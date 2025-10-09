@@ -18,6 +18,8 @@ import xgboost as xgb
 import joblib
 from pathlib import Path
 from datetime import datetime
+import optuna
+from optuna.samplers import TPESampler
 
 # Directory structure for organizing pipeline outputs
 # This structure separates different types of artifacts for better organization and debugging
@@ -32,6 +34,17 @@ REPORTS_DIR = OUTPUTS_DIR / "reports"            # Analysis reports and metadata
 # This prevents file writing errors during pipeline execution
 for dir_path in [OUTPUTS_DIR, DATA_DIR, FEATURES_DIR, MODELS_DIR, PREDICTIONS_DIR, REPORTS_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
+
+
+# Hyperparameter Tuning Configuration
+TUNING_CONFIG = {
+    'enabled': True,                          # Enable/disable hyperparameter tuning
+    'n_trials': 50,                          # Number of Optuna trials per model
+    'timeout': 600,                          # Max seconds per model tuning (10 min)
+    'n_jobs': -1,                            # Parallel jobs (-1 = all cores)
+    'show_progress_bar': True,               # Show Optuna progress
+    'models_to_tune': ['XGBoost']  # Only tune XGBoost (GPU-accelerated)
+}
 
 
 def load_dataset() -> str:
@@ -368,6 +381,87 @@ def detect_problem_type() -> str:
         return 'classification'
 
 
+def optimize_random_forest(trial, X, y, problem_type, cv):
+    """
+    Optuna objective function for Random Forest hyperparameter optimization.
+
+    Args:
+        trial: Optuna trial object
+        X: Training features
+        y: Training target
+        problem_type: 'regression' or 'classification'
+        cv: Cross-validation splitter
+
+    Returns:
+        Mean cross-validation score
+    """
+    # Suggest hyperparameters
+    params = {
+        'n_estimators': trial.suggest_int('rf_n_estimators', 50, 300),
+        'max_depth': trial.suggest_int('rf_max_depth', 5, 30),
+        'min_samples_split': trial.suggest_int('rf_min_samples_split', 2, 20),
+        'min_samples_leaf': trial.suggest_int('rf_min_samples_leaf', 1, 10),
+        'max_features': trial.suggest_categorical('rf_max_features', ['sqrt', 'log2', None]),
+        'random_state': 42,
+        'n_jobs': -1
+    }
+
+    # Create model based on problem type
+    if problem_type == 'regression':
+        model = RandomForestRegressor(**params)
+        scoring = 'neg_mean_squared_error'
+    else:
+        model = RandomForestClassifier(**params)
+        scoring = 'accuracy'
+
+    # Evaluate with cross-validation
+    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
+    return scores.mean()
+
+
+def optimize_xgboost(trial, X, y, problem_type, cv):
+    """
+    Optuna objective function for XGBoost hyperparameter optimization.
+
+    Args:
+        trial: Optuna trial object
+        X: Training features
+        y: Training target
+        problem_type: 'regression' or 'classification'
+        cv: Cross-validation splitter
+
+    Returns:
+        Mean cross-validation score
+    """
+    # Suggest hyperparameters
+    params = {
+        'n_estimators': trial.suggest_int('xgb_n_estimators', 50, 300),
+        'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.3, log=True),
+        'max_depth': trial.suggest_int('xgb_max_depth', 3, 10),
+        'min_child_weight': trial.suggest_int('xgb_min_child_weight', 1, 7),
+        'subsample': trial.suggest_float('xgb_subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.6, 1.0),
+        'gamma': trial.suggest_float('xgb_gamma', 0.0, 0.5),
+        'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.0, 1.0),
+        'reg_lambda': trial.suggest_float('xgb_reg_lambda', 0.0, 1.0),
+        'random_state': 42,
+        'n_jobs': -1,
+        'device': 'cuda'  # Enable GPU acceleration
+    }
+
+    # Create model based on problem type
+    if problem_type == 'regression':
+        model = xgb.XGBRegressor(**params)
+        scoring = 'neg_mean_squared_error'
+    else:
+        model = xgb.XGBClassifier(**params, eval_metric='logloss')
+        scoring = 'accuracy'
+
+    # Evaluate with cross-validation
+    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
+    return scores.mean()
+
+
 def train_model_pipeline() -> str:
     """
     Train multiple ML models using cross-validation and select the best performer.
@@ -398,7 +492,7 @@ def train_model_pipeline() -> str:
             models = {
                 'Linear Regression': LinearRegression(),                                    # Linear, interpretable
                 'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42), # Non-linear, robust
-                'XGBoost': xgb.XGBRegressor(random_state=42)                               # Gradient boosting, high performance
+                'XGBoost': xgb.XGBRegressor(random_state=42, device='cuda')                # Gradient boosting, high performance, GPU accelerated
             }
             # Use regular KFold for regression (no need to preserve class distribution)
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -409,7 +503,7 @@ def train_model_pipeline() -> str:
             models = {
                 'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),  # Linear, interpretable
                 'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42), # Non-linear, robust
-                'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss')        # Gradient boosting, high performance
+                'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss', device='cuda')  # Gradient boosting, high performance, GPU accelerated
             }
             # Use StratifiedKFold to preserve class distribution in each fold
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -417,40 +511,136 @@ def train_model_pipeline() -> str:
             scoring_metric = 'accuracy'
             best_score = 0  # Higher is better for accuracy
 
-        # Model evaluation pipeline
-        # Systematically evaluate each model using cross-validation
+        # Model evaluation pipeline with Optuna hyperparameter tuning
+        # Systematically evaluate each model using cross-validation with optimized hyperparameters
         results = {}
         best_model_name = None
         best_model = None
+        tuned_params = {}  # Store best hyperparameters for each model
+
+        # Suppress Optuna's default logging to reduce clutter
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         for name, model in models.items():
-            # Cross-validation provides unbiased performance estimate
-            # Using appropriate metric based on problem type
-            scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring_metric)
+            print(f"\n{'='*60}")
+            print(f"Training {name}...")
+            print(f"{'='*60}")
 
-            # Store comprehensive results for analysis
-            results[name] = {
-                'mean_score': float(scores.mean()),      # Average performance across folds
-                'std_score': float(scores.std()),        # Performance consistency measure
-                'individual_scores': scores.tolist()     # Detailed fold-by-fold results
-            }
+            # Check if this model should be tuned
+            if TUNING_CONFIG['enabled'] and name in TUNING_CONFIG['models_to_tune']:
+                print(f"🔧 Tuning hyperparameters for {name}...")
+                print(f"   Strategy: Optuna Bayesian Optimization")
+                print(f"   Trials: {TUNING_CONFIG['n_trials']}")
 
-            # Track the best performing model
-            # Selection logic depends on scoring metric
-            if problem_type == 'regression':
-                # For regression with neg_mean_squared_error, higher (less negative) is better
-                if scores.mean() > best_score:
-                    best_score = scores.mean()
-                    best_model_name = name
-                    best_model = model
+                # Create Optuna study for hyperparameter optimization
+                study = optuna.create_study(
+                    direction='maximize',  # Maximize score (works for both neg_mse and accuracy)
+                    sampler=TPESampler(seed=42)
+                )
+
+                # Select appropriate optimization function
+                if name == 'Random Forest':
+                    objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
+                elif name == 'XGBoost':
+                    objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
+                else:
+                    # Fallback for any other models
+                    objective = None
+
+                if objective:
+                    # Run hyperparameter optimization
+                    study.optimize(
+                        objective,
+                        n_trials=TUNING_CONFIG['n_trials'],
+                        timeout=TUNING_CONFIG['timeout'],
+                        show_progress_bar=TUNING_CONFIG['show_progress_bar'],
+                        n_jobs=1  # Serial execution for stability
+                    )
+
+                    # Extract best parameters
+                    best_params = study.best_params
+                    tuned_params[name] = best_params
+
+                    # Remove model-specific prefixes from parameter names
+                    prefix = 'rf_' if name == 'Random Forest' else 'xgb_'
+                    clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
+
+                    # Create tuned model
+                    if problem_type == 'regression':
+                        if name == 'Random Forest':
+                            model = RandomForestRegressor(**clean_params)
+                        elif name == 'XGBoost':
+                            model = xgb.XGBRegressor(**clean_params, device='cuda')
+                    else:
+                        if name == 'Random Forest':
+                            model = RandomForestClassifier(**clean_params)
+                        elif name == 'XGBoost':
+                            model = xgb.XGBClassifier(**clean_params, eval_metric='logloss', device='cuda')
+
+                    # Use best score from optimization
+                    best_trial_score = study.best_value
+                    trial_scores = [trial.value for trial in study.trials if trial.value is not None]
+
+                    print(f"   ✅ Optimization complete!")
+                    print(f"   Best score: {best_trial_score:.6f}")
+                    print(f"   Best params: {clean_params}")
+
+                    results[name] = {
+                        'mean_score': float(best_trial_score),
+                        'std_score': float(np.std(trial_scores[-5:])) if len(trial_scores) >= 5 else 0.0,
+                        'individual_scores': trial_scores[-5:],  # Last 5 trial scores
+                        'best_params': clean_params,
+                        'n_trials': len(study.trials),
+                        'tuned': True
+                    }
+
+                    if best_trial_score > best_score:
+                        best_score = best_trial_score
+                        best_model_name = name
+                        best_model = model
+                else:
+                    # Model doesn't have tuning function, use default
+                    print(f"   ⚠️  No tuning function available for {name}, using defaults")
+                    scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring_metric)
+                    results[name] = {
+                        'mean_score': float(scores.mean()),
+                        'std_score': float(scores.std()),
+                        'individual_scores': scores.tolist(),
+                        'tuned': False
+                    }
+
+                    if scores.mean() > best_score:
+                        best_score = scores.mean()
+                        best_model_name = name
+                        best_model = model
+
             else:
-                # For classification with accuracy, higher is better
+                # Model tuning disabled or not in tuning list - use defaults
+                print(f"   Using default hyperparameters...")
+                scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring_metric)
+
+                results[name] = {
+                    'mean_score': float(scores.mean()),
+                    'std_score': float(scores.std()),
+                    'individual_scores': scores.tolist(),
+                    'tuned': False
+                }
+
+                print(f"   Score: {scores.mean():.6f} (+/- {scores.std():.6f})")
+
                 if scores.mean() > best_score:
                     best_score = scores.mean()
                     best_model_name = name
                     best_model = model
 
         # Train the selected model on full training dataset
+        print(f"\n{'='*60}")
+        print(f"🏆 Best Model: {best_model_name}")
+        print(f"   Score: {best_score:.6f}")
+        if best_model_name in tuned_params:
+            print(f"   Tuned Parameters: {tuned_params[best_model_name]}")
+        print(f"{'='*60}\n")
+
         # This gives the model access to all available training data
         best_model.fit(X_train, y_train)
 
