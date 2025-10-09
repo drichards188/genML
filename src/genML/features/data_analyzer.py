@@ -13,8 +13,7 @@ from typing import Dict, List, Tuple, Any
 from datetime import datetime
 import logging
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Use centralized logging configuration
 logger = logging.getLogger(__name__)
 
 
@@ -307,8 +306,12 @@ class DataTypeAnalyzer:
         """Identify potential target columns."""
         candidates = []
 
-        # Common target column names
-        target_names = ['target', 'label', 'y', 'survived', 'class', 'category', 'outcome']
+        # Common target column names (expanded for broader coverage)
+        target_names = [
+            'target', 'label', 'y', 'survived', 'class', 'category', 'outcome',
+            'risk', 'price', 'sales', 'revenue', 'cost', 'score', 'rating',
+            'churn', 'fraud', 'default', 'failure', 'success', 'prediction'
+        ]
 
         for col in df.columns:
             col_lower = col.lower()

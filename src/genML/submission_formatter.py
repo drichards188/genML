@@ -308,9 +308,14 @@ class SubmissionFormatter:
 
         from datetime import datetime
 
+        # Create submissions directory
+        submissions_dir = Path("outputs/submissions")
+        submissions_dir.mkdir(parents=True, exist_ok=True)
+
         # Save main submission file
-        submission_df.to_csv(filename, index=False)
-        main_file = filename
+        main_file = submissions_dir / filename
+        submission_df.to_csv(main_file, index=False)
+        main_file = str(main_file)
 
         timestamped_file = None
         if timestamped:
@@ -318,8 +323,10 @@ class SubmissionFormatter:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             base_name = filename.rsplit('.', 1)[0]
             extension = filename.rsplit('.', 1)[1] if '.' in filename else 'csv'
-            timestamped_file = f"{base_name}_{timestamp}.{extension}"
+            timestamped_filename = f"{base_name}_{timestamp}.{extension}"
+            timestamped_file = submissions_dir / timestamped_filename
             submission_df.to_csv(timestamped_file, index=False)
+            timestamped_file = str(timestamped_file)
 
         return main_file, timestamped_file
 

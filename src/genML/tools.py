@@ -73,6 +73,34 @@ def load_dataset() -> str:
         train_df = pd.read_csv(train_path)
         test_df = pd.read_csv(test_path)
 
+        # Detect target column by comparing train vs test columns
+        train_cols = set(train_df.columns)
+        test_cols = set(test_df.columns)
+        train_only_cols = train_cols - test_cols
+
+        # Exclude common ID column names
+        id_patterns = {'id', 'ID', 'Id', 'index', 'Index'}
+        potential_targets = [col for col in train_only_cols if col not in id_patterns]
+        target_col = potential_targets[0] if potential_targets else None
+
+        # Calculate target statistics if target found
+        target_rate = None
+        if target_col and target_col in train_df.columns:
+            try:
+                # For binary/categorical targets
+                if train_df[target_col].dtype in ['object', 'category'] or train_df[target_col].nunique() <= 20:
+                    target_rate = train_df[target_col].value_counts(normalize=True).to_dict()
+                else:
+                    # For continuous targets, provide basic stats
+                    target_rate = {
+                        'mean': float(train_df[target_col].mean()),
+                        'std': float(train_df[target_col].std()),
+                        'min': float(train_df[target_col].min()),
+                        'max': float(train_df[target_col].max())
+                    }
+            except:
+                target_rate = None
+
         # Create summary
         summary = {
             "status": "success",
@@ -80,11 +108,12 @@ def load_dataset() -> str:
             "test_shape": test_df.shape,
             "train_columns": list(train_df.columns),
             "test_columns": list(test_df.columns),
+            "target_column": target_col,
             "missing_values": {
                 "train": train_df.isnull().sum().to_dict(),
                 "test": test_df.isnull().sum().to_dict()
             },
-            "target_rate": float(train_df['Survived'].mean()) if 'Survived' in train_df.columns else None,
+            "target_stats": target_rate,
             "train_head": train_df.head().to_dict('records'),
             "test_head": test_df.head().to_dict('records')
         }
@@ -166,12 +195,24 @@ def engineer_features() -> str:
         analysis_results = feature_engine.analyze_data(train_df)
 
         # Fit the feature engineering pipeline
-        # Try to detect target column automatically
-        target_col = None
-        if 'Survived' in train_df.columns:
-            target_col = 'Survived'
-        elif analysis_results.get('target_candidates'):
+        # Detect target column by comparing train vs test columns (most reliable method)
+        train_cols = set(train_df.columns)
+        test_cols = set(test_df.columns)
+        train_only_cols = train_cols - test_cols
+
+        # Exclude common ID column names
+        id_patterns = {'id', 'ID', 'Id', 'index', 'Index'}
+        potential_targets = [col for col in train_only_cols if col not in id_patterns]
+        target_col = potential_targets[0] if potential_targets else None
+
+        # Fallback to analysis-based detection if comparison fails
+        if target_col is None and analysis_results.get('target_candidates'):
             target_col = analysis_results['target_candidates'][0]
+
+        if target_col:
+            print(f"Detected target column: {target_col}")
+        else:
+            print("Warning: Could not detect target column")
 
         feature_engine.fit(train_df, target_col)
 

@@ -1,0 +1,18 @@
+# Development dependencies for testing and code quality
+
+# Testing framework
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.0
+pytest-timeout>=2.1.0
+
+# Code formatting and linting
+black>=23.0.0
+flake8>=6.0.0
+isort>=5.12.0
+
+# Type checking
+mypy>=1.5.0
+
+# Additional test utilities
+coverage>=7.3.0
