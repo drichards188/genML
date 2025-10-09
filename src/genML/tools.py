@@ -60,11 +60,11 @@ def detect_gpu_support() -> dict:
             # Try to use XGBoost with GPU
             try:
                 # Test XGBoost GPU support
-                test_model = xgb.XGBClassifier(tree_method='gpu_hist', device='cuda', n_estimators=1)
+                test_model = xgb.XGBClassifier(tree_method='hist', device='cuda', n_estimators=1)
                 # Quick fit test with dummy data
                 test_model.fit([[1], [2]], [0, 1])
                 gpu_available = True
-                xgb_params = {'tree_method': 'gpu_hist', 'device': 'cuda'}
+                xgb_params = {'tree_method': 'hist', 'device': 'cuda'}
                 logger.info("GPU detected and available for XGBoost training")
             except Exception as e:
                 logger.warning(f"GPU detected but XGBoost GPU support unavailable: {e}")
@@ -464,7 +464,7 @@ def optimize_random_forest(trial, X, y, problem_type, cv):
     return scores.mean()
 
 
-def optimize_xgboost(trial, X, y, problem_type, cv):
+def optimize_xgboost(trial, X, y, problem_type, cv, gpu_config):
     """
     Optuna objective function for XGBoost hyperparameter optimization.
 
@@ -474,6 +474,7 @@ def optimize_xgboost(trial, X, y, problem_type, cv):
         y: Training target
         problem_type: 'regression' or 'classification'
         cv: Cross-validation splitter
+        gpu_config: GPU configuration from detect_gpu_support()
 
     Returns:
         Mean cross-validation score
@@ -490,8 +491,7 @@ def optimize_xgboost(trial, X, y, problem_type, cv):
         'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.0, 1.0),
         'reg_lambda': trial.suggest_float('xgb_reg_lambda', 0.0, 1.0),
         'random_state': 42,
-        'n_jobs': -1,
-        'device': 'cuda'  # Enable GPU acceleration
+        **gpu_config['xgb_params']  # Use detected GPU config (GPU or CPU)
     }
 
     # Create model based on problem type
@@ -590,7 +590,7 @@ def train_model_pipeline() -> str:
                 if name == 'Random Forest':
                     objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
                 elif name == 'XGBoost':
-                    objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
+                    objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv, gpu_config)
                 else:
                     # Fallback for any other models
                     objective = None
@@ -618,12 +618,12 @@ def train_model_pipeline() -> str:
                         if name == 'Random Forest':
                             model = RandomForestRegressor(**clean_params)
                         elif name == 'XGBoost':
-                            model = xgb.XGBRegressor(**clean_params, device='cuda')
+                            model = xgb.XGBRegressor(**clean_params, **gpu_config['xgb_params'])
                     else:
                         if name == 'Random Forest':
                             model = RandomForestClassifier(**clean_params)
                         elif name == 'XGBoost':
-                            model = xgb.XGBClassifier(**clean_params, eval_metric='logloss', device='cuda')
+                            model = xgb.XGBClassifier(**clean_params, eval_metric='logloss', **gpu_config['xgb_params'])
 
                     # Use best score from optimization
                     best_trial_score = study.best_value
