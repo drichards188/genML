@@ -18,6 +18,11 @@ import xgboost as xgb
 import joblib
 from pathlib import Path
 from datetime import datetime
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Directory structure for organizing pipeline outputs
 # This structure separates different types of artifacts for better organization and debugging
@@ -32,6 +37,46 @@ REPORTS_DIR = OUTPUTS_DIR / "reports"            # Analysis reports and metadata
 # This prevents file writing errors during pipeline execution
 for dir_path in [OUTPUTS_DIR, DATA_DIR, FEATURES_DIR, MODELS_DIR, PREDICTIONS_DIR, REPORTS_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
+
+
+def detect_gpu_support() -> dict:
+    """
+    Detect GPU availability and return appropriate configuration for models.
+
+    Returns:
+        dict: Configuration with gpu_available flag and parameters for XGBoost and RandomForest
+    """
+    gpu_available = False
+    xgb_params = {}
+
+    try:
+        # Check if CUDA is available for XGBoost
+        import subprocess
+        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            # nvidia-smi succeeded, GPU likely available
+            # Try to use XGBoost with GPU
+            try:
+                # Test XGBoost GPU support
+                test_model = xgb.XGBClassifier(tree_method='gpu_hist', device='cuda', n_estimators=1)
+                # Quick fit test with dummy data
+                test_model.fit([[1], [2]], [0, 1])
+                gpu_available = True
+                xgb_params = {'tree_method': 'gpu_hist', 'device': 'cuda'}
+                logger.info("GPU detected and available for XGBoost training")
+            except Exception as e:
+                logger.warning(f"GPU detected but XGBoost GPU support unavailable: {e}")
+                logger.info("Falling back to CPU training")
+    except Exception as e:
+        logger.info("No GPU detected, using CPU for training")
+
+    config = {
+        'gpu_available': gpu_available,
+        'xgb_params': xgb_params,
+        'rf_params': {'n_jobs': -1}  # Random Forest uses all CPU cores (no direct GPU support)
+    }
+
+    return config
 
 
 def load_dataset() -> str:
@@ -392,13 +437,16 @@ def train_model_pipeline() -> str:
         # Automatically detect problem type
         problem_type = detect_problem_type()
 
+        # Detect GPU support and get optimal model parameters
+        gpu_config = detect_gpu_support()
+
         # Define model ensemble based on problem type
         # Each model has different strengths and biases
         if problem_type == 'regression':
             models = {
                 'Linear Regression': LinearRegression(),                                    # Linear, interpretable
-                'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42), # Non-linear, robust
-                'XGBoost': xgb.XGBRegressor(random_state=42)                               # Gradient boosting, high performance
+                'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42, **gpu_config['rf_params']), # Non-linear, robust
+                'XGBoost': xgb.XGBRegressor(random_state=42, **gpu_config['xgb_params'])   # Gradient boosting, high performance
             }
             # Use regular KFold for regression (no need to preserve class distribution)
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -408,8 +456,8 @@ def train_model_pipeline() -> str:
         else:  # classification
             models = {
                 'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),  # Linear, interpretable
-                'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42), # Non-linear, robust
-                'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss')        # Gradient boosting, high performance
+                'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42, **gpu_config['rf_params']), # Non-linear, robust
+                'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss', **gpu_config['xgb_params'])        # Gradient boosting, high performance
             }
             # Use StratifiedKFold to preserve class distribution in each fold
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)

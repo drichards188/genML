@@ -226,11 +226,11 @@ class AutoFeatureEngine:
                     y_encoded = le.fit_transform(y)
                 else:
                     y_encoded = y
-                model = RandomForestClassifier(n_estimators=50, random_state=42)
+                model = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
             else:
                 # Regression
                 y_encoded = y
-                model = RandomForestRegressor(n_estimators=50, random_state=42)
+                model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
 
             # Handle missing values in features
             X_clean = X.fillna(X.median())

@@ -255,9 +255,9 @@ class AdvancedFeatureSelector:
                 if y.nunique() == 2:
                     model = LogisticRegression(random_state=42, max_iter=1000)
                 else:
-                    model = RandomForestClassifier(n_estimators=50, random_state=42)
+                    model = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
             else:
-                model = RandomForestRegressor(n_estimators=50, random_state=42)
+                model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
 
             # Fit model
             model.fit(X, y)
