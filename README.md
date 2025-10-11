@@ -186,10 +186,3 @@ Solution: `pip install -r requirements.txt` or `uv sync`
 **Pipeline fails on feature engineering:**
 Check that your dataset has proper column names and no completely empty columns.
 
----
-
-## Development
-
-For development guidance and architecture details, see [CLAUDE.md](CLAUDE.md).
-
-**Transform any dataset into ML insights with CrewAI! 🚀**

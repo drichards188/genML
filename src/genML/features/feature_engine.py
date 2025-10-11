@@ -205,7 +205,7 @@ class AutoFeatureEngine:
 
     def get_feature_importance(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
         """
-        Calculate feature importance using a simple model.
+        Calculate feature importance using a simple model (GPU-accelerated if available).
 
         Args:
             X: Feature matrix
@@ -215,8 +215,11 @@ class AutoFeatureEngine:
             Dictionary mapping feature names to importance scores
         """
         try:
-            from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
             from sklearn.preprocessing import LabelEncoder
+            # Use GPU-aware Random Forest imports
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from gpu_utils import get_random_forest_classifier, get_random_forest_regressor
 
             # Determine if classification or regression
             if y.nunique() <= 10 and y.dtype in ['int64', 'object']:
@@ -226,11 +229,13 @@ class AutoFeatureEngine:
                     y_encoded = le.fit_transform(y)
                 else:
                     y_encoded = y
-                model = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+                RandomForestClassifierClass = get_random_forest_classifier()
+                model = RandomForestClassifierClass(n_estimators=50, random_state=42)
             else:
                 # Regression
                 y_encoded = y
-                model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+                RandomForestRegressorClass = get_random_forest_regressor()
+                model = RandomForestRegressorClass(n_estimators=50, random_state=42)
 
             # Handle missing values in features
             X_clean = X.fillna(X.median())

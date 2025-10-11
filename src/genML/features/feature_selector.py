@@ -3,21 +3,30 @@ Advanced Feature Selection Module
 
 This module provides sophisticated feature selection techniques that go beyond
 simple importance scoring. It includes correlation analysis, statistical tests,
-and iterative selection methods.
+and iterative selection methods. Uses GPU-accelerated models when available.
 """
 
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Any, Optional, Union
+from pathlib import Path
 from sklearn.feature_selection import (
     SelectKBest, SelectPercentile, RFE, RFECV,
     f_classif, f_regression, mutual_info_classif, mutual_info_regression,
     chi2, VarianceThreshold
 )
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.preprocessing import LabelEncoder
 import logging
+import sys
+
+# Import GPU-aware model classes
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from gpu_utils import (
+    get_random_forest_classifier,
+    get_random_forest_regressor,
+    get_linear_model_classifier,
+    get_linear_model_regressor
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,15 +258,19 @@ class AdvancedFeatureSelector:
             return list(X.columns)
 
     def _model_based_selection(self, X: pd.DataFrame, y: pd.Series, problem_type: str) -> List[str]:
-        """Perform model-based feature selection."""
+        """Perform model-based feature selection using GPU-accelerated models when available."""
         try:
+            # Get GPU-aware model classes
             if problem_type == 'classification':
                 if y.nunique() == 2:
-                    model = LogisticRegression(random_state=42, max_iter=1000)
+                    LogisticRegressionClass = get_linear_model_classifier()
+                    model = LogisticRegressionClass(random_state=42, max_iter=1000)
                 else:
-                    model = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+                    RandomForestClassifierClass = get_random_forest_classifier()
+                    model = RandomForestClassifierClass(n_estimators=50, random_state=42)
             else:
-                model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+                RandomForestRegressorClass = get_random_forest_regressor()
+                model = RandomForestRegressorClass(n_estimators=50, random_state=42)
 
             # Fit model
             model.fit(X, y)
@@ -283,12 +296,15 @@ class AdvancedFeatureSelector:
             return list(X.columns)
 
     def _iterative_selection(self, X: pd.DataFrame, y: pd.Series, problem_type: str) -> List[str]:
-        """Perform iterative feature selection (RFE/RFECV)."""
+        """Perform iterative feature selection (RFE/RFECV) using GPU-accelerated models when available."""
         try:
+            # Get GPU-aware model classes
             if problem_type == 'classification':
-                estimator = LogisticRegression(random_state=42, max_iter=1000)
+                LogisticRegressionClass = get_linear_model_classifier()
+                estimator = LogisticRegressionClass(random_state=42, max_iter=1000)
             else:
-                estimator = LinearRegression()
+                LinearRegressionClass = get_linear_model_regressor()
+                estimator = LinearRegressionClass()
 
             # Use RFECV for automatic feature number selection
             selector = RFECV(

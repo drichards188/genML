@@ -3,17 +3,23 @@ Modular Feature Processors for Different Data Types
 
 This module provides specialized feature processors for different data types.
 Each processor implements domain-specific feature engineering techniques that
-are commonly effective for that data type.
+are commonly effective for that data type. Uses GPU-accelerated preprocessing when available.
 """
 
 import pandas as pd
 import numpy as np
 import re
 from typing import Dict, List, Tuple, Any, Optional, Union
-from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder
+from pathlib import Path
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from abc import ABC, abstractmethod
 import logging
+import sys
+
+# Import GPU-aware StandardScaler
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from gpu_utils import get_standard_scaler
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +96,8 @@ class NumericalProcessor(BaseProcessor):
 
     def __init__(self, config: Optional[Dict] = None):
         super().__init__(config)
-        self.scaler = StandardScaler()
+        StandardScalerClass = get_standard_scaler()
+        self.scaler = StandardScalerClass()
         self.bin_edges = {}
         self.base_name = ""
 

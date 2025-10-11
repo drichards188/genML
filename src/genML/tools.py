@@ -11,8 +11,6 @@ import json
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
-from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 import joblib
@@ -25,6 +23,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 import optuna
 from optuna.samplers import TPESampler
+
+# Import GPU utilities for unified GPU acceleration support
+from src.genML.gpu_utils import (
+    get_gpu_config,
+    get_linear_model_classifier,
+    get_linear_model_regressor,
+    get_random_forest_classifier,
+    get_random_forest_regressor,
+    get_xgboost_params,
+    log_gpu_memory,
+    is_cuml_available,
+    is_xgboost_gpu_available
+)
 
 # Directory structure for organizing pipeline outputs
 # This structure separates different types of artifacts for better organization and debugging
@@ -41,44 +52,8 @@ for dir_path in [OUTPUTS_DIR, DATA_DIR, FEATURES_DIR, MODELS_DIR, PREDICTIONS_DI
     dir_path.mkdir(parents=True, exist_ok=True)
 
 
-def detect_gpu_support() -> dict:
-    """
-    Detect GPU availability and return appropriate configuration for models.
-
-    Returns:
-        dict: Configuration with gpu_available flag and parameters for XGBoost and RandomForest
-    """
-    gpu_available = False
-    xgb_params = {}
-
-    try:
-        # Check if CUDA is available for XGBoost
-        import subprocess
-        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            # nvidia-smi succeeded, GPU likely available
-            # Try to use XGBoost with GPU
-            try:
-                # Test XGBoost GPU support
-                test_model = xgb.XGBClassifier(tree_method='hist', device='cuda', n_estimators=1)
-                # Quick fit test with dummy data
-                test_model.fit([[1], [2]], [0, 1])
-                gpu_available = True
-                xgb_params = {'tree_method': 'hist', 'device': 'cuda'}
-                logger.info("GPU detected and available for XGBoost training")
-            except Exception as e:
-                logger.warning(f"GPU detected but XGBoost GPU support unavailable: {e}")
-                logger.info("Falling back to CPU training")
-    except Exception as e:
-        logger.info("No GPU detected, using CPU for training")
-
-    config = {
-        'gpu_available': gpu_available,
-        'xgb_params': xgb_params,
-        'rf_params': {'n_jobs': -1}  # Random Forest uses all CPU cores (no direct GPU support)
-    }
-
-    return config
+# GPU detection is now handled by gpu_utils module
+# The module automatically detects GPU on import and provides smart imports
 
 
 # Hyperparameter Tuning Configuration
@@ -89,6 +64,15 @@ TUNING_CONFIG = {
     'n_jobs': -1,                            # Parallel jobs (-1 = all cores)
     'show_progress_bar': True,               # Show Optuna progress
     'models_to_tune': ['XGBoost']  # Only tune XGBoost (GPU-accelerated)
+}
+
+# GPU Acceleration Configuration
+GPU_CONFIG = {
+    'force_cpu': False,                      # Force CPU mode even if GPU is available
+    'enable_cuml': True,                     # Enable cuML GPU acceleration for sklearn models
+    'enable_xgboost_gpu': True,              # Enable XGBoost GPU acceleration
+    'log_gpu_memory': True,                  # Log GPU memory usage during training
+    'gpu_memory_threshold_gb': 14.0,         # Warning threshold for GPU memory (GB)
 }
 
 
@@ -429,6 +413,7 @@ def detect_problem_type() -> str:
 def optimize_random_forest(trial, X, y, problem_type, cv):
     """
     Optuna objective function for Random Forest hyperparameter optimization.
+    Uses cuML RandomForest (GPU) if available, otherwise sklearn (CPU).
 
     Args:
         trial: Optuna trial object
@@ -440,23 +425,30 @@ def optimize_random_forest(trial, X, y, problem_type, cv):
     Returns:
         Mean cross-validation score
     """
-    # Suggest hyperparameters
+    # Suggest hyperparameters (compatible with both cuML and sklearn)
     params = {
         'n_estimators': trial.suggest_int('rf_n_estimators', 50, 300),
         'max_depth': trial.suggest_int('rf_max_depth', 5, 30),
-        'min_samples_split': trial.suggest_int('rf_min_samples_split', 2, 20),
-        'min_samples_leaf': trial.suggest_int('rf_min_samples_leaf', 1, 10),
-        'max_features': trial.suggest_categorical('rf_max_features', ['sqrt', 'log2', None]),
-        'random_state': 42,
-        'n_jobs': -1
+        'random_state': 42
     }
 
-    # Create model based on problem type
+    # Add sklearn-specific parameters if using CPU (not supported by cuML)
+    if not is_cuml_available():
+        params.update({
+            'min_samples_split': trial.suggest_int('rf_min_samples_split', 2, 20),
+            'min_samples_leaf': trial.suggest_int('rf_min_samples_leaf', 1, 10),
+            'max_features': trial.suggest_categorical('rf_max_features', ['sqrt', 'log2', None]),
+            'n_jobs': -1
+        })
+
+    # Create model based on problem type using smart imports
     if problem_type == 'regression':
-        model = RandomForestRegressor(**params)
+        RandomForestRegressorClass = get_random_forest_regressor()
+        model = RandomForestRegressorClass(**params)
         scoring = 'neg_mean_squared_error'
     else:
-        model = RandomForestClassifier(**params)
+        RandomForestClassifierClass = get_random_forest_classifier()
+        model = RandomForestClassifierClass(**params)
         scoring = 'accuracy'
 
     # Evaluate with cross-validation
@@ -464,9 +456,10 @@ def optimize_random_forest(trial, X, y, problem_type, cv):
     return scores.mean()
 
 
-def optimize_xgboost(trial, X, y, problem_type, cv, gpu_config):
+def optimize_xgboost(trial, X, y, problem_type, cv):
     """
     Optuna objective function for XGBoost hyperparameter optimization.
+    Automatically uses GPU if available via gpu_utils.
 
     Args:
         trial: Optuna trial object
@@ -474,7 +467,6 @@ def optimize_xgboost(trial, X, y, problem_type, cv, gpu_config):
         y: Training target
         problem_type: 'regression' or 'classification'
         cv: Cross-validation splitter
-        gpu_config: GPU configuration from detect_gpu_support()
 
     Returns:
         Mean cross-validation score
@@ -491,7 +483,7 @@ def optimize_xgboost(trial, X, y, problem_type, cv, gpu_config):
         'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.0, 1.0),
         'reg_lambda': trial.suggest_float('xgb_reg_lambda', 0.0, 1.0),
         'random_state': 42,
-        **gpu_config['xgb_params']  # Use detected GPU config (GPU or CPU)
+        **get_xgboost_params()  # Use detected GPU config (GPU or CPU)
     }
 
     # Create model based on problem type
@@ -531,16 +523,24 @@ def train_model_pipeline() -> str:
         # Automatically detect problem type
         problem_type = detect_problem_type()
 
-        # Detect GPU support and get optimal model parameters
-        gpu_config = detect_gpu_support()
+        # Get GPU configuration for logging
+        gpu_config = get_gpu_config()
+        log_gpu_memory("Before Training")
+
+        # Get GPU-aware model classes using smart imports
+        LinearRegressionClass = get_linear_model_regressor()
+        LogisticRegressionClass = get_linear_model_classifier()
+        RandomForestRegressorClass = get_random_forest_regressor()
+        RandomForestClassifierClass = get_random_forest_classifier()
 
         # Define model ensemble based on problem type
         # Each model has different strengths and biases
+        # Models automatically use GPU (cuML) if available, otherwise CPU (sklearn)
         if problem_type == 'regression':
             models = {
-                'Linear Regression': LinearRegression(),                                    # Linear, interpretable
-                'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42, **gpu_config['rf_params']), # Non-linear, robust
-                'XGBoost': xgb.XGBRegressor(random_state=42, **gpu_config['xgb_params'])   # Gradient boosting, high performance
+                'Linear Regression': LinearRegressionClass(),                                    # Linear, interpretable
+                'Random Forest': RandomForestRegressorClass(n_estimators=100, random_state=42),  # Non-linear, robust (GPU if cuML available)
+                'XGBoost': xgb.XGBRegressor(random_state=42, **get_xgboost_params())             # Gradient boosting, high performance (GPU if available)
             }
             # Use regular KFold for regression (no need to preserve class distribution)
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -549,9 +549,9 @@ def train_model_pipeline() -> str:
             best_score = float('-inf')  # Higher (less negative) is better for MSE
         else:  # classification
             models = {
-                'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),  # Linear, interpretable
-                'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42, **gpu_config['rf_params']), # Non-linear, robust
-                'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss', **gpu_config['xgb_params'])        # Gradient boosting, high performance
+                'Logistic Regression': LogisticRegressionClass(random_state=42, max_iter=1000),  # Linear, interpretable
+                'Random Forest': RandomForestClassifierClass(n_estimators=100, random_state=42), # Non-linear, robust (GPU if cuML available)
+                'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss', **get_xgboost_params())  # Gradient boosting, high performance (GPU if available)
             }
             # Use StratifiedKFold to preserve class distribution in each fold
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -590,7 +590,7 @@ def train_model_pipeline() -> str:
                 if name == 'Random Forest':
                     objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
                 elif name == 'XGBoost':
-                    objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv, gpu_config)
+                    objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
                 else:
                     # Fallback for any other models
                     objective = None
@@ -613,17 +613,17 @@ def train_model_pipeline() -> str:
                     prefix = 'rf_' if name == 'Random Forest' else 'xgb_'
                     clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
 
-                    # Create tuned model
+                    # Create tuned model using GPU-aware imports
                     if problem_type == 'regression':
                         if name == 'Random Forest':
-                            model = RandomForestRegressor(**clean_params)
+                            model = RandomForestRegressorClass(**clean_params)
                         elif name == 'XGBoost':
-                            model = xgb.XGBRegressor(**clean_params, **gpu_config['xgb_params'])
+                            model = xgb.XGBRegressor(**clean_params, **get_xgboost_params())
                     else:
                         if name == 'Random Forest':
-                            model = RandomForestClassifier(**clean_params)
+                            model = RandomForestClassifierClass(**clean_params)
                         elif name == 'XGBoost':
-                            model = xgb.XGBClassifier(**clean_params, eval_metric='logloss', **gpu_config['xgb_params'])
+                            model = xgb.XGBClassifier(**clean_params, eval_metric='logloss', **get_xgboost_params())
 
                     # Use best score from optimization
                     best_trial_score = study.best_value
@@ -689,8 +689,18 @@ def train_model_pipeline() -> str:
             print(f"   Tuned Parameters: {tuned_params[best_model_name]}")
         print(f"{'='*60}\n")
 
+        # Log GPU status for transparency
+        if is_cuml_available():
+            print(f"ℹ️  Using GPU acceleration (cuML) for {best_model_name}")
+        elif is_xgboost_gpu_available() and 'XGBoost' in best_model_name:
+            print(f"ℹ️  Using GPU acceleration (XGBoost) for {best_model_name}")
+        else:
+            print(f"ℹ️  Using CPU for {best_model_name}")
+
         # This gives the model access to all available training data
+        log_gpu_memory("Before Final Training")
         best_model.fit(X_train, y_train)
+        log_gpu_memory("After Final Training")
 
         # Save the trained model for prediction stage
         # Timestamped filename prevents overwrites and enables model versioning
@@ -707,7 +717,7 @@ def train_model_pipeline() -> str:
         })
         cv_results_df.to_csv(MODELS_DIR / 'cross_validation_results.csv', index=False)
 
-        # Prepare results with problem type information
+        # Prepare results with problem type and GPU information
         model_results = {
             "status": "success",
             "problem_type": problem_type,
@@ -717,7 +727,13 @@ def train_model_pipeline() -> str:
             "all_results": results,
             "model_filename": model_filename,
             "timestamp": timestamp,
-            "model_saved": str(MODELS_DIR / model_filename)
+            "model_saved": str(MODELS_DIR / model_filename),
+            "gpu_acceleration": {
+                "cuml_available": is_cuml_available(),
+                "xgboost_gpu_available": is_xgboost_gpu_available(),
+                "gpu_used_for_best_model": is_cuml_available() or (is_xgboost_gpu_available() and 'XGBoost' in best_model_name),
+                "gpu_info": gpu_config
+            }
         }
 
         # Save model training report

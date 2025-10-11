@@ -1,0 +1,31 @@
+name: genml
+channels:
+  - rapidsai
+  - conda-forge
+  - nvidia
+
+dependencies:
+  # Python version (cuML requires <3.13)
+  - python>=3.10,<3.13
+
+  # RAPIDS cuML (GPU-accelerated ML)
+  - cuml>=24.10
+
+  # Core data science packages
+  - pandas>=2.0.0
+  - numpy>=1.24.0
+  - scikit-learn>=1.3.0
+  - xgboost>=2.0.0
+  - joblib>=1.3.0
+
+  # CUDA toolkit (will be installed automatically with cuML)
+  - cuda-version>=11.8,<12.0
+
+  # Additional utilities
+  - pyyaml>=6.0.0
+
+  # Pip packages (not available in conda)
+  - pip
+  - pip:
+      - crewai[tools]>=0.193.2,<1.0.0
+      - optuna>=3.0.0
