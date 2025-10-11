@@ -483,8 +483,12 @@ def optimize_xgboost(trial, X, y, problem_type, cv):
         'reg_alpha': trial.suggest_float('xgb_reg_alpha', 0.0, 1.0),
         'reg_lambda': trial.suggest_float('xgb_reg_lambda', 0.0, 1.0),
         'random_state': 42,
-        **get_xgboost_params()  # Use detected GPU config (GPU or CPU)
     }
+
+    # Add GPU parameters if available
+    gpu_params = get_xgboost_params()
+    if gpu_params:
+        params.update(gpu_params)
 
     # Create model based on problem type
     if problem_type == 'regression':
@@ -495,7 +499,12 @@ def optimize_xgboost(trial, X, y, problem_type, cv):
         scoring = 'accuracy'
 
     # Evaluate with cross-validation
-    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
+    # Note: XGBoost GPU will automatically transfer CPU data to GPU as needed
+    # The warning about device mismatch is expected and can be ignored
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
+        scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)  # n_jobs=1 for GPU
     return scores.mean()
 
 
@@ -665,7 +674,14 @@ def train_model_pipeline() -> str:
             else:
                 # Model tuning disabled or not in tuning list - use defaults
                 print(f"   Using default hyperparameters...")
-                scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring_metric)
+
+                # Suppress XGBoost GPU device mismatch warnings for cleaner output
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
+                    # Use n_jobs=1 for XGBoost GPU (GPU parallelizes internally)
+                    n_jobs_param = 1 if 'XGBoost' in name and is_xgboost_gpu_available() else -1
+                    scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=n_jobs_param)
 
                 results[name] = {
                     'mean_score': float(scores.mean()),
