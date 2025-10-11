@@ -12,17 +12,26 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+from sklearn.linear_model import ElasticNet
 import xgboost as xgb
 import joblib
 from pathlib import Path
 from datetime import datetime
 import logging
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 import optuna
 from optuna.samplers import TPESampler
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    lgb = None
+    LIGHTGBM_AVAILABLE = False
 
 # Import GPU utilities for unified GPU acceleration support
 from src.genML.gpu_utils import (
@@ -204,13 +213,25 @@ def engineer_features() -> str:
 
         # Configuration for feature engineering
         config = {
-            'max_features': 50,  # Reasonable limit for this pipeline
+            'max_features': 100,
             'enable_feature_selection': True,
+            'manual_type_hints': {
+                'num_lanes': 'numerical',
+                'curvature': 'numerical',
+                'speed_limit': 'numerical',
+                'holiday': 'categorical',
+                'num_reported_accidents': 'numerical'
+            },
+            'interaction_pairs': [
+                ('speed_limit', 'curvature'),
+                ('num_lanes', 'speed_limit')
+            ],
             'numerical_config': {
                 'enable_scaling': True,
                 'enable_binning': True,
-                'enable_polynomial': False,  # Keep it simple for now
-                'n_bins': 4
+                'enable_polynomial': True,
+                'polynomial_degree': 2,
+                'n_bins': 5
             },
             'categorical_config': {
                 'encoding_method': 'label',
@@ -223,10 +244,10 @@ def engineer_features() -> str:
                 'enable_patterns': True
             },
             'feature_selection': {
-                'max_features': 50,
+                'max_features': 100,
                 'enable_statistical_tests': True,
                 'enable_model_based': True,
-                'selection_strategy': 'ensemble'
+                'selection_strategy': 'union'
             }
         }
 
@@ -262,6 +283,10 @@ def engineer_features() -> str:
         train_features = feature_engine.transform(train_df)
         test_features = feature_engine.transform(test_df)
 
+        # Ensure purely numeric matrices for downstream numpy operations
+        train_features = train_features.apply(pd.to_numeric, errors='coerce').fillna(0)
+        test_features = test_features.apply(pd.to_numeric, errors='coerce').fillna(0)
+
         # Combine datasets to maintain original approach for downstream compatibility
         # Add a column to track which rows are train vs test
         train_features['_is_train'] = 1
@@ -270,11 +295,12 @@ def engineer_features() -> str:
         combined_features = pd.concat([train_features, test_features], ignore_index=True)
 
         # Extract final feature matrix for compatibility with existing pipeline
+        combined_features = combined_features.apply(pd.to_numeric, errors='coerce').fillna(0)
         feature_columns = [col for col in combined_features.columns if col != '_is_train']
         train_len = len(train_df)
 
-        train_features_final = combined_features[combined_features['_is_train'] == 1][feature_columns].values
-        test_features_final = combined_features[combined_features['_is_train'] == 0][feature_columns].values
+        train_features_final = combined_features.loc[combined_features['_is_train'] == 1, feature_columns].to_numpy(dtype=np.float32, copy=False)
+        test_features_final = combined_features.loc[combined_features['_is_train'] == 0, feature_columns].to_numpy(dtype=np.float32, copy=False)
 
         # Get target variable
         if target_col and target_col in train_df.columns:
@@ -312,8 +338,8 @@ def engineer_features() -> str:
             "total_features_generated": len(feature_columns),
             "detected_domains": analysis_results.get('domain_analysis', {}).get('detected_domains', []),
             "feature_stats": {
-                "mean": np.mean(train_features_final, axis=0).tolist(),
-                "std": np.std(train_features_final, axis=0).tolist()
+                "mean": np.nanmean(train_features_final, axis=0).tolist(),
+                "std": np.nanstd(train_features_final, axis=0).tolist()
             },
             "target_distribution": {
                 "positive_class": int(np.sum(train_target)),
@@ -329,6 +355,11 @@ def engineer_features() -> str:
         return json.dumps(metadata, indent=2)
 
     except Exception as e:
+        error_trace = traceback.format_exc()
+        logger.error(f"Automated feature engineering crashed:\n{error_trace}")
+        print("=== AUTOMATED FEATURE ENGINEERING TRACEBACK ===")
+        print(error_trace)
+        print("=== END TRACEBACK ===")
         return json.dumps({
             "error": f"Automated feature engineering failed: {str(e)}",
             "status": "failed"
@@ -536,6 +567,11 @@ def train_model_pipeline() -> str:
         gpu_config = get_gpu_config()
         log_gpu_memory("Before Training")
 
+        if LIGHTGBM_AVAILABLE:
+            print("✅ LightGBM detected - adding LightGBM model to ensemble.")
+        else:
+            print("ℹ️ LightGBM not installed - install `lightgbm` to enable that model option.")
+
         # Get GPU-aware model classes using smart imports
         LinearRegressionClass = get_linear_model_regressor()
         LogisticRegressionClass = get_linear_model_classifier()
@@ -551,6 +587,15 @@ def train_model_pipeline() -> str:
                 'Random Forest': RandomForestRegressorClass(n_estimators=100, random_state=42),  # Non-linear, robust (GPU if cuML available)
                 'XGBoost': xgb.XGBRegressor(random_state=42, **get_xgboost_params())             # Gradient boosting, high performance (GPU if available)
             }
+            if LIGHTGBM_AVAILABLE:
+                models['LightGBM'] = lgb.LGBMRegressor(
+                    random_state=42,
+                    n_estimators=200,
+                    learning_rate=0.05,
+                    n_jobs=-1
+                )
+            models['Gradient Boosting'] = GradientBoostingRegressor(random_state=42)
+            models['ElasticNet'] = ElasticNet(random_state=42, max_iter=2000, l1_ratio=0.5)
             # Use regular KFold for regression (no need to preserve class distribution)
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
             # Use regression scoring metric
@@ -562,6 +607,15 @@ def train_model_pipeline() -> str:
                 'Random Forest': RandomForestClassifierClass(n_estimators=100, random_state=42), # Non-linear, robust (GPU if cuML available)
                 'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss', **get_xgboost_params())  # Gradient boosting, high performance (GPU if available)
             }
+            if LIGHTGBM_AVAILABLE:
+                models['LightGBM'] = lgb.LGBMClassifier(
+                    random_state=42,
+                    n_estimators=200,
+                    learning_rate=0.05,
+                    n_jobs=-1,
+                    objective='binary'
+                )
+            models['Gradient Boosting'] = GradientBoostingClassifier(random_state=42)
             # Use StratifiedKFold to preserve class distribution in each fold
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
             # Use classification scoring metric

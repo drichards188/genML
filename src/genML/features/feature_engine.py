@@ -62,6 +62,11 @@ class AutoFeatureEngine:
         self.enable_feature_selection = self.config.get('enable_feature_selection', True)
         self.feature_importance_threshold = self.config.get('feature_importance_threshold', 0.01)
         self.exclude_id_columns = self.config.get('exclude_id_columns', True)
+        self.manual_type_hints = self.config.get('manual_type_hints', {})
+        raw_interaction_pairs = self.config.get('interaction_pairs', [])
+        self.interaction_pairs = [tuple(pair) for pair in raw_interaction_pairs if isinstance(pair, (list, tuple)) and len(pair) == 2]
+        self.interaction_feature_names = []
+        self.interaction_fill_values = {}
 
         # Processor configurations
         self.processor_configs = {
@@ -85,7 +90,7 @@ class AutoFeatureEngine:
         logger.info(f"Analyzing dataset with shape {df.shape}")
 
         # Basic data type analysis
-        self.analysis_results = self.analyzer.analyze_dataset(df)
+        self.analysis_results = self.analyzer.analyze_dataset(df, overrides=self.manual_type_hints)
 
         # Domain analysis for intelligent feature engineering
         self.domain_analysis = self.domain_researcher.analyze_domain(df, self.analysis_results)
@@ -129,8 +134,11 @@ class AutoFeatureEngine:
         # Prepare features for processing (exclude target and ID columns)
         feature_columns = self._select_feature_columns(train_df, target_col)
 
+        feature_data = train_df[feature_columns].copy()
+        self._initialize_interactions(feature_data)
+
         # Fit processors for each column type
-        self._fit_processors(train_df[feature_columns])
+        self._fit_processors(feature_data)
 
         # Generate feature mapping
         self._generate_feature_mapping()
@@ -142,6 +150,77 @@ class AutoFeatureEngine:
         self.is_fitted = True
         logger.info(f"Feature engineering pipeline fitted successfully")
         return self
+
+    def _generate_features_for_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Generate engineered feature DataFrame for provided raw data."""
+        engineered_features = []
+
+        for col, processor in self.processors.items():
+            if col not in df.columns:
+                continue
+            try:
+                features_df = processor.transform(df[col])
+                engineered_features.append(features_df)
+                logger.debug(f"Processed {col}: generated {features_df.shape[1]} features")
+            except Exception as e:
+                logger.warning(f"Failed to process column {col}: {e}")
+
+        if self.interaction_pairs:
+            interactions_df = self._create_interaction_features(df)
+            if not interactions_df.empty:
+                engineered_features.append(interactions_df)
+                logger.debug(f"Generated {interactions_df.shape[1]} interaction features")
+
+        if engineered_features:
+            result = pd.concat(engineered_features, axis=1)
+            try:
+                # Ensure all feature columns are numeric for downstream compatibility
+                numeric_result = result.apply(pd.to_numeric, errors='coerce')
+                # Replace any conversion failures with 0 to keep consistent matrix shape
+                numeric_result = numeric_result.fillna(0).astype(float)
+                return numeric_result
+            except Exception as exc:
+                logger.warning(f"Could not coerce engineered features to numeric types: {exc}")
+                return result
+
+        return pd.DataFrame(index=df.index)
+
+    def _create_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create configured interaction features."""
+        if not self.interaction_pairs:
+            return pd.DataFrame(index=df.index)
+
+        interaction_data = {}
+
+        for (left, right), feature_name in zip(self.interaction_pairs, self.interaction_feature_names):
+            if left not in df.columns or right not in df.columns:
+                continue
+
+            left_values = pd.to_numeric(df[left], errors='coerce')
+            right_values = pd.to_numeric(df[right], errors='coerce')
+
+            left_fill = self.interaction_fill_values.get(left)
+            right_fill = self.interaction_fill_values.get(right)
+
+            if left_fill is None:
+                left_fill = float(left_values.median()) if left_values.notna().any() else 0.0
+                if pd.isna(left_fill):
+                    left_fill = 0.0
+                self.interaction_fill_values[left] = left_fill
+
+            if right_fill is None:
+                right_fill = float(right_values.median()) if right_values.notna().any() else 0.0
+                if pd.isna(right_fill):
+                    right_fill = 0.0
+                self.interaction_fill_values[right] = right_fill
+
+            interaction_series = left_values.fillna(left_fill) * right_values.fillna(right_fill)
+            interaction_data[feature_name] = interaction_series
+
+        if interaction_data:
+            return pd.DataFrame(interaction_data, index=df.index)
+
+        return pd.DataFrame(index=df.index)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -158,26 +237,7 @@ class AutoFeatureEngine:
 
         logger.info(f"Transforming data with shape {df.shape}")
 
-        # Get feature columns (same as used during fit)
-        feature_columns = list(self.processors.keys())
-        engineered_features = []
-
-        # Apply processors to each column
-        for col in feature_columns:
-            if col in df.columns:
-                try:
-                    processor = self.processors[col]
-                    features_df = processor.transform(df[col])
-                    engineered_features.append(features_df)
-                    logger.debug(f"Processed {col}: generated {features_df.shape[1]} features")
-                except Exception as e:
-                    logger.warning(f"Failed to process column {col}: {e}")
-
-        # Combine all engineered features
-        if engineered_features:
-            result_df = pd.concat(engineered_features, axis=1)
-        else:
-            result_df = pd.DataFrame(index=df.index)
+        result_df = self._generate_features_for_dataframe(df)
 
         # Apply feature selection if available
         if self.selected_features:
@@ -370,6 +430,34 @@ class AutoFeatureEngine:
 
         return columns
 
+    def _initialize_interactions(self, df: pd.DataFrame) -> None:
+        """Prepare interaction feature configuration based on available columns."""
+        if not self.interaction_pairs:
+            self.interaction_feature_names = []
+            self.interaction_fill_values = {}
+            return
+
+        available_columns = set(df.columns)
+        filtered_pairs = []
+        feature_names = []
+        fill_values = {}
+
+        for left, right in self.interaction_pairs:
+            if left in available_columns and right in available_columns:
+                filtered_pairs.append((left, right))
+                feature_names.append(f"{left}_x_{right}")
+                for col in (left, right):
+                    if col not in fill_values:
+                        numeric_series = pd.to_numeric(df[col], errors='coerce')
+                        median_value = float(numeric_series.median()) if numeric_series.notna().any() else 0.0
+                        if pd.isna(median_value):
+                            median_value = 0.0
+                        fill_values[col] = median_value
+
+        self.interaction_pairs = filtered_pairs
+        self.interaction_feature_names = feature_names
+        self.interaction_fill_values = fill_values
+
     def _fit_processors(self, df: pd.DataFrame):
         """Fit appropriate processors for each column."""
         if not self.analysis_results:
@@ -408,29 +496,21 @@ class AutoFeatureEngine:
         """Generate mapping of original columns to engineered features."""
         for col, processor in self.processors.items():
             self.feature_map[col] = processor.get_feature_names()
+        if self.interaction_feature_names:
+            self.feature_map['__interactions__'] = self.interaction_feature_names
 
     def _perform_feature_selection(self, train_df: pd.DataFrame, target_col: str):
         """Perform feature selection using the advanced feature selector."""
         try:
             # Generate features first
             feature_columns = list(self.processors.keys())
-            engineered_features = []
+            feature_subset = train_df[feature_columns].copy()
+            X = self._generate_features_for_dataframe(feature_subset)
 
-            for col in feature_columns:
-                if col in train_df.columns:
-                    try:
-                        processor = self.processors[col]
-                        features_df = processor.transform(train_df[col])
-                        engineered_features.append(features_df)
-                    except Exception as e:
-                        logger.warning(f"Failed to generate features for {col} during selection: {e}")
-
-            if not engineered_features:
+            if X.empty:
                 logger.warning("No features generated for feature selection")
                 return
 
-            # Combine features
-            X = pd.concat(engineered_features, axis=1)
             y = train_df[target_col]
 
             # Align indices

@@ -160,7 +160,8 @@ To use the pipeline with a new dataset:
 
 2. **Run the pipeline:**
    ```bash
-   python src/genML/main.py
+   conda source genml
+   python3 src/genML/main.py
    ```
 
 3. **The pipeline will automatically:**

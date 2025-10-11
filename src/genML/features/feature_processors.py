@@ -120,7 +120,7 @@ class NumericalProcessor(BaseProcessor):
             self for method chaining
         """
         self.base_name = data.name or 'feature'
-        clean_data = data.dropna()
+        clean_data = pd.to_numeric(data.dropna(), errors='coerce').dropna()
 
         if len(clean_data) == 0:
             logger.warning(f"No valid data for numerical feature {self.base_name}")
@@ -134,7 +134,19 @@ class NumericalProcessor(BaseProcessor):
         # Calculate bin edges for binning
         if self.enable_binning:
             try:
-                _, self.bin_edges[self.base_name] = pd.cut(clean_data, bins=self.n_bins, retbins=True)
+                desired_bins = min(self.n_bins, max(2, clean_data.nunique()))
+                _, edges = pd.cut(clean_data, bins=desired_bins, retbins=True, duplicates='drop')
+                unique_edges = np.unique(edges)
+                if len(unique_edges) > 2:
+                    self.bin_edges[self.base_name] = unique_edges
+                else:
+                    # Fallback to quantile-based binning for highly discrete data
+                    _, q_edges = pd.qcut(clean_data, q=desired_bins, retbins=True, duplicates='drop')
+                    unique_q_edges = np.unique(q_edges)
+                    if len(unique_q_edges) > 2:
+                        self.bin_edges[self.base_name] = unique_q_edges
+                    else:
+                        self.enable_binning = False
             except Exception as e:
                 logger.warning(f"Could not create bins for {self.base_name}: {e}")
                 self.enable_binning = False
@@ -162,7 +174,12 @@ class NumericalProcessor(BaseProcessor):
         base_name = self.base_name
 
         # Handle missing values
-        data_filled = data.fillna(data.median())
+        data_numeric = pd.to_numeric(data, errors='coerce')
+        median_val = data_numeric.median()
+        if pd.isna(median_val):
+            median_val = 0.0
+
+        data_filled = data_numeric.fillna(median_val)
 
         # Original feature (scaled)
         if self.enable_scaling:
@@ -174,7 +191,12 @@ class NumericalProcessor(BaseProcessor):
         # Binned version
         if self.enable_binning and base_name in self.bin_edges:
             try:
-                binned = pd.cut(data_filled, bins=self.bin_edges[base_name], labels=False, include_lowest=True)
+                binned = pd.cut(
+                    data_filled,
+                    bins=self.bin_edges[base_name],
+                    labels=False,
+                    include_lowest=True
+                )
                 result[f"{base_name}_bin"] = binned.fillna(0).astype(int)
             except Exception as e:
                 logger.warning(f"Could not apply binning to {base_name}: {e}")
@@ -190,7 +212,6 @@ class NumericalProcessor(BaseProcessor):
                 result[f"{base_name}_cubed"] = data_filled ** 3
 
         # Statistical indicators
-        median_val = data.median()
         result[f"{base_name}_above_median"] = (data_filled > median_val).astype(int)
 
         # Missing value indicator

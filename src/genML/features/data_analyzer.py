@@ -9,7 +9,7 @@ to classify columns into meaningful categories for feature engineering.
 import pandas as pd
 import numpy as np
 import re
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from datetime import datetime
 import logging
 
@@ -36,7 +36,7 @@ class DataTypeAnalyzer:
         self.cardinality_threshold = cardinality_threshold
         self.text_uniqueness_threshold = text_uniqueness_threshold
 
-    def analyze_dataset(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def analyze_dataset(self, df: pd.DataFrame, overrides: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Perform comprehensive analysis of dataset structure and column types.
 
@@ -79,6 +79,10 @@ class DataTypeAnalyzer:
                 analysis['datetime_columns'].append(col)
             elif col_type == 'id':
                 analysis['id_columns'].append(col)
+
+        # Apply any manual overrides after automated detection
+        if overrides:
+            self._apply_type_overrides(analysis, overrides)
 
         # Detect potential target columns
         analysis['target_candidates'] = self._identify_target_candidates(df, analysis)
@@ -149,7 +153,7 @@ class DataTypeAnalyzer:
 
         # Check for categorical vs numerical
         if pd.api.types.is_numeric_dtype(series):
-            if self._is_categorical_numeric(non_null_series):
+            if self._is_categorical_numeric(non_null_series, col_name):
                 analysis['detected_type'] = 'categorical'
                 analysis['confidence'] = 0.8
                 analysis['patterns'].append('low_cardinality_numeric')
@@ -172,14 +176,32 @@ class DataTypeAnalyzer:
 
     def _is_id_column(self, series: pd.Series, col_name: str) -> bool:
         """Check if column is likely an ID column."""
+        non_null_series = series.dropna()
+        if len(non_null_series) == 0:
+            return False
+
         # Check column name patterns
         id_name_patterns = ['id', 'key', 'index', 'identifier', 'pk', 'uuid']
-        if any(pattern in col_name.lower() for pattern in id_name_patterns):
+        name_matches = any(pattern in col_name.lower() for pattern in id_name_patterns)
+
+        unique_count = non_null_series.nunique()
+        total_count = len(non_null_series)
+        uniqueness_ratio = unique_count / total_count if total_count else 0.0
+
+        if name_matches and uniqueness_ratio >= 0.9:
+            if pd.api.types.is_numeric_dtype(non_null_series) and self._is_small_int_range(non_null_series):
+                return False
             return True
 
+        if uniqueness_ratio < 0.98:
+            return False
+
+        if pd.api.types.is_numeric_dtype(non_null_series) and self._is_small_int_range(non_null_series):
+            return False
+
         # Check if values are unique and sequential or unique identifiers
-        if series.nunique() == len(series):  # All unique values
-            if self._is_sequential(series) or self._has_id_patterns(series):
+        if unique_count == total_count:
+            if self._is_sequential(non_null_series) or self._has_id_patterns(non_null_series):
                 return True
 
         return False
@@ -209,12 +231,33 @@ class DataTypeAnalyzer:
         """Check if series contains datetime data."""
         result = {'is_datetime': False, 'confidence': 0.0, 'patterns': []}
 
+        non_null_series = series.dropna()
+        if len(non_null_series) == 0:
+            return result
+
+        if pd.api.types.is_numeric_dtype(non_null_series):
+            numeric_sample = pd.to_numeric(non_null_series, errors='coerce')
+            numeric_sample = numeric_sample[~numeric_sample.isnull()]
+            if len(numeric_sample) == 0:
+                return result
+
+            median_magnitude = float(np.nanmedian(np.abs(numeric_sample)))
+            if median_magnitude < 1e8:
+                return result
+
+        if series.dtype == 'object':
+            sample_str = non_null_series.astype(str).head(50)
+            has_date_separators = sample_str.str.contains(r'[-/:]').mean()
+            numeric_like = sample_str.str.fullmatch(r'\d{7,}').mean()
+            if has_date_separators < 0.3 and numeric_like < 0.3:
+                return result
+
         # Try to convert to datetime
         try:
             sample_size = min(100, len(series))
             sample = series.head(sample_size)
 
-            converted = pd.to_datetime(sample, errors='coerce')
+            converted = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True)
             success_rate = converted.notna().sum() / len(sample)
 
             if success_rate > 0.8:
@@ -232,6 +275,18 @@ class DataTypeAnalyzer:
                         result['patterns'].append('time_component')
                 else:
                     result['patterns'].append('numeric_timestamp')
+
+                # Validate year range for numeric timestamps to avoid tiny integers
+                try:
+                    valid_years = converted.dropna().dt.year
+                    if len(valid_years) > 0:
+                        within_range = valid_years.between(1900, 2100).mean()
+                        if within_range < 0.5:
+                            result['is_datetime'] = False
+                            result['confidence'] = 0.0
+                            result['patterns'] = []
+                except Exception:
+                    pass
 
         except Exception:
             pass
@@ -283,17 +338,50 @@ class DataTypeAnalyzer:
 
         return result
 
-    def _is_categorical_numeric(self, series: pd.Series) -> bool:
+    def _is_categorical_numeric(self, series: pd.Series, col_name: str) -> bool:
         """Check if numeric series should be treated as categorical."""
         unique_count = series.nunique()
         total_count = len(series)
+        unique_ratio = unique_count / total_count if total_count else 0.0
+        name_lower = col_name.lower()
+
+        # Booleans should be treated as categorical flags
+        if pd.api.types.is_bool_dtype(series):
+            return True
+
+        # Safely compute numeric range when possible
+        try:
+            value_range = series.max() - series.min() if len(series) > 0 else 0
+        except TypeError:
+            # Range computation failed (likely due to mixed/boolean types)
+            value_range = 0
+
+        # Binary indicators remain categorical
+        if unique_count <= 2:
+            return True
+
+        count_like_keywords = ['num', 'count', 'total', 'sum', 'avg', 'mean', 'rate', 'score', 'amount', 'size']
+        if any(keyword in name_lower for keyword in count_like_keywords):
+            return False
+
+        # Floats with multiple decimal places typically represent continuous values
+        if pd.api.types.is_float_dtype(series):
+            return False
+
+        # Wide numeric range suggests continuous numeric feature even with limited unique values
+        if value_range >= 10 and unique_count >= 4:
+            return False
+
+        # High uniqueness ratio suggests numeric rather than categorical
+        if unique_ratio >= max(0.2, self.cardinality_threshold * 2):
+            return False
 
         # Low cardinality suggests categorical
         if unique_count <= 10:
             return True
 
         # Check cardinality ratio
-        if unique_count / total_count < self.cardinality_threshold:
+        if unique_ratio < self.cardinality_threshold and unique_count < 50:
             return True
 
         # Check for integer values that might be codes
@@ -301,6 +389,52 @@ class DataTypeAnalyzer:
             return True
 
         return False
+
+    def _is_small_int_range(self, series: pd.Series) -> bool:
+        """Determine if numeric series covers only a very small integer range."""
+        if not pd.api.types.is_numeric_dtype(series):
+            return False
+
+        unique_count = series.nunique()
+        if unique_count == 0 or unique_count > 15:
+            return False
+
+        value_range = series.max() - series.min()
+        return value_range <= max(50, unique_count * 4)
+
+    def _apply_type_overrides(self, analysis: Dict[str, Any], overrides: Dict[str, str]) -> None:
+        """Apply manual type overrides to analysis results."""
+        valid_types = {'numerical', 'categorical', 'text', 'datetime', 'id'}
+
+        for col, forced_type in overrides.items():
+            if forced_type not in valid_types:
+                continue
+            if col not in analysis['column_types']:
+                continue
+
+            current_type = analysis['column_types'][col]['detected_type']
+            if current_type == forced_type:
+                continue
+
+            # Remove column from current type lists
+            type_lists = {
+                'numerical': analysis['numerical_columns'],
+                'categorical': analysis['categorical_columns'],
+                'text': analysis['text_columns'],
+                'datetime': analysis['datetime_columns'],
+                'id': analysis['id_columns']
+            }
+            if current_type in type_lists and col in type_lists[current_type]:
+                type_lists[current_type].remove(col)
+
+            # Add column to forced type list
+            type_lists[forced_type].append(col)
+
+            column_info = analysis['column_types'][col]
+            column_info['detected_type'] = forced_type
+            column_info['confidence'] = 1.0
+            if 'manual_override' not in column_info['patterns']:
+                column_info['patterns'].append('manual_override')
 
     def _identify_target_candidates(self, df: pd.DataFrame, analysis: Dict) -> List[str]:
         """Identify potential target columns."""

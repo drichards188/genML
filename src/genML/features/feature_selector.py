@@ -61,7 +61,7 @@ class AdvancedFeatureSelector:
         self.enable_statistical_tests = self.config.get('enable_statistical_tests', True)
         self.enable_model_based = self.config.get('enable_model_based', True)
         self.enable_iterative = self.config.get('enable_iterative', False)  # Expensive
-        self.selection_strategy = self.config.get('selection_strategy', 'ensemble')  # 'ensemble', 'best', 'union'
+        self.selection_strategy = self.config.get('selection_strategy', 'union')  # 'ensemble', 'best', 'union'
 
     def select_features(self, X: pd.DataFrame, y: pd.Series,
                        problem_type: str = 'auto') -> Tuple[List[str], Dict[str, Any]]:
