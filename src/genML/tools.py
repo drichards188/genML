@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import VotingRegressor, VotingClassifier
 import xgboost as xgb
 import joblib
 from pathlib import Path
@@ -32,6 +33,13 @@ try:
 except ImportError:
     lgb = None
     LIGHTGBM_AVAILABLE = False
+
+try:
+    import catboost as cb
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    cb = None
+    CATBOOST_AVAILABLE = False
 
 # Import GPU utilities for unified GPU acceleration support
 from src.genML.gpu_utils import (
@@ -69,11 +77,11 @@ for dir_path in [OUTPUTS_DIR, DATA_DIR, FEATURES_DIR, MODELS_DIR, PREDICTIONS_DI
 # Hyperparameter Tuning Configuration
 TUNING_CONFIG = {
     'enabled': True,                          # Enable/disable hyperparameter tuning
-    'n_trials': 50,                          # Number of Optuna trials per model
+    'n_trials': 100,                         # Number of Optuna trials per model
     'timeout': 600,                          # Max seconds per model tuning (10 min)
     'n_jobs': -1,                            # Parallel jobs (-1 = all cores)
     'show_progress_bar': True,               # Show Optuna progress
-    'models_to_tune': ['Random Forest', 'XGBoost', 'Logistic Regression', 'Linear Regression']
+    'models_to_tune': ['Random Forest', 'XGBoost', 'CatBoost', 'Logistic Regression', 'Linear Regression']
 }
 
 # GPU Acceleration Configuration
@@ -246,7 +254,7 @@ def engineer_features() -> str:
                 'n_bins': 5
             },
             'categorical_config': {
-                'encoding_method': 'label',
+                'encoding_method': 'target',
                 'enable_frequency': True,
                 'max_categories': 20
             },
@@ -685,6 +693,51 @@ def optimize_linear_model(trial, X, y, problem_type, cv):
     return scores.mean()
 
 
+def optimize_catboost(trial, X, y, problem_type, cv):
+    """
+    Optuna objective function for CatBoost hyperparameter optimization.
+    CatBoost supports GPU acceleration natively.
+
+    Args:
+        trial: Optuna trial object
+        X: Training features
+        y: Training target
+        problem_type: 'regression' or 'classification'
+        cv: Cross-validation splitter
+
+    Returns:
+        Mean cross-validation score
+    """
+    # Suggest hyperparameters
+    params = {
+        'iterations': trial.suggest_int('cb_iterations', 100, 500),
+        'learning_rate': trial.suggest_float('cb_learning_rate', 0.01, 0.3, log=True),
+        'depth': trial.suggest_int('cb_depth', 4, 10),
+        'l2_leaf_reg': trial.suggest_float('cb_l2_leaf_reg', 1.0, 10.0),
+        'border_count': trial.suggest_int('cb_border_count', 32, 255),
+        'random_state': 42,
+        'verbose': False,
+        'task_type': 'GPU' if is_cuml_available() or is_xgboost_gpu_available() else 'CPU',
+        'devices': '0' if is_cuml_available() or is_xgboost_gpu_available() else None
+    }
+
+    # Create model based on problem type
+    if problem_type == 'regression':
+        model = cb.CatBoostRegressor(**params)
+        scoring = 'neg_mean_squared_error'
+    else:
+        model = cb.CatBoostClassifier(**params)
+        scoring = 'accuracy'
+
+    # Evaluate with cross-validation
+    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+
+    # Clean up model to free memory immediately after scoring
+    del model
+
+    return scores.mean()
+
+
 def cleanup_memory(stage_name="", aggressive=False):
     """
     Force garbage collection and GPU memory cleanup to prevent memory leaks.
@@ -734,6 +787,15 @@ def cleanup_memory(stage_name="", aggressive=False):
         except Exception as e:
             logger.warning(f"[Cleanup] GPU memory cleanup failed: {e}")
 
+    if CATBOOST_AVAILABLE:
+        try:
+            clear_cache = getattr(getattr(cb, '_catboost', None), 'clear_cache', None)
+            if clear_cache:
+                logger.info(f"[Cleanup] Clearing CatBoost internal cache")
+                clear_cache()
+        except Exception as e:
+            logger.warning(f"[Cleanup] CatBoost cache cleanup failed: {e}")
+
 
 def train_model_pipeline() -> str:
     """
@@ -778,28 +840,95 @@ def train_model_pipeline() -> str:
         else:
             print("ℹ️ LightGBM not installed - install `lightgbm` to enable that model option.")
 
+        if CATBOOST_AVAILABLE:
+            print("✅ CatBoost detected - adding CatBoost model to ensemble.")
+        else:
+            print("ℹ️ CatBoost not installed - install `catboost` to enable that model option.")
+
         # Get GPU-aware model classes using smart imports
         LinearRegressionClass = get_linear_model_regressor()
         LogisticRegressionClass = get_linear_model_classifier()
         RandomForestRegressorClass = get_random_forest_regressor()
         RandomForestClassifierClass = get_random_forest_classifier()
 
+        def make_factory(constructor, base_params=None):
+            """
+            Create a factory that instantiates estimators with optional overrides.
+
+            Using factories keeps heavy estimators out of long-lived scopes so they
+            can be garbage collected promptly, which helps avoid GPU memory leaks.
+            """
+            base_params = base_params or {}
+
+            def factory(overrides=None):
+                params = base_params.copy()
+                if overrides:
+                    params.update(overrides)
+                return constructor(**params)
+
+            return factory
+
+        def make_xgb_regressor_factory():
+            def factory(overrides=None):
+                params = {'random_state': 42}
+                params.update(get_xgboost_params())
+                if overrides:
+                    params.update(overrides)
+                return xgb.XGBRegressor(**params)
+
+            return factory
+
+        def make_xgb_classifier_factory():
+            def factory(overrides=None):
+                params = {'random_state': 42, 'eval_metric': 'logloss'}
+                params.update(get_xgboost_params())
+                if overrides:
+                    params.update(overrides)
+                return xgb.XGBClassifier(**params)
+
+            return factory
+
+        def make_catboost_factory(constructor):
+            def factory(overrides=None):
+                params = {
+                    'iterations': 200,
+                    'learning_rate': 0.05,
+                    'depth': 6,
+                    'random_state': 42,
+                    'verbose': False,
+                }
+                if is_cuml_available() or is_xgboost_gpu_available():
+                    params.update({'task_type': 'GPU', 'devices': '0'})
+                if overrides:
+                    params.update(overrides)
+                return constructor(**params)
+
+            return factory
+
         # Define model ensemble based on problem type
         # Each model has different strengths and biases
         # Models automatically use GPU (cuML) if available, otherwise CPU (sklearn)
         if problem_type == 'regression':
             models = {
-                'Linear Regression': LinearRegressionClass(),                                    # Linear, interpretable
-                'Random Forest': RandomForestRegressorClass(n_estimators=100, random_state=42),  # Non-linear, robust (GPU if cuML available)
-                'XGBoost': xgb.XGBRegressor(random_state=42, **get_xgboost_params())             # Gradient boosting, high performance (GPU if available)
+                'Linear Regression': make_factory(LinearRegressionClass),  # Linear, interpretable
+                'Random Forest': make_factory(
+                    RandomForestRegressorClass,
+                    {'n_estimators': 100, 'random_state': 42}
+                ),  # Non-linear, robust (GPU if cuML available)
+                'XGBoost': make_xgb_regressor_factory()  # Gradient boosting, high performance (GPU if available)
             }
             if LIGHTGBM_AVAILABLE:
-                models['LightGBM'] = lgb.LGBMRegressor(
-                    random_state=42,
-                    n_estimators=200,
-                    learning_rate=0.05,
-                    n_jobs=-1
+                models['LightGBM'] = make_factory(
+                    lgb.LGBMRegressor,
+                    {
+                        'random_state': 42,
+                        'n_estimators': 200,
+                        'learning_rate': 0.05,
+                        'n_jobs': -1
+                    }
                 )
+            if CATBOOST_AVAILABLE:
+                models['CatBoost'] = make_catboost_factory(cb.CatBoostRegressor)
             # Use regular KFold for regression (no need to preserve class distribution)
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
             # Use regression scoring metric
@@ -807,40 +936,84 @@ def train_model_pipeline() -> str:
             best_score = float('-inf')  # Higher (less negative) is better for MSE
         else:  # classification
             models = {
-                'Logistic Regression': LogisticRegressionClass(random_state=42, max_iter=1000),  # Linear, interpretable
-                'Random Forest': RandomForestClassifierClass(n_estimators=100, random_state=42), # Non-linear, robust (GPU if cuML available)
-                'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss', **get_xgboost_params())  # Gradient boosting, high performance (GPU if available)
+                'Logistic Regression': make_factory(
+                    LogisticRegressionClass,
+                    {'random_state': 42, 'max_iter': 1000}
+                ),  # Linear, interpretable
+                'Random Forest': make_factory(
+                    RandomForestClassifierClass,
+                    {'n_estimators': 100, 'random_state': 42}
+                ),  # Non-linear, robust (GPU if cuML available)
+                'XGBoost': make_xgb_classifier_factory()  # Gradient boosting, high performance (GPU if available)
             }
             if LIGHTGBM_AVAILABLE:
-                models['LightGBM'] = lgb.LGBMClassifier(
-                    random_state=42,
-                    n_estimators=200,
-                    learning_rate=0.05,
-                    n_jobs=-1,
-                    objective='binary'
+                models['LightGBM'] = make_factory(
+                    lgb.LGBMClassifier,
+                    {
+                        'random_state': 42,
+                        'n_estimators': 200,
+                        'learning_rate': 0.05,
+                        'n_jobs': -1,
+                        'objective': 'binary'
+                    }
                 )
+            if CATBOOST_AVAILABLE:
+                models['CatBoost'] = make_catboost_factory(cb.CatBoostClassifier)
             # Use StratifiedKFold to preserve class distribution in each fold
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
             # Use classification scoring metric
             scoring_metric = 'accuracy'
             best_score = 0  # Higher is better for accuracy
 
+        def evaluate_with_default_params(model_name, factory_fn):
+            """
+            Run cross-validation on the estimator built from the factory.
+            The estimator is created inside this helper so it can be freed immediately.
+            """
+            import warnings
+
+            estimator = factory_fn()
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
+                    # Use n_jobs=1 for XGBoost GPU (GPU parallelizes internally)
+                    n_jobs_param = 1 if 'XGBoost' in model_name and is_xgboost_gpu_available() else -1
+                    return cross_val_score(
+                        estimator,
+                        X_train,
+                        y_train,
+                        cv=cv,
+                        scoring=scoring_metric,
+                        n_jobs=n_jobs_param
+                    )
+            finally:
+                # Explicitly delete estimator before cleanup to release GPU memory
+                del estimator
+
         # Model evaluation pipeline with Optuna hyperparameter tuning
         # Systematically evaluate each model using cross-validation with optimized hyperparameters
         results = {}
         best_model_name = None
-        best_model = None
+        best_model_factory = None
+        best_model_params = None
+        best_model_object = None
         tuned_params = {}  # Store best hyperparameters for each model
 
         # Suppress Optuna's default logging to reduce clutter
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        for name, model in models.items():
+        for name, model_factory in models.items():
             print(f"\n{'='*60}")
             print(f"Training {name}...")
             print(f"{'='*60}")
             logger.info(f"[Training] Starting training for {name}")
             logger.info(f"[Training] Training data shape: X={X_train.shape}, y={y_train.shape}")
+
+            used_params = None
+            model_mean_score = None
+            model_std_score = 0.0
+            model_scores_list = []
+            tuned_flag = False
 
             # Check if this model should be tuned
             if TUNING_CONFIG['enabled'] and name in TUNING_CONFIG['models_to_tune']:
@@ -863,6 +1036,8 @@ def train_model_pipeline() -> str:
                     objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
                 elif name == 'XGBoost':
                     objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
+                elif name == 'CatBoost':
+                    objective = lambda trial: optimize_catboost(trial, X_train, y_train, problem_type, cv)
                 elif name == 'Logistic Regression' or name == 'Linear Regression':
                     objective = lambda trial: optimize_linear_model(trial, X_train, y_train, problem_type, cv)
                 else:
@@ -903,27 +1078,12 @@ def train_model_pipeline() -> str:
                     prefix_map = {
                         'Random Forest': 'rf_',
                         'XGBoost': 'xgb_',
+                        'CatBoost': 'cb_',
                         'Logistic Regression': 'lr_',
                         'Linear Regression': 'linreg_'
                     }
                     prefix = prefix_map.get(name, '')
                     clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
-
-                    # Create tuned model using GPU-aware imports
-                    if problem_type == 'regression':
-                        if name == 'Random Forest':
-                            model = RandomForestRegressorClass(**clean_params)
-                        elif name == 'XGBoost':
-                            model = xgb.XGBRegressor(**clean_params, **get_xgboost_params())
-                        elif name == 'Linear Regression':
-                            model = LinearRegressionClass(**clean_params)
-                    else:
-                        if name == 'Random Forest':
-                            model = RandomForestClassifierClass(**clean_params)
-                        elif name == 'XGBoost':
-                            model = xgb.XGBClassifier(**clean_params, eval_metric='logloss', **get_xgboost_params())
-                        elif name == 'Logistic Regression':
-                            model = LogisticRegressionClass(**clean_params)
 
                     # Use best score from optimization
                     best_trial_score = study.best_value
@@ -933,60 +1093,62 @@ def train_model_pipeline() -> str:
                     print(f"   Best score: {best_trial_score:.6f}")
                     print(f"   Best params: {clean_params}")
 
+                    model_mean_score = float(best_trial_score)
+                    model_std_score = float(np.std(trial_scores[-5:])) if len(trial_scores) >= 5 else 0.0
+                    model_scores_list = trial_scores[-5:]  # Last 5 trial scores
+                    used_params = clean_params
+                    tuned_flag = True
+
                     results[name] = {
-                        'mean_score': float(best_trial_score),
-                        'std_score': float(np.std(trial_scores[-5:])) if len(trial_scores) >= 5 else 0.0,
-                        'individual_scores': trial_scores[-5:],  # Last 5 trial scores
+                        'mean_score': model_mean_score,
+                        'std_score': model_std_score,
+                        'individual_scores': model_scores_list,
                         'best_params': clean_params,
                         'n_trials': len(study.trials),
                         'tuned': True
                     }
 
-                    if best_trial_score > best_score:
-                        best_score = best_trial_score
-                        best_model_name = name
-                        best_model = model
+                    # Ensure Optuna study objects don't linger in memory
+                    del study
                 else:
                     # Model doesn't have tuning function, use default
                     print(f"   ⚠️  No tuning function available for {name}, using defaults")
-                    scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring_metric)
+                    scores = evaluate_with_default_params(name, model_factory)
+                    model_mean_score = float(scores.mean())
+                    model_std_score = float(scores.std())
+                    model_scores_list = scores.tolist()
                     results[name] = {
-                        'mean_score': float(scores.mean()),
-                        'std_score': float(scores.std()),
-                        'individual_scores': scores.tolist(),
+                        'mean_score': model_mean_score,
+                        'std_score': model_std_score,
+                        'individual_scores': model_scores_list,
                         'tuned': False
                     }
-
-                    if scores.mean() > best_score:
-                        best_score = scores.mean()
-                        best_model_name = name
-                        best_model = model
+                    print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
 
             else:
                 # Model tuning disabled or not in tuning list - use defaults
                 print(f"   Using default hyperparameters...")
 
-                # Suppress XGBoost GPU device mismatch warnings for cleaner output
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
-                    # Use n_jobs=1 for XGBoost GPU (GPU parallelizes internally)
-                    n_jobs_param = 1 if 'XGBoost' in name and is_xgboost_gpu_available() else -1
-                    scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=n_jobs_param)
+                scores = evaluate_with_default_params(name, model_factory)
+                model_mean_score = float(scores.mean())
+                model_std_score = float(scores.std())
+                model_scores_list = scores.tolist()
 
                 results[name] = {
-                    'mean_score': float(scores.mean()),
-                    'std_score': float(scores.std()),
-                    'individual_scores': scores.tolist(),
+                    'mean_score': model_mean_score,
+                    'std_score': model_std_score,
+                    'individual_scores': model_scores_list,
                     'tuned': False
                 }
 
-                print(f"   Score: {scores.mean():.6f} (+/- {scores.std():.6f})")
+                print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
 
-                if scores.mean() > best_score:
-                    best_score = scores.mean()
-                    best_model_name = name
-                    best_model = model
+            if model_mean_score is not None and model_mean_score > best_score:
+                best_score = model_mean_score
+                best_model_name = name
+                best_model_factory = model_factory
+                best_model_params = used_params
+                best_model_object = None
 
             # Clean up memory after each model evaluation
             # Use aggressive cleanup for Random Forest to combat cuML memory leaks
@@ -995,6 +1157,89 @@ def train_model_pipeline() -> str:
             cleanup_memory(f"After {name} evaluation", aggressive=is_rf)
             logger.info(f"[Training] {name} - Post-evaluation cleanup completed")
             logger.info(f"[Training] {name} - Training completed")
+
+        # Create ensemble of top models
+        print(f"\n{'='*60}")
+        print(f"Creating Weighted Ensemble...")
+        print(f"{'='*60}")
+
+        # Sort models by score and select top performers for ensemble
+        sorted_models = sorted(results.items(), key=lambda x: x[1]['mean_score'], reverse=True)
+        top_models = [m for m in sorted_models[:min(3, len(sorted_models))]]  # Top 3 models
+
+        if len(top_models) >= 2:
+            print(f"Ensemble members: {[m[0] for m in top_models]}")
+
+            # Create ensemble estimators list with fitted models
+            ensemble_estimators = []
+            ensemble_weights = []
+
+            for model_name, model_results in top_models:
+                factory = models.get(model_name)
+                if not factory:
+                    logger.warning(f"[Ensemble] Missing factory for {model_name}, skipping")
+                    continue
+
+                overrides = model_results.get('best_params') if model_results.get('tuned') else None
+                m = factory(overrides)
+
+                ensemble_estimators.append((model_name.lower().replace(' ', '_'), m))
+                # Weight by relative performance (higher score = higher weight)
+                ensemble_weights.append(model_results['mean_score'])
+
+            if len(ensemble_estimators) < 2:
+                print("Not enough valid models for ensembling after filtering tuned members.")
+                cleanup_memory("After ensemble evaluation", aggressive=False)
+            else:
+                # Normalize weights to sum to 1
+                min_weight = min(ensemble_weights)
+                ensemble_weights = [w - min_weight + 0.1 for w in ensemble_weights]  # Add small constant
+                weight_sum = sum(ensemble_weights)
+                ensemble_weights = [w / weight_sum for w in ensemble_weights]
+
+                print(f"Ensemble weights: {dict(zip([m[0] for m in top_models], [f'{w:.3f}' for w in ensemble_weights]))}")
+
+                # Create ensemble
+                if problem_type == 'regression':
+                    ensemble = VotingRegressor(estimators=ensemble_estimators, weights=ensemble_weights)
+                else:
+                    ensemble = VotingClassifier(estimators=ensemble_estimators, weights=ensemble_weights, voting='soft')
+
+                # Evaluate ensemble with cross-validation
+                print("Evaluating ensemble...")
+                ensemble_scores = cross_val_score(ensemble, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=1)
+                ensemble_mean_score = ensemble_scores.mean()
+
+                print(f"Ensemble CV Score: {ensemble_mean_score:.6f} (+/- {ensemble_scores.std():.6f})")
+
+                # Add ensemble to results
+                results['Ensemble'] = {
+                    'mean_score': float(ensemble_mean_score),
+                    'std_score': float(ensemble_scores.std()),
+                    'individual_scores': ensemble_scores.tolist(),
+                    'members': [m[0] for m in top_models],
+                    'weights': ensemble_weights,
+                    'tuned': False
+                }
+
+                # Check if ensemble beats best individual model
+                if ensemble_mean_score > best_score:
+                    print(f"✅ Ensemble improves over best individual model!")
+                    print(f"   Improvement: {((ensemble_mean_score - best_score) / abs(best_score) * 100):.2f}%")
+                    best_score = ensemble_mean_score
+                    best_model_name = 'Ensemble'
+                    best_model_factory = None
+                    best_model_params = None
+                    best_model_object = ensemble
+                else:
+                    print(f"Individual model {best_model_name} still wins")
+                    print(f"   Difference: {((best_score - ensemble_mean_score) / abs(best_score) * 100):.2f}%")
+                    # Release ensemble estimators aggressively when not selected
+                    del ensemble
+
+                cleanup_memory("After ensemble evaluation", aggressive=False)
+        else:
+            print("Not enough models for ensembling (need at least 2)")
 
         # Train the selected model on full training dataset
         print(f"\n{'='*60}")
@@ -1011,6 +1256,13 @@ def train_model_pipeline() -> str:
             print(f"ℹ️  Using GPU acceleration (XGBoost) for {best_model_name}")
         else:
             print(f"ℹ️  Using CPU for {best_model_name}")
+
+        if best_model_name == 'Ensemble':
+            best_model = best_model_object
+        else:
+            if best_model_factory is None:
+                raise RuntimeError(f"No factory available to instantiate best model '{best_model_name}'")
+            best_model = best_model_factory(best_model_params)
 
         # This gives the model access to all available training data
         log_gpu_memory("Before Final Training")
