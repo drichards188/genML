@@ -193,9 +193,11 @@ def get_gpu_memory_usage() -> Optional[float]:
         )
         if result.returncode == 0:
             memory_mb = float(result.stdout.strip())
-            return memory_mb / 1024
-    except Exception:
-        pass
+            memory_gb = memory_mb / 1024
+            logger.debug(f"GPU memory usage: {memory_gb:.2f}GB ({memory_mb:.0f}MB)")
+            return memory_gb
+    except Exception as e:
+        logger.debug(f"Failed to get GPU memory usage: {e}")
     return None
 
 

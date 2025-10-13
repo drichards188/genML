@@ -12,17 +12,17 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
-from sklearn.linear_model import ElasticNet
 import xgboost as xgb
 import joblib
 from pathlib import Path
 from datetime import datetime
 import logging
 import traceback
+import gc  # For explicit garbage collection to prevent memory leaks
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+# Note: Full logging setup is done in logging_config.py and initialized in main.py
+# This just creates a logger instance for this module
 logger = logging.getLogger(__name__)
 import optuna
 from optuna.samplers import TPESampler
@@ -42,6 +42,7 @@ from src.genML.gpu_utils import (
     get_random_forest_regressor,
     get_xgboost_params,
     log_gpu_memory,
+    get_gpu_memory_usage,
     is_cuml_available,
     is_xgboost_gpu_available
 )
@@ -72,7 +73,7 @@ TUNING_CONFIG = {
     'timeout': 600,                          # Max seconds per model tuning (10 min)
     'n_jobs': -1,                            # Parallel jobs (-1 = all cores)
     'show_progress_bar': True,               # Show Optuna progress
-    'models_to_tune': ['XGBoost']  # Only tune XGBoost (GPU-accelerated)
+    'models_to_tune': ['Random Forest', 'XGBoost', 'Logistic Regression', 'Linear Regression']
 }
 
 # GPU Acceleration Configuration
@@ -82,6 +83,17 @@ GPU_CONFIG = {
     'enable_xgboost_gpu': True,              # Enable XGBoost GPU acceleration
     'log_gpu_memory': True,                  # Log GPU memory usage during training
     'gpu_memory_threshold_gb': 14.0,         # Warning threshold for GPU memory (GB)
+}
+
+# Memory Management Configuration (Prevents WSL2 crashes and memory leaks)
+MEMORY_CONFIG = {
+    'max_parallel_jobs': 1,                  # Limit parallel jobs to prevent memory exhaustion (WSL2-safe: serial execution)
+    'enable_gc_between_trials': True,        # Force garbage collection between Optuna trials
+    'enable_gpu_memory_cleanup': True,       # Clear GPU memory between trials (cuML)
+    'cv_n_jobs_limit': 1,                    # Limit cross-validation parallel jobs (WSL2-safe: serial execution)
+    'max_trees_random_forest': 100,          # Limit Random Forest max trees to prevent memory exhaustion (reduced from 150)
+    'rf_cv_folds': 3,                        # Reduce CV folds for Random Forest to limit memory usage
+    'aggressive_rf_cleanup': True,           # Enable aggressive cleanup for Random Forest (prevents cuML leaks)
 }
 
 
@@ -446,6 +458,9 @@ def optimize_random_forest(trial, X, y, problem_type, cv):
     Optuna objective function for Random Forest hyperparameter optimization.
     Uses cuML RandomForest (GPU) if available, otherwise sklearn (CPU).
 
+    Memory-safe implementation: Limits parallel jobs to prevent WSL2 crashes.
+    Includes aggressive memory cleanup to prevent cuML memory leaks.
+
     Args:
         trial: Optuna trial object
         X: Training features
@@ -456,35 +471,98 @@ def optimize_random_forest(trial, X, y, problem_type, cv):
     Returns:
         Mean cross-validation score
     """
-    # Suggest hyperparameters (compatible with both cuML and sklearn)
-    params = {
-        'n_estimators': trial.suggest_int('rf_n_estimators', 50, 300),
-        'max_depth': trial.suggest_int('rf_max_depth', 5, 30),
-        'random_state': 42
-    }
+    logger.info(f"[RF Trial {trial.number}] Starting Random Forest optimization trial")
+    logger.info(f"[RF Trial {trial.number}] Input shapes: X={X.shape}, y={y.shape}")
+    logger.info(f"[RF Trial {trial.number}] Problem type: {problem_type}")
+    logger.info(f"[RF Trial {trial.number}] Using {'cuML (GPU)' if is_cuml_available() else 'sklearn (CPU)'}")
 
-    # Add sklearn-specific parameters if using CPU (not supported by cuML)
-    if not is_cuml_available():
-        params.update({
-            'min_samples_split': trial.suggest_int('rf_min_samples_split', 2, 20),
-            'min_samples_leaf': trial.suggest_int('rf_min_samples_leaf', 1, 10),
-            'max_features': trial.suggest_categorical('rf_max_features', ['sqrt', 'log2', None]),
-            'n_jobs': -1
-        })
+    try:
+        # Suggest hyperparameters (compatible with both cuML and sklearn)
+        logger.info(f"[RF Trial {trial.number}] Suggesting hyperparameters...")
+        params = {
+            'n_estimators': trial.suggest_int('rf_n_estimators', 50, MEMORY_CONFIG['max_trees_random_forest']),
+            'max_depth': trial.suggest_int('rf_max_depth', 5, 15),  # Reduced from 30 to prevent GPU OOM crashes
+            'random_state': 42
+        }
+        logger.info(f"[RF Trial {trial.number}] Base params: n_estimators={params['n_estimators']}, max_depth={params['max_depth']}")
 
-    # Create model based on problem type using smart imports
-    if problem_type == 'regression':
-        RandomForestRegressorClass = get_random_forest_regressor()
-        model = RandomForestRegressorClass(**params)
-        scoring = 'neg_mean_squared_error'
-    else:
-        RandomForestClassifierClass = get_random_forest_classifier()
-        model = RandomForestClassifierClass(**params)
-        scoring = 'accuracy'
+        # Add sklearn-specific parameters if using CPU (not supported by cuML)
+        if not is_cuml_available():
+            logger.info(f"[RF Trial {trial.number}] Adding sklearn-specific parameters...")
+            params.update({
+                'min_samples_split': trial.suggest_int('rf_min_samples_split', 2, 20),
+                'min_samples_leaf': trial.suggest_int('rf_min_samples_leaf', 1, 10),
+                'max_features': trial.suggest_categorical('rf_max_features', ['sqrt', 'log2', None]),
+                'n_jobs': MEMORY_CONFIG['max_parallel_jobs']  # Limit parallel jobs to prevent memory exhaustion
+            })
+            logger.info(f"[RF Trial {trial.number}] Extended params: {params}")
 
-    # Evaluate with cross-validation
-    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
-    return scores.mean()
+        # Create model based on problem type using smart imports
+        logger.info(f"[RF Trial {trial.number}] Creating Random Forest model...")
+        if problem_type == 'regression':
+            RandomForestRegressorClass = get_random_forest_regressor()
+            logger.info(f"[RF Trial {trial.number}] Using {RandomForestRegressorClass.__module__}.{RandomForestRegressorClass.__name__}")
+            model = RandomForestRegressorClass(**params)
+            scoring = 'neg_mean_squared_error'
+        else:
+            RandomForestClassifierClass = get_random_forest_classifier()
+            logger.info(f"[RF Trial {trial.number}] Using {RandomForestClassifierClass.__module__}.{RandomForestClassifierClass.__name__}")
+            model = RandomForestClassifierClass(**params)
+            scoring = 'accuracy'
+        logger.info(f"[RF Trial {trial.number}] Model created successfully")
+
+        # Evaluate with cross-validation (limit CV parallelism for memory-intensive Random Forest)
+        cv_n_jobs = MEMORY_CONFIG['cv_n_jobs_limit'] if not is_cuml_available() else 1
+        logger.info(f"[RF Trial {trial.number}] Starting cross-validation with {cv.get_n_splits()} folds, cv_n_jobs={cv_n_jobs}")
+        logger.info(f"[RF Trial {trial.number}] Scoring metric: {scoring}")
+
+        # Log GPU memory before CV if available
+        if is_cuml_available():
+            memory_gb = get_gpu_memory_usage()
+            if memory_gb is not None:
+                logger.info(f"[RF Trial {trial.number}] GPU memory before CV: {memory_gb:.2f}GB")
+
+        scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=cv_n_jobs)
+        logger.info(f"[RF Trial {trial.number}] Cross-validation completed")
+        logger.info(f"[RF Trial {trial.number}] CV scores: {scores}")
+
+        # Store result before cleanup
+        mean_score = scores.mean()
+        logger.info(f"[RF Trial {trial.number}] Mean score: {mean_score:.6f}")
+
+        # Aggressive cleanup to prevent cuML memory leaks
+        # cuML RandomForest stores tree metadata on CPU that isn't automatically freed
+        logger.info(f"[RF Trial {trial.number}] Starting cleanup...")
+        del model
+        del scores
+
+        # Force garbage collection immediately
+        gc.collect()
+        logger.info(f"[RF Trial {trial.number}] Garbage collection completed")
+
+        # Clean up GPU memory if using cuML
+        if is_cuml_available():
+            try:
+                import cupy as cp
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+                memory_gb = get_gpu_memory_usage()
+                if memory_gb is not None:
+                    logger.info(f"[RF Trial {trial.number}] GPU memory after cleanup: {memory_gb:.2f}GB")
+                logger.info(f"[RF Trial {trial.number}] GPU memory cleanup completed")
+            except Exception as e:
+                logger.warning(f"[RF Trial {trial.number}] GPU cleanup failed: {e}")
+
+        logger.info(f"[RF Trial {trial.number}] Trial completed successfully, returning score: {mean_score:.6f}")
+        return mean_score
+
+    except Exception as e:
+        logger.error(f"[RF Trial {trial.number}] CRASHED with error: {str(e)}")
+        logger.error(f"[RF Trial {trial.number}] Error type: {type(e).__name__}")
+        logger.error(f"[RF Trial {trial.number}] Traceback:")
+        import traceback as tb
+        logger.error(tb.format_exc())
+        raise
 
 
 def optimize_xgboost(trial, X, y, problem_type, cv):
@@ -536,7 +614,125 @@ def optimize_xgboost(trial, X, y, problem_type, cv):
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
         scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)  # n_jobs=1 for GPU
+
+    # Clean up model to free memory immediately after scoring
+    del model
+
     return scores.mean()
+
+
+def optimize_linear_model(trial, X, y, problem_type, cv):
+    """
+    Optuna objective function for Linear/Logistic Regression hyperparameter optimization.
+    Uses GPU-aware imports (cuML if available, sklearn fallback).
+
+    Args:
+        trial: Optuna trial object
+        X: Training features
+        y: Training target
+        problem_type: 'regression' or 'classification'
+        cv: Cross-validation splitter
+
+    Returns:
+        Mean cross-validation score
+    """
+    if problem_type == 'classification':
+        # Logistic Regression hyperparameters
+        params = {
+            'max_iter': trial.suggest_int('lr_max_iter', 100, 2000),
+            'random_state': 42
+        }
+
+        # Add sklearn-specific parameters if using CPU (not all supported by cuML)
+        if not is_cuml_available():
+            params.update({
+                'C': trial.suggest_float('lr_C', 0.001, 10.0, log=True),
+                'penalty': trial.suggest_categorical('lr_penalty', ['l1', 'l2', 'elasticnet', 'none']),
+                'solver': trial.suggest_categorical('lr_solver', ['lbfgs', 'saga']),
+            })
+            # Handle penalty-solver compatibility
+            if params['penalty'] == 'elasticnet':
+                params['solver'] = 'saga'
+                params['l1_ratio'] = trial.suggest_float('lr_l1_ratio', 0.0, 1.0)
+            elif params['penalty'] == 'l1':
+                params['solver'] = 'saga'
+            elif params['penalty'] == 'none':
+                params['solver'] = 'lbfgs'
+
+        LogisticRegressionClass = get_linear_model_classifier()
+        model = LogisticRegressionClass(**params)
+        scoring = 'accuracy'
+    else:
+        # Linear Regression hyperparameters (fewer to tune)
+        params = {
+            'fit_intercept': trial.suggest_categorical('linreg_fit_intercept', [True, False])
+        }
+
+        # Add sklearn-specific parameters
+        if not is_cuml_available():
+            params['positive'] = trial.suggest_categorical('linreg_positive', [True, False])
+
+        LinearRegressionClass = get_linear_model_regressor()
+        model = LinearRegressionClass(**params)
+        scoring = 'neg_mean_squared_error'
+
+    # Evaluate with cross-validation (limit parallelism for WSL2 stability)
+    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+
+    # Clean up model to free memory immediately after scoring
+    del model
+
+    return scores.mean()
+
+
+def cleanup_memory(stage_name="", aggressive=False):
+    """
+    Force garbage collection and GPU memory cleanup to prevent memory leaks.
+    Critical for preventing WSL2 crashes during long training runs.
+
+    Args:
+        stage_name: Name of the stage for logging purposes
+        aggressive: If True, run multiple GC passes (useful for cuML leaks)
+    """
+    logger.info(f"[Cleanup] Starting cleanup for: {stage_name} (aggressive={aggressive})")
+
+    # Log memory before cleanup
+    if is_cuml_available():
+        mem_before = get_gpu_memory_usage()
+        if mem_before:
+            logger.info(f"[Cleanup] GPU memory before cleanup: {mem_before:.2f}GB")
+
+    if MEMORY_CONFIG['enable_gc_between_trials']:
+        # Run garbage collection
+        if aggressive:
+            # Multiple GC passes to catch circular references and delayed cleanup
+            logger.info(f"[Cleanup] Running aggressive garbage collection (3 passes)")
+            for i in range(3):
+                collected = gc.collect()
+                logger.info(f"[Cleanup] GC pass {i+1}: collected {collected} objects")
+        else:
+            logger.info(f"[Cleanup] Running standard garbage collection")
+            collected = gc.collect()
+            logger.info(f"[Cleanup] GC collected {collected} objects")
+
+    # Clean up GPU memory if using cuML
+    if MEMORY_CONFIG['enable_gpu_memory_cleanup'] and is_cuml_available():
+        try:
+            import cupy as cp
+            logger.info(f"[Cleanup] Freeing GPU memory pools (cuML)")
+            # Clear unused GPU memory pools
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+
+            # Log memory after cleanup
+            mem_after = get_gpu_memory_usage()
+            if mem_after:
+                logger.info(f"[Cleanup] GPU memory after cleanup: {mem_after:.2f}GB")
+                if mem_before and mem_after < mem_before:
+                    freed = mem_before - mem_after
+                    logger.info(f"[Cleanup] Freed {freed:.2f}GB of GPU memory")
+        except Exception as e:
+            logger.warning(f"[Cleanup] GPU memory cleanup failed: {e}")
 
 
 def train_model_pipeline() -> str:
@@ -556,15 +752,25 @@ def train_model_pipeline() -> str:
         JSON string with model performance results and best model info
     """
     try:
+        logger.info("="*80)
+        logger.info("STARTING MODEL TRAINING PIPELINE")
+        logger.info("="*80)
+
         # Load preprocessed features from feature engineering stage
+        logger.info("Loading preprocessed features from feature engineering stage...")
         X_train = np.load(FEATURES_DIR / 'X_train.npy')
         y_train = np.load(FEATURES_DIR / 'y_train.npy')
+        logger.info(f"Loaded training data: X_train.shape={X_train.shape}, y_train.shape={y_train.shape}")
+        logger.info(f"Data types: X_train.dtype={X_train.dtype}, y_train.dtype={y_train.dtype}")
 
         # Automatically detect problem type
+        logger.info("Detecting problem type...")
         problem_type = detect_problem_type()
+        logger.info(f"Problem type detected: {problem_type}")
 
         # Get GPU configuration for logging
         gpu_config = get_gpu_config()
+        logger.info(f"GPU Configuration: {gpu_config}")
         log_gpu_memory("Before Training")
 
         if LIGHTGBM_AVAILABLE:
@@ -594,8 +800,6 @@ def train_model_pipeline() -> str:
                     learning_rate=0.05,
                     n_jobs=-1
                 )
-            models['Gradient Boosting'] = GradientBoostingRegressor(random_state=42)
-            models['ElasticNet'] = ElasticNet(random_state=42, max_iter=2000, l1_ratio=0.5)
             # Use regular KFold for regression (no need to preserve class distribution)
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
             # Use regression scoring metric
@@ -615,7 +819,6 @@ def train_model_pipeline() -> str:
                     n_jobs=-1,
                     objective='binary'
                 )
-            models['Gradient Boosting'] = GradientBoostingClassifier(random_state=42)
             # Use StratifiedKFold to preserve class distribution in each fold
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
             # Use classification scoring metric
@@ -636,44 +839,74 @@ def train_model_pipeline() -> str:
             print(f"\n{'='*60}")
             print(f"Training {name}...")
             print(f"{'='*60}")
+            logger.info(f"[Training] Starting training for {name}")
+            logger.info(f"[Training] Training data shape: X={X_train.shape}, y={y_train.shape}")
 
             # Check if this model should be tuned
             if TUNING_CONFIG['enabled'] and name in TUNING_CONFIG['models_to_tune']:
                 print(f"🔧 Tuning hyperparameters for {name}...")
                 print(f"   Strategy: Optuna Bayesian Optimization")
                 print(f"   Trials: {TUNING_CONFIG['n_trials']}")
+                logger.info(f"[Training] {name} - Hyperparameter tuning enabled with {TUNING_CONFIG['n_trials']} trials")
 
                 # Create Optuna study for hyperparameter optimization
                 study = optuna.create_study(
                     direction='maximize',  # Maximize score (works for both neg_mse and accuracy)
                     sampler=TPESampler(seed=42)
                 )
+                logger.info(f"[Training] {name} - Optuna study created")
 
                 # Select appropriate optimization function
                 if name == 'Random Forest':
+                    logger.info(f"[Training] Random Forest - Entering hyperparameter optimization")
+                    logger.info(f"[Training] Random Forest - Memory config: max_trees={MEMORY_CONFIG['max_trees_random_forest']}, cv_folds={MEMORY_CONFIG['rf_cv_folds']}, aggressive_cleanup={MEMORY_CONFIG['aggressive_rf_cleanup']}")
                     objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
                 elif name == 'XGBoost':
                     objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
+                elif name == 'Logistic Regression' or name == 'Linear Regression':
+                    objective = lambda trial: optimize_linear_model(trial, X_train, y_train, problem_type, cv)
                 else:
                     # Fallback for any other models
                     objective = None
 
                 if objective:
                     # Run hyperparameter optimization
-                    study.optimize(
-                        objective,
-                        n_trials=TUNING_CONFIG['n_trials'],
-                        timeout=TUNING_CONFIG['timeout'],
-                        show_progress_bar=TUNING_CONFIG['show_progress_bar'],
-                        n_jobs=1  # Serial execution for stability
-                    )
+                    logger.info(f"[Training] {name} - Starting Optuna optimization (n_trials={TUNING_CONFIG['n_trials']}, timeout={TUNING_CONFIG['timeout']}s)")
+                    try:
+                        study.optimize(
+                            objective,
+                            n_trials=TUNING_CONFIG['n_trials'],
+                            timeout=TUNING_CONFIG['timeout'],
+                            show_progress_bar=TUNING_CONFIG['show_progress_bar'],
+                            n_jobs=1  # Serial execution for stability
+                        )
+                        logger.info(f"[Training] {name} - Optimization completed successfully")
+                    except Exception as e:
+                        logger.error(f"[Training] {name} - Optimization FAILED: {str(e)}")
+                        logger.error(f"[Training] {name} - Error type: {type(e).__name__}")
+                        import traceback as tb
+                        logger.error(f"[Training] {name} - Traceback:\n{tb.format_exc()}")
+                        raise
+
+                    # Clean up memory after optimization to prevent leaks
+                    # Use aggressive cleanup for Random Forest to combat cuML memory leaks
+                    is_rf = name == 'Random Forest'
+                    logger.info(f"[Training] {name} - Starting memory cleanup (aggressive={is_rf})")
+                    cleanup_memory(f"After {name} optimization", aggressive=is_rf)
+                    logger.info(f"[Training] {name} - Memory cleanup completed")
 
                     # Extract best parameters
                     best_params = study.best_params
                     tuned_params[name] = best_params
 
                     # Remove model-specific prefixes from parameter names
-                    prefix = 'rf_' if name == 'Random Forest' else 'xgb_'
+                    prefix_map = {
+                        'Random Forest': 'rf_',
+                        'XGBoost': 'xgb_',
+                        'Logistic Regression': 'lr_',
+                        'Linear Regression': 'linreg_'
+                    }
+                    prefix = prefix_map.get(name, '')
                     clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
 
                     # Create tuned model using GPU-aware imports
@@ -682,11 +915,15 @@ def train_model_pipeline() -> str:
                             model = RandomForestRegressorClass(**clean_params)
                         elif name == 'XGBoost':
                             model = xgb.XGBRegressor(**clean_params, **get_xgboost_params())
+                        elif name == 'Linear Regression':
+                            model = LinearRegressionClass(**clean_params)
                     else:
                         if name == 'Random Forest':
                             model = RandomForestClassifierClass(**clean_params)
                         elif name == 'XGBoost':
                             model = xgb.XGBClassifier(**clean_params, eval_metric='logloss', **get_xgboost_params())
+                        elif name == 'Logistic Regression':
+                            model = LogisticRegressionClass(**clean_params)
 
                     # Use best score from optimization
                     best_trial_score = study.best_value
@@ -750,6 +987,14 @@ def train_model_pipeline() -> str:
                     best_score = scores.mean()
                     best_model_name = name
                     best_model = model
+
+            # Clean up memory after each model evaluation
+            # Use aggressive cleanup for Random Forest to combat cuML memory leaks
+            is_rf = name == 'Random Forest'
+            logger.info(f"[Training] {name} - Starting post-evaluation cleanup (aggressive={is_rf})")
+            cleanup_memory(f"After {name} evaluation", aggressive=is_rf)
+            logger.info(f"[Training] {name} - Post-evaluation cleanup completed")
+            logger.info(f"[Training] {name} - Training completed")
 
         # Train the selected model on full training dataset
         print(f"\n{'='*60}")

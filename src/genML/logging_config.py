@@ -56,6 +56,12 @@ def setup_logging(dataset_name: Optional[str] = None, log_level: int = logging.I
     # Open log file for all output
     log_file = open(log_filepath, 'w', encoding='utf-8', buffering=1)
 
+    # Write timestamp header at the beginning of the log file
+    log_start_time = datetime.now().strftime("%m/%d/%Y %H:%M")
+    log_file.write(f"{log_start_time}\n")
+    log_file.write("=" * 50 + "\n\n")
+    log_file.flush()
+
     # Redirect stdout and stderr to capture print statements
     sys.stdout = TeeStream(sys.__stdout__, log_file)
     sys.stderr = TeeStream(sys.__stderr__, log_file)
@@ -79,10 +85,24 @@ def setup_logging(dataset_name: Optional[str] = None, log_level: int = logging.I
     )
 
     # File handler - capture ALL logging messages (DEBUG and above)
-    file_handler = logging.FileHandler(log_filepath, mode='a', encoding='utf-8')
+    # Use delay=False to open file immediately (important for crash diagnosis)
+    file_handler = logging.FileHandler(log_filepath, mode='a', encoding='utf-8', delay=False)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(detailed_formatter)
     root_logger.addHandler(file_handler)
+
+    # Create a custom filter to force flush after each record (critical for crash diagnosis)
+    class FlushFilter(logging.Filter):
+        def filter(self, record):
+            # Always return True to pass the record, but flush after logging
+            return True
+
+    # Monkey-patch emit to force flush after every log
+    original_emit = file_handler.emit
+    def emit_with_flush(record):
+        original_emit(record)
+        file_handler.flush()
+    file_handler.emit = emit_with_flush
 
     # Console handler - show INFO and above
     console_handler = logging.StreamHandler(sys.__stdout__)
