@@ -242,6 +242,87 @@ class TestTrainModelPipeline:
             tools.MODELS_DIR = original_models_dir
             tools.REPORTS_DIR = original_reports_dir
 
+
+class TestCatBoostTuning:
+    """CatBoost-specific tests covering GPU-aware tuning behaviour."""
+
+    def test_optimize_catboost_uses_gpu_params(self, monkeypatch):
+        catboost = pytest.importorskip("catboost")
+        import optuna
+
+        captured_params = {}
+
+        class DummyRegressor:
+            def __init__(self, **kwargs):
+                captured_params.update(kwargs)
+
+        monkeypatch.setattr(tools.cb, "CatBoostRegressor", DummyRegressor)
+        monkeypatch.setattr(tools, "is_catboost_gpu_available", lambda: True)
+        monkeypatch.setattr(tools, "cross_val_score", lambda *args, **kwargs: np.array([0.5, 0.6, 0.55]))
+
+        trial = optuna.trial.FixedTrial({
+            'cb_iterations': 500,
+            'cb_learning_rate': 0.05,
+            'cb_depth': 6,
+            'cb_l2_leaf_reg': 5.0,
+            'cb_border_count': 64,
+            'cb_bagging_temperature': 1.5,
+            'cb_random_strength': 2.0,
+            'cb_min_data_in_leaf': 16,
+            'cb_subsample': 0.75
+        })
+
+        score = tools.optimize_catboost(
+            trial,
+            X=np.random.randn(10, 3),
+            y=np.random.randn(10),
+            problem_type='regression',
+            cv=3
+        )
+
+        assert np.isclose(score, np.mean([0.5, 0.6, 0.55]))
+        assert captured_params['task_type'] == 'GPU'
+        assert captured_params['devices'] == '0'
+        assert captured_params['loss_function'] == 'RMSE'
+        assert captured_params['allow_writing_files'] is False
+
+    def test_optimize_catboost_cpu_fallback(self, monkeypatch):
+        pytest.importorskip("catboost")
+        import optuna
+
+        captured_params = {}
+
+        class DummyRegressor:
+            def __init__(self, **kwargs):
+                captured_params.update(kwargs)
+
+        monkeypatch.setattr(tools.cb, "CatBoostRegressor", DummyRegressor)
+        monkeypatch.setattr(tools, "is_catboost_gpu_available", lambda: False)
+        monkeypatch.setattr(tools, "cross_val_score", lambda *args, **kwargs: np.array([0.42, 0.4]))
+
+        trial = optuna.trial.FixedTrial({
+            'cb_iterations': 400,
+            'cb_learning_rate': 0.1,
+            'cb_depth': 5,
+            'cb_l2_leaf_reg': 7.0,
+            'cb_border_count': 50,
+            'cb_bagging_temperature': 0.5,
+            'cb_random_strength': 1.0,
+            'cb_min_data_in_leaf': 8,
+            'cb_subsample': 0.9
+        })
+
+        tools.optimize_catboost(
+            trial,
+            X=np.random.randn(8, 2),
+            y=np.random.randn(8),
+            problem_type='regression',
+            cv=3
+        )
+
+        assert captured_params['task_type'] == 'CPU'
+        assert 'devices' not in captured_params
+
     def test_train_model_regression(self, tmp_path):
         """Test model training for regression"""
         # Create sample features and target for regression
@@ -277,6 +358,76 @@ class TestTrainModelPipeline:
             tools.FEATURES_DIR = original_features_dir
             tools.MODELS_DIR = original_models_dir
             tools.REPORTS_DIR = original_reports_dir
+
+
+class TestAiAutomationUtilities:
+    """Tests for AI-driven automation helpers."""
+
+    def test_apply_ai_generated_features_creates_ratio(self):
+        train_raw = pd.DataFrame({
+            'speed': [30.0, 60.0, 90.0],
+            'lanes': [1.0, 2.0, 3.0]
+        })
+        test_raw = pd.DataFrame({
+            'speed': [45.0, 50.0],
+            'lanes': [1.0, 2.0]
+        })
+        train_feats = pd.DataFrame({'baseline': [1.0, 1.0, 1.0]})
+        test_feats = pd.DataFrame({'baseline': [1.0, 1.0]})
+
+        suggestions = {
+            'status': 'success',
+            'engineered_features': [
+                {
+                    'name': 'speed_per_lane',
+                    'operation': 'ratio',
+                    'inputs': ['speed', 'lanes'],
+                    'parameters': {},
+                    'expected_impact': 'high',
+                    'rationale': 'Speed density per lane'
+                }
+            ]
+        }
+
+        updated_train, updated_test, summary = tools.apply_ai_generated_features(
+            train_raw,
+            test_raw,
+            train_feats,
+            test_feats,
+            suggestions
+        )
+
+        assert 'speed_per_lane' in updated_train.columns
+        assert 'speed_per_lane' in updated_test.columns
+        assert summary['successful'] == 1
+        expected_train = np.array([30.0, 30.0, 30.0], dtype=np.float32)
+        np.testing.assert_allclose(updated_train['speed_per_lane'].to_numpy(), expected_train, rtol=1e-5)
+
+    def test_build_ai_tuning_override_details_validates_ranges(self):
+        recommendations = [
+            {
+                'model': 'CatBoost',
+                'parameter': 'depth',
+                'suggested_value': 20,
+                'rationale': 'Underfitting detected for high-error segments',
+                'confidence': 'high'
+            },
+            {
+                'model': 'XGBoost',
+                'parameter': 'learning_rate',
+                'suggested_value': 0.00001,
+                'rationale': 'Stabilize gradients on outliers',
+                'confidence': 'low'
+            }
+        ]
+
+        details = tools.build_ai_tuning_override_details(recommendations)
+        overrides = tools.extract_override_values(details)
+
+        assert details['CatBoost']['depth']['value'] == 10
+        assert pytest.approx(details['XGBoost']['learning_rate']['value'], rel=1e-6) == 0.01
+        assert overrides['CatBoost']['depth'] == 10
+        assert overrides['XGBoost']['learning_rate'] == pytest.approx(0.01, rel=1e-6)
 
 
 class TestGeneratePredictions:

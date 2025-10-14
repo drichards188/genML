@@ -6,8 +6,10 @@ Each function represents a major stage in the machine learning workflow and is d
 to be modular, reusable, and well-documented. The functions handle data loading,
 feature engineering, model training, and prediction generation.
 """
+import copy
 import os
 import json
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
@@ -62,7 +64,8 @@ from src.genML.gpu_utils import (
     log_gpu_memory,
     get_gpu_memory_usage,
     is_cuml_available,
-    is_xgboost_gpu_available
+    is_xgboost_gpu_available,
+    is_catboost_gpu_available
 )
 
 # Directory structure for organizing pipeline outputs
@@ -114,6 +117,368 @@ MEMORY_CONFIG = {
     'aggressive_rf_cleanup': True,           # Enable aggressive cleanup for Random Forest (prevents cuML leaks)
 }
 
+# AI Advisors Configuration (OpenAI-powered intelligent analysis)
+AI_ADVISORS_CONFIG = {
+    'enabled': True,                         # Enable/disable AI advisors globally
+    'feature_ideation': {
+        'enabled': True,                     # Enable feature ideation advisor
+        'sample_size': 100,                  # Number of rows to sample for analysis
+        'save_report': True,                 # Save feature suggestions report
+    },
+    'error_analysis': {
+        'enabled': True,                     # Enable error pattern analyzer
+        'top_n_errors': 100,                 # Number of worst errors to analyze in detail
+        'save_report': True,                 # Save error analysis report
+    },
+    'openai_config': {
+        'model': 'gpt-4o-mini',              # OpenAI model to use
+        'max_cost_per_run': 10.0,            # Maximum API cost per run (USD)
+        'enable_cache': True,                # Enable response caching to save costs
+        'cache_dir': 'outputs/ai_cache',     # Cache directory
+    }
+}
+
+AI_SUPPORTED_FEATURE_OPERATIONS = {'ratio', 'difference', 'product', 'sum', 'log', 'binary_threshold'}
+AI_FEATURE_EPSILON = 1e-6
+AI_TUNING_OVERRIDE_PATH = REPORTS_DIR / 'ai_tuning_overrides.json'
+AI_TUNING_SUPPORTED_PARAMETERS = {
+    'CatBoost': {
+        'iterations': ('int', 200, 2000),
+        'learning_rate': ('float', 0.01, 0.3),
+        'depth': ('int', 3, 10),
+        'l2_leaf_reg': ('float', 1.0, 20.0),
+        'subsample': ('float', 0.3, 1.0)
+    },
+    'XGBoost': {
+        'n_estimators': ('int', 100, 2000),
+        'learning_rate': ('float', 0.01, 0.3),
+        'max_depth': ('int', 3, 12),
+        'subsample': ('float', 0.3, 1.0),
+        'colsample_bytree': ('float', 0.3, 1.0)
+    },
+    'Random Forest': {
+        'n_estimators': ('int', 100, 1000),
+        'max_depth': ('int', 5, 25),
+        'min_samples_split': ('int', 2, 20),
+        'min_samples_leaf': ('int', 1, 10)
+    },
+    'LightGBM': {
+        'n_estimators': ('int', 100, 2000),
+        'learning_rate': ('float', 0.01, 0.3),
+        'num_leaves': ('int', 16, 256),
+        'feature_fraction': ('float', 0.2, 1.0)
+    },
+    'Logistic Regression': {
+        'C': ('float', 0.0001, 100.0)
+    },
+    'Linear Regression': {
+        'fit_intercept': ('bool', None, None)
+    }
+}
+
+
+def _normalize_ai_feature_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and normalize an AI-generated feature specification."""
+    if not isinstance(spec, dict):
+        raise ValueError("feature spec must be a dictionary")
+
+    name = str(spec.get('name', '')).strip()
+    if not name:
+        raise ValueError("missing feature name")
+    name = name.replace(' ', '_')
+
+    operation = str(spec.get('operation', '')).strip().lower()
+    if operation not in AI_SUPPORTED_FEATURE_OPERATIONS:
+        raise ValueError(f"unsupported operation '{operation}'")
+
+    inputs = spec.get('inputs', [])
+    if not isinstance(inputs, list) or not inputs:
+        raise ValueError("inputs must be a non-empty list")
+    inputs = [str(inp).strip() for inp in inputs if str(inp).strip()]
+    if not inputs:
+        raise ValueError("inputs cannot be empty strings")
+
+    if operation in {'ratio', 'difference'} and len(inputs) != 2:
+        raise ValueError(f"{operation} operation requires exactly 2 inputs")
+    if operation == 'log' and len(inputs) != 1:
+        raise ValueError("log operation requires exactly 1 input")
+    if operation == 'binary_threshold' and len(inputs) != 1:
+        raise ValueError("binary_threshold operation requires exactly 1 input")
+    if operation in {'product', 'sum'} and len(inputs) < 2:
+        raise ValueError(f"{operation} operation requires at least 2 inputs")
+
+    parameters = spec.get('parameters') or {}
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters must be a dictionary")
+
+    if operation == 'binary_threshold':
+        if 'threshold' not in parameters:
+            raise ValueError("binary_threshold operation requires 'threshold' parameter")
+        try:
+            parameters['threshold'] = float(parameters['threshold'])
+        except (TypeError, ValueError):
+            raise ValueError("binary_threshold threshold must be a numeric value")
+
+    expected_impact = str(spec.get('expected_impact', '')).strip().lower()
+    rationale = str(spec.get('rationale', '')).strip()
+
+    return {
+        'name': name,
+        'operation': operation,
+        'inputs': inputs,
+        'parameters': parameters,
+        'expected_impact': expected_impact,
+        'rationale': rationale
+    }
+
+
+def _resolve_unique_feature_name(base_name: str, existing: set) -> str:
+    """Ensure the generated feature name does not clash with existing columns."""
+    name = base_name
+    suffix = 1
+    while name in existing:
+        name = f"{base_name}_{suffix}"
+        suffix += 1
+    return name
+
+
+def _get_numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    """Extract a numeric pandas Series from a dataframe column."""
+    if column not in df.columns:
+        raise KeyError(f"column '{column}' not found in dataset")
+    series = pd.to_numeric(df[column], errors='coerce')
+    return series.fillna(0.0)
+
+
+def _compute_ai_feature_series(operation: str, inputs: List[str], parameters: Dict[str, Any], source_df: pd.DataFrame) -> pd.Series:
+    """Compute an engineered feature series based on the supported operations."""
+    if operation == 'ratio':
+        numerator = _get_numeric_series(source_df, inputs[0])
+        denominator = _get_numeric_series(source_df, inputs[1])
+        safe_denominator = denominator.where(np.abs(denominator) > AI_FEATURE_EPSILON, np.nan)
+        result = numerator / safe_denominator
+        result = result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    elif operation == 'difference':
+        series_a = _get_numeric_series(source_df, inputs[0])
+        series_b = _get_numeric_series(source_df, inputs[1])
+        result = series_a - series_b
+    elif operation == 'product':
+        result = pd.Series(1.0, index=source_df.index, dtype=float)
+        for column in inputs:
+            result = result * _get_numeric_series(source_df, column)
+    elif operation == 'sum':
+        result = pd.Series(0.0, index=source_df.index, dtype=float)
+        for column in inputs:
+            result = result + _get_numeric_series(source_df, column)
+    elif operation == 'log':
+        base_series = _get_numeric_series(source_df, inputs[0])
+        result = np.log1p(base_series.clip(lower=0.0))
+    elif operation == 'binary_threshold':
+        threshold = parameters.get('threshold', 0.0)
+        base_series = _get_numeric_series(source_df, inputs[0])
+        result = (base_series > threshold).astype(float)
+    else:
+        raise ValueError(f"operation '{operation}' not implemented")
+
+    return result.astype(np.float32)
+
+
+def apply_ai_generated_features(
+    train_raw: pd.DataFrame,
+    test_raw: pd.DataFrame,
+    train_features: pd.DataFrame,
+    test_features: pd.DataFrame,
+    suggestions: Optional[Dict[str, Any]]
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """
+    Apply AI-generated feature specifications to the engineered feature matrices.
+
+    Returns:
+        Tuple of (train_features, test_features, summary_dict)
+    """
+    summary: Dict[str, Any] = {
+        'status': 'skipped',
+        'attempted': 0,
+        'successful': 0,
+        'created_features': [],
+        'failed_features': []
+    }
+
+    if not suggestions or suggestions.get('status') != 'success':
+        summary['reason'] = 'no_valid_suggestions'
+        return train_features, test_features, summary
+
+    feature_specs = suggestions.get('engineered_features') or []
+    if not feature_specs:
+        summary['reason'] = 'no_engineered_features'
+        return train_features, test_features, summary
+
+    # Align indices to avoid mismatches when assigning new columns
+    train_features = train_features.reset_index(drop=True)
+    test_features = test_features.reset_index(drop=True)
+    train_source = train_raw.reset_index(drop=True)
+    test_source = test_raw.reset_index(drop=True)
+
+    summary['attempted'] = len(feature_specs)
+    existing_columns = set(train_features.columns)
+
+    for spec in feature_specs:
+        try:
+            normalized = _normalize_ai_feature_spec(spec)
+            feature_name = _resolve_unique_feature_name(normalized['name'], existing_columns)
+
+            train_series = _compute_ai_feature_series(
+                normalized['operation'],
+                normalized['inputs'],
+                normalized['parameters'],
+                train_source
+            )
+            test_series = _compute_ai_feature_series(
+                normalized['operation'],
+                normalized['inputs'],
+                normalized['parameters'],
+                test_source
+            )
+
+            train_features[feature_name] = train_series
+            test_features[feature_name] = test_series
+            existing_columns.add(feature_name)
+
+            summary['successful'] += 1
+            summary['created_features'].append({
+                'name': feature_name,
+                'operation': normalized['operation'],
+                'inputs': normalized['inputs'],
+                'expected_impact': normalized['expected_impact'],
+                'rationale': normalized['rationale']
+            })
+        except Exception as exc:
+            failure_record = {
+                'name': spec.get('name'),
+                'operation': spec.get('operation'),
+                'reason': str(exc)
+            }
+            summary['failed_features'].append(failure_record)
+            logger.warning(f"Failed to apply AI-generated feature {failure_record['name']}: {exc}")
+
+    if summary['successful'] > 0:
+        summary['status'] = 'applied'
+    else:
+        summary['reason'] = summary.get('reason', 'no_features_applied')
+
+    return train_features, test_features, summary
+
+
+def sanitize_override_value(model: str, parameter: str, value: Any) -> Any:
+    """Coerce AI-proposed tuning values into safe numeric/boolean types."""
+    spec = AI_TUNING_SUPPORTED_PARAMETERS.get(model, {}).get(parameter)
+    if not spec:
+        raise ValueError(f"Unsupported parameter '{parameter}' for model '{model}'")
+
+    value_type, min_val, max_val = spec
+
+    if value_type == 'int':
+        cast_val = int(round(float(value)))
+        if min_val is not None:
+            cast_val = max(min_val, cast_val)
+        if max_val is not None:
+            cast_val = min(max_val, cast_val)
+        return cast_val
+
+    if value_type == 'float':
+        cast_val = float(value)
+        if min_val is not None:
+            cast_val = max(min_val, cast_val)
+        if max_val is not None:
+            cast_val = min(max_val, cast_val)
+        return float(round(cast_val, 6))
+
+    if value_type == 'bool':
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {'true', '1', 'yes', 'y'}:
+                return True
+            if lowered in {'false', '0', 'no', 'n'}:
+                return False
+        return bool(value)
+
+    raise ValueError(f"Unsupported value type '{value_type}' for model '{model}' parameter '{parameter}'")
+
+
+def build_ai_tuning_override_details(recommendations: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Convert AI tuning recommendations into structured override details."""
+    details: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for rec in recommendations or []:
+        model = str(rec.get('model', '')).strip()
+        parameter = str(rec.get('parameter', '')).strip()
+        if not model or not parameter:
+            continue
+
+        if model not in AI_TUNING_SUPPORTED_PARAMETERS:
+            logger.warning(f"Skipping AI tuning recommendation for unsupported model '{model}'")
+            continue
+        if parameter not in AI_TUNING_SUPPORTED_PARAMETERS[model]:
+            logger.warning(f"Skipping unsupported parameter '{parameter}' for model '{model}'")
+            continue
+
+        if 'suggested_value' not in rec:
+            logger.warning(f"Skipping recommendation for {model}/{parameter} without suggested_value")
+            continue
+
+        try:
+            sanitized_value = sanitize_override_value(model, parameter, rec['suggested_value'])
+        except Exception as exc:
+            logger.warning(f"Could not sanitize AI tuning value for {model}/{parameter}: {exc}")
+            continue
+
+        rationale = str(rec.get('rationale', '')).strip()
+        confidence = str(rec.get('confidence', '')).strip().lower()
+
+        details.setdefault(model, {})[parameter] = {
+            'value': sanitized_value,
+            'confidence': confidence,
+            'rationale': rationale,
+            'suggested_value_raw': rec.get('suggested_value')
+        }
+
+    return details
+
+
+def extract_override_values(details: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """Flatten override details into model -> param -> value structure."""
+    values: Dict[str, Dict[str, Any]] = {}
+    for model, params in (details or {}).items():
+        values[model] = {param: info.get('value') for param, info in params.items() if 'value' in info}
+    return values
+
+
+def load_ai_tuning_overrides() -> Tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Any]]:
+    """Load persisted AI tuning overrides."""
+    if not AI_TUNING_OVERRIDE_PATH.exists():
+        return {}, {}
+    try:
+        with open(AI_TUNING_OVERRIDE_PATH, 'r') as f:
+            data = json.load(f)
+    except Exception as exc:
+        logger.warning(f"Failed to read AI tuning overrides: {exc}")
+        return {}, {}
+
+    details = data.get('overrides', {})
+    return details, data
+
+
+def save_ai_tuning_overrides(details: Dict[str, Dict[str, Dict[str, Any]]], metadata: Dict[str, Any]) -> None:
+    """Persist AI tuning overrides to disk."""
+    payload = {
+        'generated_at': datetime.utcnow().isoformat(),
+        'overrides': details,
+        **metadata
+    }
+    AI_TUNING_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(AI_TUNING_OVERRIDE_PATH, 'w') as f:
+        json.dump(payload, f, indent=2)
+    logger.info(f"Saved AI tuning overrides to {AI_TUNING_OVERRIDE_PATH}")
 
 def load_dataset() -> str:
     """
@@ -312,9 +677,129 @@ def engineer_features() -> str:
 
         feature_engine.fit(train_df, target_col)
 
+        ai_feature_suggestions: Optional[Dict[str, Any]] = None
+
+        # AI Advisor: Feature Ideation
+        # Use AI to suggest domain-specific features based on current feature set
+        if AI_ADVISORS_CONFIG['enabled'] and AI_ADVISORS_CONFIG['feature_ideation']['enabled']:
+            try:
+                print(f"\n{'='*60}")
+                print("🤖 AI Feature Ideation Advisor")
+                print(f"{'='*60}")
+                print("Analyzing current features and suggesting improvements...")
+
+                from src.genML.ai_advisors import FeatureIdeationAdvisor, OpenAIClient
+
+                # Create OpenAI client with configuration
+                openai_client = OpenAIClient(config=AI_ADVISORS_CONFIG['openai_config'])
+
+                if openai_client.is_available():
+                    # Get current feature list
+                    current_features = [col for col in train_df.columns if col != target_col]
+
+                    # Get feature importances if available from feature engine
+                    feature_importances = None
+                    if hasattr(feature_engine, 'feature_selector') and hasattr(feature_engine.feature_selector, 'feature_importances_'):
+                        importance_dict = {}
+                        for feat, imp in zip(current_features, feature_engine.feature_selector.feature_importances_):
+                            importance_dict[feat] = float(imp)
+                        feature_importances = importance_dict
+
+                    # Create advisor and generate suggestions
+                    advisor = FeatureIdeationAdvisor(openai_client=openai_client)
+
+                    # Sample data for analysis (avoid sending too much data to API)
+                    sample_size = AI_ADVISORS_CONFIG['feature_ideation']['sample_size']
+                    df_sample = train_df.head(sample_size)
+
+                    # Get detected domain from analysis results
+                    detected_domain = analysis_results.get('domain_analysis', {}).get('detected_domains', [None])[0]
+
+                    suggestions = advisor.suggest_features(
+                        df_sample=df_sample,
+                        current_features=current_features,
+                        target_col=target_col,
+                        detected_domain=detected_domain,
+                        feature_importances=feature_importances
+                    )
+
+                    # Display suggestions summary
+                    if suggestions.get('status') == 'success':
+                        ai_feature_suggestions = suggestions
+                        n_suggested = len(suggestions.get('engineered_features', []))
+                        n_interactions = len(suggestions.get('interaction_suggestions', []))
+                        n_transformations = len(suggestions.get('transformation_suggestions', []))
+
+                        print(f"✅ AI Feature Ideation completed!")
+                        print(f"   New features suggested: {n_suggested}")
+                        print(f"   Interaction suggestions: {n_interactions}")
+                        print(f"   Transformation suggestions: {n_transformations}")
+
+                        # Display top priority features
+                        if suggestions.get('priority_features'):
+                            print(f"\n   Top Priority Features:")
+                            for i, feat in enumerate(suggestions['priority_features'][:3], 1):
+                                print(f"      {i}. {feat}")
+
+                        # Save report if configured
+                        if AI_ADVISORS_CONFIG['feature_ideation']['save_report']:
+                            report_path = REPORTS_DIR / 'ai_feature_suggestions.json'
+                            advisor.save_report(suggestions, str(report_path))
+                            print(f"\n   📄 Report saved to: {report_path}")
+
+                        # Display API usage stats
+                        usage_stats = openai_client.get_usage_stats()
+                        print(f"\n   💰 API Cost: ${usage_stats['total_cost']:.4f}")
+                        print(f"   📊 Tokens: {usage_stats['total_tokens']:,} ({usage_stats['input_tokens']:,} in, {usage_stats['output_tokens']:,} out)")
+                    else:
+                        print(f"⚠️  AI Feature Ideation returned an error")
+                else:
+                    print("⚠️  OpenAI API not available - skipping feature ideation")
+                    print("   Set OPENAI_API_KEY environment variable to enable AI advisors")
+
+                print(f"{'='*60}\n")
+
+            except Exception as e:
+                logger.warning(f"AI Feature Ideation failed: {e}")
+                print(f"⚠️  AI Feature Ideation failed: {e}")
+                print("Continuing with existing features...\n")
+
         # Transform both training and test data
         train_features = feature_engine.transform(train_df)
         test_features = feature_engine.transform(test_df)
+
+        ai_feature_summary = {
+            'status': 'skipped',
+            'attempted': 0,
+            'successful': 0,
+            'reason': 'not_evaluated'
+        }
+
+        if ai_feature_suggestions:
+            train_features, test_features, ai_feature_summary = apply_ai_generated_features(
+                train_df,
+                test_df,
+                train_features,
+                test_features,
+                ai_feature_suggestions
+            )
+
+            if ai_feature_summary['status'] == 'applied':
+                created_names = [feat['name'] for feat in ai_feature_summary['created_features']]
+                preview = ', '.join(created_names[:5]) if created_names else '(names unavailable)'
+                print(f"   ✅ Applied {ai_feature_summary['successful']} AI-generated feature(s): {preview}")
+                if ai_feature_summary['successful'] > 5:
+                    remaining = ai_feature_summary['successful'] - 5
+                    print(f"      ...and {remaining} more")
+            elif ai_feature_summary.get('reason'):
+                print(f"   ℹ️  AI feature application skipped: {ai_feature_summary['reason']}")
+        else:
+            ai_feature_summary = {
+                'status': 'skipped',
+                'attempted': 0,
+                'successful': 0,
+                'reason': 'no_ai_suggestions'
+            }
 
         # Ensure purely numeric matrices for downstream numpy operations
         train_features = train_features.apply(pd.to_numeric, errors='coerce').fillna(0)
@@ -410,6 +895,8 @@ def engineer_features() -> str:
             "feature_engineering_method": "automated",
             "total_features_generated": len(feature_columns),
             "detected_domains": analysis_results.get('domain_analysis', {}).get('detected_domains', []),
+            "ai_feature_summary": ai_feature_summary,
+            "ai_generated_features": [feat['name'] for feat in ai_feature_summary.get('created_features', [])],
             "feature_stats": {
                 "mean": np.nanmean(train_features_final, axis=0).tolist(),
                 "std": np.nanstd(train_features_final, axis=0).tolist()
@@ -768,24 +1255,43 @@ def optimize_catboost(trial, X, y, problem_type, cv):
     Returns:
         Mean cross-validation score
     """
+    use_gpu = is_catboost_gpu_available()
+
     # Suggest hyperparameters
     params = {
-        'iterations': trial.suggest_int('cb_iterations', 100, 500),
+        'iterations': trial.suggest_int('cb_iterations', 300, 1200),
         'learning_rate': trial.suggest_float('cb_learning_rate', 0.01, 0.3, log=True),
         'depth': trial.suggest_int('cb_depth', 4, 10),
-        'l2_leaf_reg': trial.suggest_float('cb_l2_leaf_reg', 1.0, 10.0),
+        'l2_leaf_reg': trial.suggest_float('cb_l2_leaf_reg', 1.0, 20.0),
         'border_count': trial.suggest_int('cb_border_count', 32, 255),
+        'bagging_temperature': trial.suggest_float('cb_bagging_temperature', 0.0, 10.0),
+        'random_strength': trial.suggest_float('cb_random_strength', 0.0, 10.0),
+        'min_data_in_leaf': trial.suggest_int('cb_min_data_in_leaf', 1, 64),
+        'subsample': trial.suggest_float('cb_subsample', 0.5, 1.0),
         'random_state': 42,
         'verbose': False,
-        'task_type': 'GPU' if is_cuml_available() or is_xgboost_gpu_available() else 'CPU',
-        'devices': '0' if is_cuml_available() or is_xgboost_gpu_available() else None
+        'allow_writing_files': False,
+        'task_type': 'GPU' if use_gpu else 'CPU',
+        'od_type': 'Iter',
+        'od_wait': 30
     }
+    if use_gpu:
+        params['devices'] = '0'
 
     # Create model based on problem type
     if problem_type == 'regression':
+        params.update({
+            'loss_function': 'RMSE',
+            'eval_metric': 'RMSE'
+        })
         model = cb.CatBoostRegressor(**params)
         scoring = 'neg_mean_squared_error'
     else:
+        params.update({
+            'loss_function': 'Logloss',
+            'eval_metric': 'AUC',
+            'auto_class_weights': 'Balanced'
+        })
         model = cb.CatBoostClassifier(**params)
         scoring = 'accuracy'
 
@@ -1012,6 +1518,21 @@ def train_model_pipeline() -> str:
         else:
             print("ℹ️ TabNet not installed - install `pytorch-tabnet` to enable that model option.")
 
+        ai_override_details, ai_override_metadata = load_ai_tuning_overrides()
+        ai_model_overrides = extract_override_values(ai_override_details)
+        ai_override_updates: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        if ai_model_overrides:
+            override_summary = []
+            for model_name, params in ai_model_overrides.items():
+                if params:
+                    formatted_params = ', '.join(f"{k}={v}" for k, v in params.items())
+                    override_summary.append(f"{model_name}({formatted_params})")
+            if override_summary:
+                print(f"🤖 Applying AI tuning overrides: {', '.join(override_summary)}")
+        else:
+            ai_override_details = {}
+            ai_override_metadata = {}
+
         # Get GPU-aware model classes using smart imports
         LinearRegressionClass = get_linear_model_regressor()
         LogisticRegressionClass = get_linear_model_classifier()
@@ -1058,14 +1579,29 @@ def train_model_pipeline() -> str:
         def make_catboost_factory(constructor):
             def factory(overrides=None):
                 params = {
-                    'iterations': 200,
+                    'iterations': 400,
                     'learning_rate': 0.05,
                     'depth': 6,
                     'random_state': 42,
                     'verbose': False,
+                    'allow_writing_files': False
                 }
-                if is_cuml_available() or is_xgboost_gpu_available():
+                if constructor == cb.CatBoostRegressor:
+                    params.update({
+                        'loss_function': 'RMSE',
+                        'eval_metric': 'RMSE'
+                    })
+                else:
+                    params.update({
+                        'loss_function': 'Logloss',
+                        'eval_metric': 'AUC'
+                    })
+
+                if is_catboost_gpu_available():
                     params.update({'task_type': 'GPU', 'devices': '0'})
+                else:
+                    params.update({'task_type': 'CPU'})
+
                 if overrides:
                     params.update(overrides)
                 return constructor(**params)
@@ -1198,14 +1734,14 @@ def train_model_pipeline() -> str:
             scoring_metric = 'accuracy'
             best_score = 0  # Higher is better for accuracy
 
-        def evaluate_with_default_params(model_name, factory_fn):
+        def evaluate_with_default_params(model_name, factory_fn, overrides=None):
             """
             Run cross-validation on the estimator built from the factory.
             The estimator is created inside this helper so it can be freed immediately.
             """
             import warnings
 
-            estimator = factory_fn()
+            estimator = factory_fn(overrides)
             try:
                 with warnings.catch_warnings():
                     warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
@@ -1242,6 +1778,7 @@ def train_model_pipeline() -> str:
             logger.info(f"[Training] Starting training for {name}")
             logger.info(f"[Training] Training data shape: X={X_train.shape}, y={y_train.shape}")
 
+            model_override_values = ai_model_overrides.get(name, {})
             used_params = None
             model_mean_score = None
             model_std_score = 0.0
@@ -1321,6 +1858,10 @@ def train_model_pipeline() -> str:
                     prefix = prefix_map.get(name, '')
                     clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
 
+                    applied_overrides = model_override_values
+                    if applied_overrides:
+                        clean_params.update(applied_overrides)
+
                     # Use best score from optimization
                     best_trial_score = study.best_value
                     trial_scores = [trial.value for trial in study.trials if trial.value is not None]
@@ -1341,7 +1882,8 @@ def train_model_pipeline() -> str:
                         'individual_scores': model_scores_list,
                         'best_params': clean_params,
                         'n_trials': len(study.trials),
-                        'tuned': True
+                        'tuned': True,
+                        'ai_overrides': applied_overrides
                     }
 
                     # Ensure Optuna study objects don't linger in memory
@@ -1349,7 +1891,7 @@ def train_model_pipeline() -> str:
                 else:
                     # Model doesn't have tuning function, use default
                     print(f"   ⚠️  No tuning function available for {name}, using defaults")
-                    scores = evaluate_with_default_params(name, model_factory)
+                    scores = evaluate_with_default_params(name, model_factory, ai_model_overrides.get(name))
                     model_mean_score = float(scores.mean())
                     model_std_score = float(scores.std())
                     model_scores_list = scores.tolist()
@@ -1357,7 +1899,8 @@ def train_model_pipeline() -> str:
                         'mean_score': model_mean_score,
                         'std_score': model_std_score,
                         'individual_scores': model_scores_list,
-                        'tuned': False
+                        'tuned': False,
+                        'ai_overrides': model_override_values
                     }
                     print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
 
@@ -1365,7 +1908,7 @@ def train_model_pipeline() -> str:
                 # Model tuning disabled or not in tuning list - use defaults
                 print(f"   Using default hyperparameters...")
 
-                scores = evaluate_with_default_params(name, model_factory)
+                scores = evaluate_with_default_params(name, model_factory, model_override_values)
                 model_mean_score = float(scores.mean())
                 model_std_score = float(scores.std())
                 model_scores_list = scores.tolist()
@@ -1374,7 +1917,8 @@ def train_model_pipeline() -> str:
                     'mean_score': model_mean_score,
                     'std_score': model_std_score,
                     'individual_scores': model_scores_list,
-                    'tuned': False
+                    'tuned': False,
+                    'ai_overrides': model_override_values
                 }
 
                 print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
@@ -1505,17 +2049,139 @@ def train_model_pipeline() -> str:
         else:
             if best_model_factory is None:
                 raise RuntimeError(f"No factory available to instantiate best model '{best_model_name}'")
-            best_model = best_model_factory(best_model_params)
+
+            overrides_for_best = ai_model_overrides.get(best_model_name, {})
+            if best_model_params:
+                final_params = best_model_params.copy()
+                if overrides_for_best:
+                    final_params.update(overrides_for_best)
+            else:
+                final_params = overrides_for_best if overrides_for_best else None
+
+            best_model = best_model_factory(final_params)
 
         # This gives the model access to all available training data
         log_gpu_memory("Before Final Training")
         best_model.fit(X_train, y_train)
         log_gpu_memory("After Final Training")
 
+        # AI Advisor: Error Pattern Analysis
+        # Use AI to analyze prediction errors and identify improvement opportunities
+        if AI_ADVISORS_CONFIG['enabled'] and AI_ADVISORS_CONFIG['error_analysis']['enabled']:
+            try:
+                print(f"\n{'='*60}")
+                print("🤖 AI Error Pattern Analyzer")
+                print(f"{'='*60}")
+                print("Analyzing prediction errors to identify patterns...")
+
+                from src.genML.ai_advisors import ErrorPatternAnalyzer, OpenAIClient
+
+                # Create OpenAI client with configuration
+                openai_client = OpenAIClient(config=AI_ADVISORS_CONFIG['openai_config'])
+
+                if openai_client.is_available():
+                    # Generate predictions on training data for error analysis
+                    y_pred_train = best_model.predict(X_train)
+
+                    # Load feature names for detailed analysis
+                    feature_names_file = FEATURES_DIR / 'feature_names.txt'
+                    if feature_names_file.exists():
+                        with open(feature_names_file, 'r') as f:
+                            feature_names = [line.strip() for line in f.readlines()]
+                    else:
+                        feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
+
+                    # Create analyzer and perform analysis
+                    analyzer = ErrorPatternAnalyzer(openai_client=openai_client)
+
+                    error_report = analyzer.analyze_errors(
+                        X=X_train,
+                        y_true=y_train,
+                        y_pred=y_pred_train,
+                        feature_names=feature_names,
+                        model_type=best_model_name,
+                        top_n_errors=AI_ADVISORS_CONFIG['error_analysis']['top_n_errors']
+                    )
+
+                    # Display analysis summary
+                    if error_report.get('status') == 'success':
+                        error_stats = error_report['error_statistics']
+                        print(f"✅ AI Error Analysis completed!")
+                        print(f"   Mean Absolute Error: {error_stats['mean_absolute_error']:.6f}")
+                        print(f"   RMSE: {error_stats['rmse']:.6f}")
+                        print(f"   Max Error: {error_stats['max_error']:.6f}")
+
+                        # Display key findings from AI analysis
+                        ai_suggestions = error_report.get('ai_suggestions', {})
+
+                        if ai_suggestions.get('error_patterns_detected'):
+                            print(f"\n   🔍 Key Error Patterns Detected:")
+                            for i, pattern in enumerate(ai_suggestions['error_patterns_detected'][:3], 1):
+                                print(f"      {i}. {pattern}")
+
+                        if ai_suggestions.get('priority_actions'):
+                            print(f"\n   💡 Priority Actions:")
+                            for i, action in enumerate(ai_suggestions['priority_actions'][:3], 1):
+                                print(f"      {i}. {action}")
+
+                        # Display top feature-error correlations
+                        feature_corrs = error_report.get('feature_error_correlations', {})
+                        if feature_corrs:
+                            print(f"\n   📊 Top Features Correlated with Errors:")
+                            for i, (feat, corr) in enumerate(list(feature_corrs.items())[:5], 1):
+                                print(f"      {i}. {feat}: {corr:+.3f}")
+
+                        # Save report if configured
+                        if AI_ADVISORS_CONFIG['error_analysis']['save_report']:
+                            report_path = REPORTS_DIR / 'ai_error_analysis.json'
+                            analyzer.save_report(error_report, str(report_path))
+                            print(f"\n   📄 Report saved to: {report_path}")
+
+                        # Display API usage stats
+                        usage_stats = openai_client.get_usage_stats()
+                        print(f"\n   💰 API Cost: ${usage_stats['total_cost']:.4f}")
+                        print(f"   📊 Tokens: {usage_stats['total_tokens']:,} ({usage_stats['input_tokens']:,} in, {usage_stats['output_tokens']:,} out)")
+
+                        new_override_details = build_ai_tuning_override_details(
+                            ai_suggestions.get('tuning_recommendations', [])
+                        )
+                        if new_override_details:
+                            merged_details = copy.deepcopy(ai_override_details)
+                            for model_key, param_map in new_override_details.items():
+                                merged_details.setdefault(model_key, {}).update(param_map)
+                            ai_override_details = merged_details
+                            ai_override_updates = new_override_details
+                            ai_model_overrides = extract_override_values(ai_override_details)
+                            print(f"\n   🔁 Recorded AI tuning overrides for: {', '.join(new_override_details.keys())}")
+                    else:
+                        print(f"⚠️  AI Error Analysis returned an error")
+                else:
+                    print("⚠️  OpenAI API not available - skipping error analysis")
+                    print("   Set OPENAI_API_KEY environment variable to enable AI advisors")
+
+                print(f"{'='*60}\n")
+
+            except Exception as e:
+                logger.warning(f"AI Error Analysis failed: {e}")
+                print(f"⚠️  AI Error Analysis failed: {e}")
+                print("Continuing with model saving...\n")
+
         # Save the trained model for prediction stage
         # Timestamped filename prevents overwrites and enables model versioning
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         model_filename = f'best_model_{best_model_name.lower().replace(" ", "_")}_{timestamp}.pkl'
+
+        if ai_override_updates:
+            save_ai_tuning_overrides(
+                ai_override_details,
+                {
+                    'problem_type': problem_type,
+                    'best_model': best_model_name,
+                    'best_score': float(best_score),
+                    'model_filename': model_filename
+                }
+            )
+
         joblib.dump(best_model, MODELS_DIR / model_filename)
 
         # Save detailed cross-validation results for analysis
@@ -1538,6 +2204,10 @@ def train_model_pipeline() -> str:
             "model_filename": model_filename,
             "timestamp": timestamp,
             "model_saved": str(MODELS_DIR / model_filename),
+            "ai_tuning_overrides_loaded": ai_override_details,
+            "ai_tuning_overrides_metadata": ai_override_metadata,
+            "ai_tuning_overrides_updates": ai_override_updates,
+            "ai_model_overrides_used": ai_model_overrides,
             "gpu_acceleration": {
                 "cuml_available": is_cuml_available(),
                 "xgboost_gpu_available": is_xgboost_gpu_available(),

@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _GPU_CONFIG = {
     'cuml_available': False,
     'xgboost_gpu_available': False,
+    'catboost_gpu_available': False,
     'cuda_available': False,
     'gpu_memory_gb': 0,
     'gpu_name': None,
@@ -120,6 +121,37 @@ def detect_xgboost_gpu() -> Tuple[bool, Dict[str, str]]:
         return False, {}
 
 
+def detect_catboost_gpu() -> bool:
+    """
+    Detect CatBoost GPU support by fitting a minimal model.
+
+    Returns:
+        bool: True if CatBoost can train on GPU
+    """
+    try:
+        import numpy as np
+        from catboost import CatBoostRegressor, Pool
+
+        # Minimal dataset for GPU probing
+        X = np.array([[0.0], [1.0]], dtype=np.float32)
+        y = np.array([0.0, 1.0], dtype=np.float32)
+        train_pool = Pool(X, y)
+
+        probe_model = CatBoostRegressor(
+            iterations=1,
+            task_type='GPU',
+            devices='0',
+            verbose=False,
+            allow_writing_files=False
+        )
+        probe_model.fit(train_pool)
+        logger.info("CatBoost GPU support detected")
+        return True
+    except Exception as e:
+        logger.debug(f"CatBoost GPU support not available: {e}")
+        return False
+
+
 def initialize_gpu_detection(force_cpu: bool = False) -> Dict[str, Any]:
     """
     Run comprehensive GPU detection and initialize global configuration.
@@ -148,9 +180,11 @@ def initialize_gpu_detection(force_cpu: bool = False) -> Dict[str, Any]:
         _GPU_CONFIG['cuml_available'] = detect_cuml()
         _GPU_CONFIG['xgboost_gpu_available'], xgb_params = detect_xgboost_gpu()
         _GPU_CONFIG['xgb_params'] = xgb_params
+        _GPU_CONFIG['catboost_gpu_available'] = detect_catboost_gpu()
     else:
         _GPU_CONFIG['cuml_available'] = False
         _GPU_CONFIG['xgboost_gpu_available'] = False
+        _GPU_CONFIG['catboost_gpu_available'] = False
         _GPU_CONFIG['xgb_params'] = {}
 
     # Log summary
@@ -162,6 +196,7 @@ def initialize_gpu_detection(force_cpu: bool = False) -> Dict[str, Any]:
         logger.info(f"  Memory: {_GPU_CONFIG['gpu_memory_gb']:.1f}GB")
         logger.info(f"  cuML Available: {_GPU_CONFIG['cuml_available']}")
         logger.info(f"  XGBoost GPU Available: {_GPU_CONFIG['xgboost_gpu_available']}")
+        logger.info(f"  CatBoost GPU Available: {_GPU_CONFIG['catboost_gpu_available']}")
     logger.info("="*60)
 
     return _GPU_CONFIG
@@ -334,7 +369,11 @@ def to_cpu_array(data):
 
 def is_gpu_available() -> bool:
     """Check if any GPU acceleration is available"""
-    return _GPU_CONFIG.get('cuml_available', False) or _GPU_CONFIG.get('xgboost_gpu_available', False)
+    return any([
+        _GPU_CONFIG.get('cuml_available', False),
+        _GPU_CONFIG.get('xgboost_gpu_available', False),
+        _GPU_CONFIG.get('catboost_gpu_available', False)
+    ])
 
 
 def is_cuml_available() -> bool:
@@ -345,6 +384,11 @@ def is_cuml_available() -> bool:
 def is_xgboost_gpu_available() -> bool:
     """Check if XGBoost GPU is available"""
     return _GPU_CONFIG.get('xgboost_gpu_available', False)
+
+
+def is_catboost_gpu_available() -> bool:
+    """Check if CatBoost GPU is available"""
+    return _GPU_CONFIG.get('catboost_gpu_available', False)
 
 
 def get_xgboost_params() -> Dict[str, str]:
