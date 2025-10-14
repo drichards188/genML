@@ -12,7 +12,8 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import VotingRegressor, VotingClassifier
+from sklearn.ensemble import VotingRegressor, VotingClassifier, StackingRegressor, StackingClassifier
+from sklearn.linear_model import Ridge
 import xgboost as xgb
 import joblib
 from pathlib import Path
@@ -40,6 +41,15 @@ try:
 except ImportError:
     cb = None
     CATBOOST_AVAILABLE = False
+
+try:
+    from pytorch_tabnet.tab_model import TabNetRegressor, TabNetClassifier
+    import torch
+    TABNET_AVAILABLE = True
+except ImportError:
+    TabNetRegressor = None
+    TabNetClassifier = None
+    TABNET_AVAILABLE = False
 
 # Import GPU utilities for unified GPU acceleration support
 from src.genML.gpu_utils import (
@@ -81,7 +91,7 @@ TUNING_CONFIG = {
     'timeout': 600,                          # Max seconds per model tuning (10 min)
     'n_jobs': -1,                            # Parallel jobs (-1 = all cores)
     'show_progress_bar': True,               # Show Optuna progress
-    'models_to_tune': ['Random Forest', 'XGBoost', 'CatBoost', 'Logistic Regression', 'Linear Regression']
+    'models_to_tune': ['Random Forest', 'XGBoost', 'CatBoost', 'TabNet', 'Logistic Regression', 'Linear Regression']
 }
 
 # GPU Acceleration Configuration
@@ -233,8 +243,9 @@ def engineer_features() -> str:
 
         # Configuration for feature engineering
         config = {
-            'max_features': 100,
+            'max_features': 200,  # Increased from 100 to allow more features (was too aggressive)
             'enable_feature_selection': True,
+            'feature_importance_threshold': 0.001,  # Lowered from 0.01 to be less aggressive
             'manual_type_hints': {
                 'num_lanes': 'numerical',
                 'curvature': 'numerical',
@@ -243,8 +254,9 @@ def engineer_features() -> str:
                 'num_reported_accidents': 'numerical'
             },
             'interaction_pairs': [
-                ('speed_limit', 'curvature'),
-                ('num_lanes', 'speed_limit')
+                # Generic numerical interactions that work across datasets
+                # The feature engine will silently skip interactions if columns don't exist
+                # Add dataset-specific interactions here if needed for competition optimization
             ],
             'numerical_config': {
                 'enable_scaling': True,
@@ -264,10 +276,11 @@ def engineer_features() -> str:
                 'enable_patterns': True
             },
             'feature_selection': {
-                'max_features': 100,
+                'max_features': 200,  # Increased from 100 to retain more features
                 'enable_statistical_tests': True,
                 'enable_model_based': True,
-                'selection_strategy': 'union'
+                'selection_strategy': 'union',
+                'feature_importance_threshold': 0.001  # Lowered from 0.01 to be less aggressive
             }
         }
 
@@ -329,6 +342,46 @@ def engineer_features() -> str:
             # Fallback: assume last column or binary target
             train_target = train_df.iloc[:, -1].values
 
+        # Apply target transformation for bounded regression problems
+        # If target is bounded in [0,1] (like probabilities), use logit transform
+        target_min = np.min(train_target)
+        target_max = np.max(train_target)
+        apply_logit_transform = False
+
+        if target_min >= 0 and target_max <= 1 and target_max > target_min:
+            # Target is bounded in [0,1] - apply logit transformation
+            # This helps models that assume unbounded targets
+            apply_logit_transform = True
+            print(f"Detected bounded target in [{target_min:.3f}, {target_max:.3f}]")
+            print(f"Applying logit transformation: logit(y) = log(y / (1-y))")
+
+            # Clip values to avoid log(0) and division by zero
+            epsilon = 1e-7
+            train_target_clipped = np.clip(train_target, epsilon, 1 - epsilon)
+
+            # Apply logit transform
+            train_target_transformed = np.log(train_target_clipped / (1 - train_target_clipped))
+
+            # Save transformation parameters
+            transform_info = {
+                'applied': True,
+                'type': 'logit',
+                'original_min': float(target_min),
+                'original_max': float(target_max),
+                'epsilon': epsilon
+            }
+            joblib.dump(transform_info, FEATURES_DIR / 'target_transform.pkl')
+
+            print(f"Transformed target range: [{np.min(train_target_transformed):.3f}, {np.max(train_target_transformed):.3f}]")
+
+            # Use transformed target for training
+            train_target = train_target_transformed
+        else:
+            # No transformation needed
+            transform_info = {'applied': False}
+            joblib.dump(transform_info, FEATURES_DIR / 'target_transform.pkl')
+            print("Target transformation: None (unbounded target)")
+
         # Save processed features in the expected format
         np.save(FEATURES_DIR / 'X_train.npy', train_features_final)
         np.save(FEATURES_DIR / 'X_test.npy', test_features_final)
@@ -361,10 +414,17 @@ def engineer_features() -> str:
                 "mean": np.nanmean(train_features_final, axis=0).tolist(),
                 "std": np.nanstd(train_features_final, axis=0).tolist()
             },
+            "target_transformation": {
+                "applied": transform_info['applied'],
+                "type": transform_info.get('type', None),
+                "original_range": [transform_info.get('original_min'), transform_info.get('original_max')] if transform_info['applied'] else None,
+                "transformed_range": [float(np.min(train_target)), float(np.max(train_target))]
+            },
             "target_distribution": {
-                "positive_class": int(np.sum(train_target)),
-                "negative_class": int(len(train_target) - np.sum(train_target)),
-                "positive_rate": float(np.mean(train_target))
+                "mean": float(np.mean(train_target)),
+                "std": float(np.std(train_target)),
+                "min": float(np.min(train_target)),
+                "max": float(np.max(train_target))
             }
         }
 
@@ -738,6 +798,108 @@ def optimize_catboost(trial, X, y, problem_type, cv):
     return scores.mean()
 
 
+def optimize_tabnet(trial, X, y, problem_type, cv):
+    """
+    Optuna objective function for TabNet hyperparameter optimization.
+    TabNet is a neural network designed for tabular data with built-in GPU support.
+
+    Args:
+        trial: Optuna trial object
+        X: Training features
+        y: Training target
+        problem_type: 'regression' or 'classification'
+        cv: Cross-validation splitter
+
+    Returns:
+        Mean cross-validation score
+    """
+    # Suggest hyperparameters
+    params = {
+        'n_d': trial.suggest_int('tabnet_n_d', 8, 64),  # Width of decision prediction layer
+        'n_a': trial.suggest_int('tabnet_n_a', 8, 64),  # Width of attention embedding
+        'n_steps': trial.suggest_int('tabnet_n_steps', 3, 10),  # Number of steps in architecture
+        'gamma': trial.suggest_float('tabnet_gamma', 1.0, 2.0),  # Feature reusage in attention
+        'lambda_sparse': trial.suggest_float('tabnet_lambda_sparse', 1e-6, 1e-3, log=True),  # Sparsity regularization
+        'optimizer_params': {
+            'lr': trial.suggest_float('tabnet_lr', 1e-4, 1e-2, log=True)
+        },
+        'scheduler_params': {
+            'step_size': 50,
+            'gamma': 0.95
+        },
+        'mask_type': 'sparsemax',
+        'seed': 42,
+        'verbose': 0
+    }
+
+    # GPU configuration for TabNet
+    if torch.cuda.is_available():
+        params['device_name'] = 'cuda'
+    else:
+        params['device_name'] = 'cpu'
+
+    # Create model based on problem type
+    if problem_type == 'regression':
+        # Use sklearn-style cross-validation but manually handle TabNet
+        from sklearn.model_selection import cross_val_score
+        from sklearn.base import BaseEstimator, RegressorMixin
+
+        class TabNetRegressorWrapper(BaseEstimator, RegressorMixin):
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.model = None
+
+            def fit(self, X, y):
+                self.model = TabNetRegressor(**self.kwargs)
+                # Convert to float32 for TabNet
+                X_train = X.astype(np.float32)
+                y_train = y.astype(np.float32).reshape(-1, 1)
+                self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
+                return self
+
+            def predict(self, X):
+                X_test = X.astype(np.float32)
+                return self.model.predict(X_test).flatten()
+
+        model = TabNetRegressorWrapper(**params)
+        scoring = 'neg_mean_squared_error'
+    else:
+        class TabNetClassifierWrapper(BaseEstimator):
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.model = None
+
+            def fit(self, X, y):
+                self.model = TabNetClassifier(**self.kwargs)
+                X_train = X.astype(np.float32)
+                y_train = y.astype(np.int64)
+                self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
+                return self
+
+            def predict(self, X):
+                X_test = X.astype(np.float32)
+                return self.model.predict(X_test)
+
+        model = TabNetClassifierWrapper(**params)
+        scoring = 'accuracy'
+
+    # Evaluate with cross-validation
+    try:
+        scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+        mean_score = scores.mean()
+    except Exception as e:
+        logger.warning(f"TabNet optimization failed: {e}")
+        # Return very bad score to skip this trial
+        mean_score = float('-inf') if problem_type == 'regression' else 0.0
+
+    # Clean up
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return mean_score
+
+
 def cleanup_memory(stage_name="", aggressive=False):
     """
     Force garbage collection and GPU memory cleanup to prevent memory leaks.
@@ -845,6 +1007,11 @@ def train_model_pipeline() -> str:
         else:
             print("ℹ️ CatBoost not installed - install `catboost` to enable that model option.")
 
+        if TABNET_AVAILABLE:
+            print("✅ TabNet detected - adding TabNet neural network to ensemble.")
+        else:
+            print("ℹ️ TabNet not installed - install `pytorch-tabnet` to enable that model option.")
+
         # Get GPU-aware model classes using smart imports
         LinearRegressionClass = get_linear_model_regressor()
         LogisticRegressionClass = get_linear_model_classifier()
@@ -905,6 +1072,68 @@ def train_model_pipeline() -> str:
 
             return factory
 
+        def make_tabnet_factory(constructor):
+            """Factory for TabNet models with sklearn-compatible wrappers."""
+            def factory(overrides=None):
+                from sklearn.base import BaseEstimator, RegressorMixin
+
+                # Default TabNet parameters
+                params = {
+                    'n_d': 32,
+                    'n_a': 32,
+                    'n_steps': 5,
+                    'gamma': 1.5,
+                    'lambda_sparse': 1e-4,
+                    'optimizer_params': {'lr': 2e-3},
+                    'scheduler_params': {'step_size': 50, 'gamma': 0.95},
+                    'mask_type': 'sparsemax',
+                    'seed': 42,
+                    'verbose': 0,
+                    'device_name': 'cuda' if torch.cuda.is_available() else 'cpu'
+                }
+                if overrides:
+                    params.update(overrides)
+
+                # Create sklearn-compatible wrapper
+                if constructor == TabNetRegressor:
+                    class TabNetRegressorWrapper(BaseEstimator, RegressorMixin):
+                        def __init__(self, **kwargs):
+                            self.kwargs = kwargs
+                            self.model = None
+
+                        def fit(self, X, y):
+                            self.model = TabNetRegressor(**self.kwargs)
+                            X_train = X.astype(np.float32)
+                            y_train = y.astype(np.float32).reshape(-1, 1)
+                            self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
+                            return self
+
+                        def predict(self, X):
+                            X_test = X.astype(np.float32)
+                            return self.model.predict(X_test).flatten()
+
+                    return TabNetRegressorWrapper(**params)
+                else:
+                    class TabNetClassifierWrapper(BaseEstimator):
+                        def __init__(self, **kwargs):
+                            self.kwargs = kwargs
+                            self.model = None
+
+                        def fit(self, X, y):
+                            self.model = TabNetClassifier(**self.kwargs)
+                            X_train = X.astype(np.float32)
+                            y_train = y.astype(np.int64)
+                            self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
+                            return self
+
+                        def predict(self, X):
+                            X_test = X.astype(np.float32)
+                            return self.model.predict(X_test)
+
+                    return TabNetClassifierWrapper(**params)
+
+            return factory
+
         # Define model ensemble based on problem type
         # Each model has different strengths and biases
         # Models automatically use GPU (cuML) if available, otherwise CPU (sklearn)
@@ -929,6 +1158,8 @@ def train_model_pipeline() -> str:
                 )
             if CATBOOST_AVAILABLE:
                 models['CatBoost'] = make_catboost_factory(cb.CatBoostRegressor)
+            if TABNET_AVAILABLE:
+                models['TabNet'] = make_tabnet_factory(TabNetRegressor)  # Neural network for tabular data (GPU if available)
             # Use regular KFold for regression (no need to preserve class distribution)
             cv = KFold(n_splits=5, shuffle=True, random_state=42)
             # Use regression scoring metric
@@ -959,6 +1190,8 @@ def train_model_pipeline() -> str:
                 )
             if CATBOOST_AVAILABLE:
                 models['CatBoost'] = make_catboost_factory(cb.CatBoostClassifier)
+            if TABNET_AVAILABLE:
+                models['TabNet'] = make_tabnet_factory(TabNetClassifier)  # Neural network for tabular data (GPU if available)
             # Use StratifiedKFold to preserve class distribution in each fold
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
             # Use classification scoring metric
@@ -1038,6 +1271,8 @@ def train_model_pipeline() -> str:
                     objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
                 elif name == 'CatBoost':
                     objective = lambda trial: optimize_catboost(trial, X_train, y_train, problem_type, cv)
+                elif name == 'TabNet':
+                    objective = lambda trial: optimize_tabnet(trial, X_train, y_train, problem_type, cv)
                 elif name == 'Logistic Regression' or name == 'Linear Regression':
                     objective = lambda trial: optimize_linear_model(trial, X_train, y_train, problem_type, cv)
                 else:
@@ -1079,6 +1314,7 @@ def train_model_pipeline() -> str:
                         'Random Forest': 'rf_',
                         'XGBoost': 'xgb_',
                         'CatBoost': 'cb_',
+                        'TabNet': 'tabnet_',
                         'Logistic Regression': 'lr_',
                         'Linear Regression': 'linreg_'
                     }
@@ -1158,9 +1394,9 @@ def train_model_pipeline() -> str:
             logger.info(f"[Training] {name} - Post-evaluation cleanup completed")
             logger.info(f"[Training] {name} - Training completed")
 
-        # Create ensemble of top models
+        # Create stacking ensemble of top models
         print(f"\n{'='*60}")
-        print(f"Creating Weighted Ensemble...")
+        print(f"Creating Stacking Ensemble...")
         print(f"{'='*60}")
 
         # Sort models by score and select top performers for ensemble
@@ -1168,11 +1404,10 @@ def train_model_pipeline() -> str:
         top_models = [m for m in sorted_models[:min(3, len(sorted_models))]]  # Top 3 models
 
         if len(top_models) >= 2:
-            print(f"Ensemble members: {[m[0] for m in top_models]}")
+            print(f"Ensemble members (base models): {[m[0] for m in top_models]}")
 
-            # Create ensemble estimators list with fitted models
+            # Create ensemble estimators list
             ensemble_estimators = []
-            ensemble_weights = []
 
             for model_name, model_results in top_models:
                 factory = models.get(model_name)
@@ -1184,50 +1419,58 @@ def train_model_pipeline() -> str:
                 m = factory(overrides)
 
                 ensemble_estimators.append((model_name.lower().replace(' ', '_'), m))
-                # Weight by relative performance (higher score = higher weight)
-                ensemble_weights.append(model_results['mean_score'])
 
             if len(ensemble_estimators) < 2:
-                print("Not enough valid models for ensembling after filtering tuned members.")
+                print("Not enough valid models for ensembling after filtering.")
                 cleanup_memory("After ensemble evaluation", aggressive=False)
             else:
-                # Normalize weights to sum to 1
-                min_weight = min(ensemble_weights)
-                ensemble_weights = [w - min_weight + 0.1 for w in ensemble_weights]  # Add small constant
-                weight_sum = sum(ensemble_weights)
-                ensemble_weights = [w / weight_sum for w in ensemble_weights]
-
-                print(f"Ensemble weights: {dict(zip([m[0] for m in top_models], [f'{w:.3f}' for w in ensemble_weights]))}")
-
-                # Create ensemble
+                # Create stacking ensemble with meta-learner
+                # Stacking learns optimal combination vs fixed weights in voting
                 if problem_type == 'regression':
-                    ensemble = VotingRegressor(estimators=ensemble_estimators, weights=ensemble_weights)
+                    # Use Ridge as meta-learner for regression
+                    meta_learner = Ridge(alpha=1.0, random_state=42)
+                    ensemble = StackingRegressor(
+                        estimators=ensemble_estimators,
+                        final_estimator=meta_learner,
+                        cv=5,  # Internal CV for generating meta-features
+                        n_jobs=1  # Serial for GPU stability
+                    )
+                    print(f"Meta-learner: Ridge Regression")
                 else:
-                    ensemble = VotingClassifier(estimators=ensemble_estimators, weights=ensemble_weights, voting='soft')
+                    # Use LogisticRegression as meta-learner for classification
+                    LogisticClass = get_linear_model_classifier()
+                    meta_learner = LogisticClass(random_state=42, max_iter=1000)
+                    ensemble = StackingClassifier(
+                        estimators=ensemble_estimators,
+                        final_estimator=meta_learner,
+                        cv=5,  # Internal CV for generating meta-features
+                        n_jobs=1  # Serial for GPU stability
+                    )
+                    print(f"Meta-learner: Logistic Regression")
 
-                # Evaluate ensemble with cross-validation
-                print("Evaluating ensemble...")
+                # Evaluate stacking ensemble with cross-validation
+                print("Evaluating stacking ensemble...")
                 ensemble_scores = cross_val_score(ensemble, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=1)
                 ensemble_mean_score = ensemble_scores.mean()
 
-                print(f"Ensemble CV Score: {ensemble_mean_score:.6f} (+/- {ensemble_scores.std():.6f})")
+                print(f"Stacking Ensemble CV Score: {ensemble_mean_score:.6f} (+/- {ensemble_scores.std():.6f})")
 
                 # Add ensemble to results
-                results['Ensemble'] = {
+                results['Stacking Ensemble'] = {
                     'mean_score': float(ensemble_mean_score),
                     'std_score': float(ensemble_scores.std()),
                     'individual_scores': ensemble_scores.tolist(),
                     'members': [m[0] for m in top_models],
-                    'weights': ensemble_weights,
+                    'meta_learner': type(meta_learner).__name__,
                     'tuned': False
                 }
 
                 # Check if ensemble beats best individual model
                 if ensemble_mean_score > best_score:
-                    print(f"✅ Ensemble improves over best individual model!")
+                    print(f"✅ Stacking Ensemble improves over best individual model!")
                     print(f"   Improvement: {((ensemble_mean_score - best_score) / abs(best_score) * 100):.2f}%")
                     best_score = ensemble_mean_score
-                    best_model_name = 'Ensemble'
+                    best_model_name = 'Stacking Ensemble'
                     best_model_factory = None
                     best_model_params = None
                     best_model_object = ensemble
@@ -1257,7 +1500,7 @@ def train_model_pipeline() -> str:
         else:
             print(f"ℹ️  Using CPU for {best_model_name}")
 
-        if best_model_name == 'Ensemble':
+        if best_model_name == 'Stacking Ensemble':
             best_model = best_model_object
         else:
             if best_model_factory is None:
@@ -1353,6 +1596,22 @@ def generate_predictions() -> str:
 
         # Generate model predictions on test data
         predictions = best_model.predict(X_test)                    # Predictions (class labels or continuous values)
+
+        # Apply inverse target transformation if needed
+        transform_info = joblib.load(FEATURES_DIR / 'target_transform.pkl')
+        if transform_info['applied']:
+            print(f"Applying inverse {transform_info['type']} transformation to predictions")
+            print(f"Predictions range before inverse transform: [{np.min(predictions):.3f}, {np.max(predictions):.3f}]")
+
+            # Inverse logit: y = exp(logit_y) / (1 + exp(logit_y))
+            # Equivalent to: y = 1 / (1 + exp(-logit_y))  (more numerically stable)
+            predictions = 1 / (1 + np.exp(-predictions))
+
+            # Clip to original bounds for safety
+            epsilon = transform_info['epsilon']
+            predictions = np.clip(predictions, epsilon, 1 - epsilon)
+
+            print(f"Predictions range after inverse transform: [{np.min(predictions):.3f}, {np.max(predictions):.3f}]")
 
         # Generate prediction probabilities/confidence scores if available
         # Only classification models have predict_proba method
