@@ -12,10 +12,11 @@ from crewai.flow import Flow, listen, start
 
 # Import ML pipeline functions - these handle the core data science operations
 from src.genML.tools import (
-    load_dataset,           # Data loading and initial exploration
-    engineer_features,      # Feature engineering and preprocessing
-    train_model_pipeline,   # Model training and selection
-    generate_predictions    # Final predictions and submission file creation
+    load_dataset,            # Data loading and initial exploration
+    engineer_features,       # Feature engineering and preprocessing
+    run_model_selection_advisor,  # AI model advisor
+    train_model_pipeline,    # Model training and selection
+    generate_predictions     # Final predictions and submission file creation
 )
 
 
@@ -107,9 +108,38 @@ class MLPipelineFlow(Flow):
             return error_result
 
     @listen(feature_engineering_task)
+    def model_selection_task(self, feature_results):
+        """
+        Stage 3: AI-assisted model selection guidance.
+
+        Executes the model selection advisor to rank supported models before training.
+        """
+        print("\n🔄 Step 3: Consulting AI model advisor for recommended algorithms...")
+
+        if feature_results.get("status") == "failed":
+            print("❌ Skipping model advisor - feature engineering failed")
+            return feature_results
+
+        try:
+            result_json = run_model_selection_advisor()
+            advisor_results = json.loads(result_json)
+
+            status = advisor_results.get("status", "unknown")
+            print("=== MODEL SELECTION ADVISOR RESULTS ===")
+            print(json.dumps(advisor_results, indent=2))
+
+            feature_results['model_advisor'] = advisor_results
+            feature_results['model_advisor_status'] = status
+            return feature_results
+        except Exception as e:
+            print(f"❌ MODEL ADVISOR FAILED: {e}")
+            feature_results['model_advisor_error'] = str(e)
+            return feature_results
+
+    @listen(model_selection_task)
     def model_training_task(self, feature_results):
         """
-        Stage 3: Model Training and Selection
+        Stage 4: Model Training and Selection
 
         This stage trains multiple ML models using cross-validation and selects the best
         performing one. Model selection is crucial for achieving optimal performance on
@@ -122,7 +152,7 @@ class MLPipelineFlow(Flow):
         Returns:
             dict: Model training results with performance metrics and best model info
         """
-        print("\n🔄 Step 3: Training and selecting the best ML model...")
+        print("\n🔄 Step 4: Training and selecting the best ML model...")
 
         # Ensure previous stage completed successfully
         if feature_results.get("status") == "failed":
@@ -152,7 +182,7 @@ class MLPipelineFlow(Flow):
     @listen(model_training_task)
     def prediction_task(self, model_results):
         """
-        Stage 4: Prediction Generation and Submission Creation
+        Stage 5: Prediction Generation and Submission Creation
 
         The final stage of the ML pipeline. It uses the trained model to generate predictions
         on the test dataset and creates a properly formatted submission file. This stage is

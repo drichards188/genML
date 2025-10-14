@@ -10,6 +10,8 @@ import copy
 import os
 import json
 from typing import Any, Dict, List, Optional, Tuple
+from collections import OrderedDict
+
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
@@ -175,6 +177,215 @@ AI_TUNING_SUPPORTED_PARAMETERS = {
         'fit_intercept': ('bool', None, None)
     }
 }
+
+SUPPORTED_MODEL_SUMMARIES: Dict[str, Dict[str, Any]] = {
+    'Linear Regression': {
+        'type': 'linear',
+        'best_for': ['interpretable baseline', 'low-dimensional numeric data'],
+        'limitations': ['struggles with non-linearity', 'sensitive to multicollinearity'],
+        'resource_cost': 'very_low'
+    },
+    'Logistic Regression': {
+        'type': 'linear',
+        'best_for': ['binary classification', 'interpretable coefficients'],
+        'limitations': ['assumes linear decision boundary', 'requires feature scaling'],
+        'resource_cost': 'very_low'
+    },
+    'Random Forest': {
+        'type': 'tree_ensemble',
+        'best_for': ['mixed feature types', 'robustness to noise'],
+        'limitations': ['larger memory usage', 'less suited for sparse high-dimensional data'],
+        'resource_cost': 'medium'
+    },
+    'XGBoost': {
+        'type': 'gradient_boosting',
+        'best_for': ['tabular datasets', 'handling missing values'],
+        'limitations': ['requires tuning to avoid overfitting', 'can be slow on very wide datasets'],
+        'resource_cost': 'medium_high'
+    },
+    'CatBoost': {
+        'type': 'gradient_boosting',
+        'best_for': ['categorical-heavy datasets', 'strong default performance'],
+        'limitations': ['GPU memory sensitive', 'longer training for very large datasets'],
+        'resource_cost': 'medium_high'
+    },
+    'LightGBM': {
+        'type': 'gradient_boosting',
+        'best_for': ['large datasets', 'sparse features'],
+        'limitations': ['sensitive to categorical preprocessing when GPU absent'],
+        'resource_cost': 'medium'
+    },
+    'TabNet': {
+        'type': 'neural_network',
+        'best_for': ['datasets with complex interactions', 'GPU availability'],
+        'limitations': ['requires large sample size', 'potentially unstable without tuning'],
+        'resource_cost': 'high'
+    }
+}
+
+
+def build_dataset_profile(
+    train_df: pd.DataFrame,
+    metadata: Dict[str, Any],
+    feature_names: List[str],
+    problem_type: str
+) -> Dict[str, Any]:
+    """Assemble a structured dataset description for the model advisor."""
+    feature_names = feature_names or []
+    numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = [c for c in train_df.columns if c not in numeric_cols]
+
+    missing_ratios = (
+        train_df.isnull()
+        .mean()
+        .sort_values(ascending=False)
+        .head(5)
+        .to_dict()
+    )
+    missing_summary = [
+        {
+            'feature': str(name),
+            'missing_ratio': float(ratio)
+        }
+        for name, ratio in missing_ratios.items()
+        if ratio > 0
+    ]
+
+    variance_summary: List[Dict[str, float]] = []
+    if numeric_cols:
+        var_series = (
+            train_df[numeric_cols]
+            .var()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+        variance_summary = [
+            {'feature': str(name), 'variance': float(value)}
+            for name, value in var_series.items()
+        ]
+
+    target_distribution = metadata.get('target_distribution') or {}
+    target_column = metadata.get('target_column')
+
+    class_balance = None
+    if (
+        problem_type == 'classification'
+        and target_column
+        and target_column in train_df.columns
+    ):
+        value_counts = train_df[target_column].value_counts(normalize=True)
+        class_balance = [
+            {'class': str(cls), 'ratio': float(ratio)}
+            for cls, ratio in value_counts.head(10).items()
+        ]
+
+    resource_info = get_gpu_config()
+
+    profile = {
+        'problem_type': problem_type,
+        'row_count': int(train_df.shape[0]),
+        'column_count_raw': int(train_df.shape[1]),
+        'engineered_feature_count': int(len(feature_names)),
+        'numeric_feature_count': int(len(numeric_cols)),
+        'categorical_feature_count': int(len(categorical_cols)),
+        'target_column': target_column,
+        'target_distribution': target_distribution,
+        'class_balance': class_balance,
+        'missing_value_summary': missing_summary,
+        'top_variance_features': variance_summary,
+        'detected_domains': metadata.get('detected_domains', []),
+        'ai_feature_summary': metadata.get('ai_feature_summary'),
+        'ai_generated_features': metadata.get('ai_generated_features'),
+        'sample_rows': train_df.head(3).to_dict('records'),
+        'engineered_feature_samples': feature_names[:10],
+        'resource_constraints': {
+            'gpu_available': bool(resource_info.get('cuda_available')),
+            'gpu_memory_gb': resource_info.get('gpu_memory_gb'),
+            'cuml_available': bool(resource_info.get('cuml_available')),
+            'xgboost_gpu_available': bool(resource_info.get('xgboost_gpu_available'))
+        }
+    }
+
+    return profile
+
+
+def load_model_selection_guidance() -> Dict[str, Any]:
+    """Load previously generated model selection guidance if available."""
+    guidance_path = REPORTS_DIR / 'ai_model_selection.json'
+    if not guidance_path.exists():
+        return {}
+    try:
+        with open(guidance_path, 'r') as f:
+            return json.load(f)
+    except Exception as exc:
+        logger.warning(f"Failed to load model selection guidance: {exc}")
+        return {}
+
+
+def save_model_selection_guidance(guidance: Dict[str, Any]) -> None:
+    guidance_path = REPORTS_DIR / 'ai_model_selection.json'
+    try:
+        guidance_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(guidance_path, 'w') as f:
+            json.dump(guidance, f, indent=2)
+    except Exception as exc:
+        logger.warning(f"Failed to save model selection guidance: {exc}")
+
+
+def apply_model_selection_guidance(
+    models: Dict[str, Any],
+    guidance: Dict[str, Any],
+    base_tuning_list: List[str]
+) -> Tuple[OrderedDict, Optional[List[str]], Dict[str, Any]]:
+    """Reorder and filter the model dictionary based on AI guidance."""
+    if not guidance or guidance.get('status') in {None, 'failed'}:
+        return OrderedDict(models), None, {'applied': False, 'reason': 'no_guidance'}
+
+    excluded = set(guidance.get('excluded_models', []))
+    recommended = guidance.get('recommended_models') or []
+    available_names = list(models.keys())
+
+    ordered_names = [
+        name for name in recommended
+        if name in models and name not in excluded
+    ]
+    ordered_names.extend(
+        [name for name in available_names if name not in ordered_names and name not in excluded]
+    )
+
+    filtered_models = OrderedDict(
+        (name, models[name]) for name in ordered_names if name in models and name not in excluded
+    )
+
+    if not filtered_models:
+        filtered_models = OrderedDict(models)
+        tuning_list = None
+    else:
+        # Only include recommended models in tuning list if recommendations exist
+        if recommended:
+            tuning_list = [
+                name for name in recommended
+                if name in base_tuning_list and name in filtered_models
+            ]
+        else:
+            # No recommendations, use all non-excluded models from base_tuning_list
+            tuning_list = [
+                name for name in ordered_names
+                if name in base_tuning_list and name in filtered_models
+            ]
+
+    summary = {
+        'applied': True,
+        'recommended_order': ordered_names,
+        'excluded_models': list(excluded),
+        'guidance_status': guidance.get('status'),
+        'confidence': guidance.get('confidence'),
+        'per_model_rationale': guidance.get('per_model_rationale'),
+        'global_risks': guidance.get('global_risks'),
+        'notes': guidance.get('notes')
+    }
+
+    return filtered_models, tuning_list, summary
 
 
 def _normalize_ai_feature_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -895,6 +1106,7 @@ def engineer_features() -> str:
             "feature_engineering_method": "automated",
             "total_features_generated": len(feature_columns),
             "detected_domains": analysis_results.get('domain_analysis', {}).get('detected_domains', []),
+            "target_column": target_col,
             "ai_feature_summary": ai_feature_summary,
             "ai_generated_features": [feat['name'] for feat in ai_feature_summary.get('created_features', [])],
             "feature_stats": {
@@ -931,6 +1143,91 @@ def engineer_features() -> str:
             "error": f"Automated feature engineering failed: {str(e)}",
             "status": "failed"
         })
+
+
+def get_available_model_summaries(problem_type: str) -> Dict[str, Dict[str, Any]]:
+    """Filter supported model summaries based on availability and task type."""
+    summaries = {}
+
+    for name, info in SUPPORTED_MODEL_SUMMARIES.items():
+        if name == 'LightGBM' and not LIGHTGBM_AVAILABLE:
+            continue
+        if name == 'CatBoost' and not CATBOOST_AVAILABLE:
+            continue
+        if name == 'TabNet' and not TABNET_AVAILABLE:
+            continue
+        if name == 'Linear Regression' and problem_type == 'classification':
+            continue
+        if name == 'Logistic Regression' and problem_type == 'regression':
+            continue
+
+        summaries[name] = info
+
+    return summaries
+
+
+def run_model_selection_advisor() -> str:
+    """Execute the model selection advisor and persist its guidance."""
+    try:
+        logger.info("Running AI model selection advisor...")
+
+        train_df = pd.read_pickle(DATA_DIR / 'train_data.pkl')
+
+        feature_report_path = REPORTS_DIR / 'feature_engineering_report.json'
+        if not feature_report_path.exists():
+            raise FileNotFoundError("feature_engineering_report.json not found")
+
+        with open(feature_report_path, 'r') as f:
+            feature_metadata = json.load(f)
+
+        feature_names_file = FEATURES_DIR / 'feature_names.txt'
+        feature_names = []
+        if feature_names_file.exists():
+            with open(feature_names_file, 'r') as f:
+                feature_names = [line.strip() for line in f.readlines() if line.strip()]
+
+        problem_type = detect_problem_type()
+        dataset_profile = build_dataset_profile(train_df, feature_metadata, feature_names, problem_type)
+
+        supported_models = get_available_model_summaries(problem_type)
+
+        historical_context = {}
+        training_report_path = REPORTS_DIR / 'model_training_report.json'
+        if training_report_path.exists():
+            try:
+                with open(training_report_path, 'r') as f:
+                    historical_context = json.load(f)
+            except Exception as exc:
+                logger.warning(f"Could not load historical model report: {exc}")
+
+        from src.genML.ai_advisors import ModelSelectionAdvisor, OpenAIClient
+
+        openai_client = OpenAIClient(config=AI_ADVISORS_CONFIG['openai_config'])
+        advisor = ModelSelectionAdvisor(openai_client=openai_client)
+        guidance = advisor.recommend_models(
+            dataset_profile=dataset_profile,
+            supported_models=supported_models,
+            historical_context=historical_context
+        )
+
+        guidance['problem_type'] = problem_type
+        guidance['dataset_profile_digest'] = {
+            'row_count': dataset_profile.get('row_count'),
+            'engineered_feature_count': dataset_profile.get('engineered_feature_count'),
+            'detected_domains': dataset_profile.get('detected_domains')
+        }
+
+        save_model_selection_guidance(guidance)
+        return json.dumps(guidance, indent=2)
+
+    except Exception as exc:
+        logger.warning(f"Model selection advisor failed: {exc}")
+        fallback = {
+            'status': 'failed',
+            'error': str(exc)
+        }
+        save_model_selection_guidance(fallback)
+        return json.dumps(fallback, indent=2)
 
 
 def detect_problem_type() -> str:
@@ -1533,6 +1830,8 @@ def train_model_pipeline() -> str:
             ai_override_details = {}
             ai_override_metadata = {}
 
+        original_models_to_tune = list(TUNING_CONFIG['models_to_tune'])
+
         # Get GPU-aware model classes using smart imports
         LinearRegressionClass = get_linear_model_regressor()
         LogisticRegressionClass = get_linear_model_classifier()
@@ -1733,6 +2032,23 @@ def train_model_pipeline() -> str:
             # Use classification scoring metric
             scoring_metric = 'accuracy'
             best_score = 0  # Higher is better for accuracy
+
+        model_selection_summary = {'applied': False}
+        guidance_payload = load_model_selection_guidance()
+        ordered_models, tuned_models_list, selection_summary = apply_model_selection_guidance(
+            models,
+            guidance_payload,
+            original_models_to_tune
+        )
+        models = ordered_models
+        if tuned_models_list is not None:
+            TUNING_CONFIG['models_to_tune'] = tuned_models_list
+        if selection_summary.get('applied'):
+            model_selection_summary = selection_summary
+            if selection_summary.get('recommended_order'):
+                print(f"🤖 Model advisor recommended order: {selection_summary['recommended_order']}")
+            if selection_summary.get('excluded_models'):
+                print(f"   Skipping models per advisor guidance: {selection_summary['excluded_models']}")
 
         def evaluate_with_default_params(model_name, factory_fn, overrides=None):
             """
@@ -2204,6 +2520,8 @@ def train_model_pipeline() -> str:
             "model_filename": model_filename,
             "timestamp": timestamp,
             "model_saved": str(MODELS_DIR / model_filename),
+            "ai_model_selection_guidance": guidance_payload,
+            "ai_model_selection_summary": model_selection_summary,
             "ai_tuning_overrides_loaded": ai_override_details,
             "ai_tuning_overrides_metadata": ai_override_metadata,
             "ai_tuning_overrides_updates": ai_override_updates,
@@ -2220,9 +2538,14 @@ def train_model_pipeline() -> str:
         with open(REPORTS_DIR / 'model_training_report.json', 'w') as f:
             json.dump(model_results, f, indent=2)
 
+        TUNING_CONFIG['models_to_tune'] = original_models_to_tune
         return json.dumps(model_results, indent=2)
 
     except Exception as e:
+        try:
+            TUNING_CONFIG['models_to_tune'] = original_models_to_tune
+        except Exception:
+            pass
         return json.dumps({
             "error": f"Error in model training: {str(e)}",
             "status": "failed"

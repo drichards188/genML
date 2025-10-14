@@ -429,6 +429,31 @@ class TestAiAutomationUtilities:
         assert overrides['CatBoost']['depth'] == 10
         assert overrides['XGBoost']['learning_rate'] == pytest.approx(0.01, rel=1e-6)
 
+    def test_apply_model_selection_guidance_orders_models(self):
+        models = {
+            'Random Forest': object(),
+            'CatBoost': object(),
+            'XGBoost': object(),
+            'Linear Regression': object()
+        }
+        guidance = {
+            'status': 'success',
+            'recommended_models': ['CatBoost', 'XGBoost'],
+            'excluded_models': ['Linear Regression'],
+            'confidence': 'high'
+        }
+
+        ordered, tuning_list, summary = tools.apply_model_selection_guidance(
+            models,
+            guidance,
+            base_tuning_list=['Random Forest', 'CatBoost', 'XGBoost']
+        )
+
+        assert list(ordered.keys()) == ['CatBoost', 'XGBoost', 'Random Forest']
+        assert tuning_list == ['CatBoost', 'XGBoost']
+        assert summary['applied'] is True
+        assert 'Linear Regression' in summary['excluded_models']
+
 
 class TestGeneratePredictions:
     """Tests for generate_predictions function"""
