@@ -637,62 +637,62 @@ def apply_ai_generated_features(
     summary['attempted'] = len(feature_specs)
     existing_columns = set(train_features.columns)
 
-        for spec in feature_specs:
-            try:
-                normalized = _normalize_ai_feature_spec(spec)
-                feature_name = _resolve_unique_feature_name(normalized['name'], existing_columns)
+    for spec in feature_specs:
+        try:
+            normalized = _normalize_ai_feature_spec(spec)
+            feature_name = _resolve_unique_feature_name(normalized['name'], existing_columns)
 
-                missing_inputs = [
-                    column for column in normalized['inputs']
-                    if column not in train_source.columns or column not in test_source.columns
-                ]
-                if missing_inputs:
-                    failure_record = {
-                        'name': normalized['name'],
-                        'operation': normalized['operation'],
-                        'reason': f"missing source columns: {', '.join(missing_inputs)}"
-                    }
-                    summary['failed_features'].append(failure_record)
-                    logger.debug(
-                        "Skipping AI feature %s due to missing inputs: %s",
-                        normalized['name'],
-                        ", ".join(missing_inputs)
-                    )
-                    continue
-
-                train_series = _compute_ai_feature_series(
-                    normalized['operation'],
-                    normalized['inputs'],
-                    normalized['parameters'],
-                    train_source
-                )
-                test_series = _compute_ai_feature_series(
-                    normalized['operation'],
-                    normalized['inputs'],
-                    normalized['parameters'],
-                    test_source
-                )
-
-                train_features[feature_name] = train_series
-                test_features[feature_name] = test_series
-                existing_columns.add(feature_name)
-
-                summary['successful'] += 1
-                summary['created_features'].append({
-                    'name': feature_name,
-                    'operation': normalized['operation'],
-                    'inputs': normalized['inputs'],
-                    'expected_impact': normalized['expected_impact'],
-                    'rationale': normalized['rationale']
-                })
-            except Exception as exc:
+            missing_inputs = [
+                column for column in normalized['inputs']
+                if column not in train_source.columns or column not in test_source.columns
+            ]
+            if missing_inputs:
                 failure_record = {
-                    'name': spec.get('name'),
-                    'operation': spec.get('operation'),
-                    'reason': str(exc)
+                    'name': normalized['name'],
+                    'operation': normalized['operation'],
+                    'reason': f"missing source columns: {', '.join(missing_inputs)}"
                 }
                 summary['failed_features'].append(failure_record)
-                logger.warning(f"Failed to apply AI-generated feature {failure_record['name']}: {exc}")
+                logger.debug(
+                    "Skipping AI feature %s due to missing inputs: %s",
+                    normalized['name'],
+                    ", ".join(missing_inputs)
+                )
+                continue
+
+            train_series = _compute_ai_feature_series(
+                normalized['operation'],
+                normalized['inputs'],
+                normalized['parameters'],
+                train_source
+            )
+            test_series = _compute_ai_feature_series(
+                normalized['operation'],
+                normalized['inputs'],
+                normalized['parameters'],
+                test_source
+            )
+
+            train_features[feature_name] = train_series
+            test_features[feature_name] = test_series
+            existing_columns.add(feature_name)
+
+            summary['successful'] += 1
+            summary['created_features'].append({
+                'name': feature_name,
+                'operation': normalized['operation'],
+                'inputs': normalized['inputs'],
+                'expected_impact': normalized['expected_impact'],
+                'rationale': normalized['rationale']
+            })
+        except Exception as exc:
+            failure_record = {
+                'name': spec.get('name'),
+                'operation': spec.get('operation'),
+                'reason': str(exc)
+            }
+            summary['failed_features'].append(failure_record)
+            logger.warning(f"Failed to apply AI-generated feature {failure_record['name']}: {exc}")
 
     if summary['successful'] > 0:
         summary['status'] = 'applied'

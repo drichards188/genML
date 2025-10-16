@@ -46,8 +46,8 @@ class AutoFeatureEngine:
         """
         self.config = config or {}
         self.analyzer = DataTypeAnalyzer()
-        self.feature_selector = AdvancedFeatureSelector(config.get('feature_selection', {}))
-        self.domain_researcher = DomainResearcher(config.get('domain_research', {}))
+        self.feature_selector = AdvancedFeatureSelector(self.config.get('feature_selection', {}))
+        self.domain_researcher = DomainResearcher(self.config.get('domain_research', {}))
         self.processors = {}
         self.feature_map = {}
         self.analysis_results = {}
@@ -160,8 +160,11 @@ class AutoFeatureEngine:
                 continue
             try:
                 features_df = processor.transform(df[col])
-                engineered_features.append(features_df)
-                logger.debug(f"Processed {col}: generated {features_df.shape[1]} features")
+                if not features_df.empty and features_df.shape[1] > 0:
+                    engineered_features.append(features_df)
+                    logger.debug(f"Processed {col}: generated {features_df.shape[1]} features")
+                else:
+                    logger.warning(f"Processor for {col} generated no features")
             except Exception as e:
                 logger.warning(f"Failed to process column {col}: {e}")
 
@@ -178,12 +181,33 @@ class AutoFeatureEngine:
                 numeric_result = result.apply(pd.to_numeric, errors='coerce')
                 # Replace any conversion failures with 0 to keep consistent matrix shape
                 numeric_result = numeric_result.fillna(0).astype(float)
+
+                # Final validation: ensure we have at least one feature
+                if numeric_result.empty or numeric_result.shape[1] == 0:
+                    logger.error("Feature generation produced empty DataFrame!")
+                    logger.error(f"Configuration: {self.config}")
+                    logger.error(f"Processors: {list(self.processors.keys())}")
+                    # Return a minimal fallback feature to prevent downstream errors
+                    fallback = pd.DataFrame({'__constant__': np.ones(len(df))}, index=df.index)
+                    logger.warning("Returning fallback constant feature to prevent empty DataFrame")
+                    return fallback
+
                 return numeric_result
             except Exception as exc:
                 logger.warning(f"Could not coerce engineered features to numeric types: {exc}")
-                return result
+                if not result.empty and result.shape[1] > 0:
+                    return result
+                else:
+                    # Return fallback
+                    logger.warning("Returning fallback constant feature due to conversion error")
+                    return pd.DataFrame({'__constant__': np.ones(len(df))}, index=df.index)
 
-        return pd.DataFrame(index=df.index)
+        # No features were generated - create fallback
+        logger.error("No features were generated from any processor!")
+        logger.error(f"DataFrame columns: {list(df.columns)}")
+        logger.error(f"Processors available: {list(self.processors.keys())}")
+        logger.warning("Returning fallback constant feature to prevent empty DataFrame")
+        return pd.DataFrame({'__constant__': np.ones(len(df))}, index=df.index)
 
     def _create_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create configured interaction features."""
@@ -246,6 +270,17 @@ class AutoFeatureEngine:
             if available_selected:
                 result_df = result_df[available_selected]
                 logger.info(f"Applied feature selection: {len(available_selected)} features selected")
+            else:
+                logger.warning(f"Feature selection produced no matching features!")
+                logger.warning(f"Selected features: {self.selected_features[:5]}...")
+                logger.warning(f"Available features: {list(result_df.columns)[:5]}...")
+                # Keep all features as fallback
+                logger.warning("Keeping all generated features instead")
+
+        # Final validation
+        if result_df.empty or result_df.shape[1] == 0:
+            logger.error("Transform produced empty DataFrame!")
+            raise ValueError("Feature transformation produced no features. Check your configuration and input data.")
 
         logger.info(f"Final feature matrix shape: {result_df.shape}")
         return result_df
