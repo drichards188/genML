@@ -11,6 +11,7 @@ import os
 import json
 from typing import Any, Dict, List, Optional, Tuple
 from collections import OrderedDict
+from itertools import combinations
 
 import pandas as pd
 import numpy as np
@@ -494,6 +495,109 @@ def _compute_ai_feature_series(operation: str, inputs: List[str], parameters: Di
     return result.astype(np.float32)
 
 
+def build_derived_feature_context(
+    df_sample: pd.DataFrame,
+    target_col: Optional[str],
+    feature_importances: Optional[Dict[str, float]] = None
+) -> Dict[str, Any]:
+    """
+    Summarize relationships that help the feature ideation advisor focus on derived features.
+    """
+    context: Dict[str, Any] = {}
+    if df_sample.empty:
+        return context
+
+    numeric_columns = [
+        col for col in df_sample.columns
+        if col != target_col and pd.api.types.is_numeric_dtype(df_sample[col])
+    ]
+    categorical_columns = [
+        col for col in df_sample.columns
+        if col != target_col and not pd.api.types.is_numeric_dtype(df_sample[col])
+    ]
+
+    context["numeric_columns"] = numeric_columns[:20]
+    context["categorical_columns"] = categorical_columns[:20]
+
+    if numeric_columns:
+        variance_series = df_sample[numeric_columns].var().dropna().sort_values(ascending=False)
+        top_variance_cols = variance_series.head(6).index.tolist()
+        context["high_variance_numeric"] = {
+            col: float(variance_series[col]) for col in top_variance_cols
+        }
+
+        ratio_pairs = [list(pair) for pair in combinations(top_variance_cols, 2)]
+        context["candidate_ratio_pairs"] = ratio_pairs[:5]
+        context["candidate_difference_pairs"] = ratio_pairs[:5]
+
+        try:
+            corr_matrix = df_sample[numeric_columns].corr().abs()
+            tri_mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+            high_corr_pairs = (
+                corr_matrix.where(tri_mask)
+                .stack()
+                .sort_values(ascending=False)
+                .head(5)
+                .items()
+            )
+            context["high_correlation_pairs"] = [
+                {
+                    "features": [feat_a, feat_b],
+                    "abs_correlation": float(value)
+                }
+                for (feat_a, feat_b), value in high_corr_pairs
+            ]
+        except Exception:
+            context["high_correlation_pairs"] = []
+
+    if target_col and target_col in df_sample.columns and numeric_columns:
+        target_series = df_sample[target_col]
+        if pd.api.types.is_numeric_dtype(target_series):
+            correlations = (
+                df_sample[numeric_columns]
+                .corrwith(target_series)
+                .dropna()
+                .abs()
+                .sort_values(ascending=False)
+                .head(5)
+            )
+            context["target_correlations"] = {
+                feature: float(score) for feature, score in correlations.items()
+            }
+        else:
+            grouped_means: Dict[str, Dict[str, float]] = {}
+            target_groups = target_series.astype(str)
+            for col in numeric_columns[:5]:
+                try:
+                    means = df_sample.groupby(target_groups)[col].mean()
+                    grouped_means[col] = {
+                        str(group): float(value) for group, value in means.items()
+                    }
+                except Exception:
+                    continue
+            if grouped_means:
+                context["target_group_means"] = grouped_means
+
+    if feature_importances:
+        sorted_importances = sorted(
+            feature_importances.items(),
+            key=lambda item: item[1],
+            reverse=True
+        )
+        context["top_feature_importances"] = [
+            {"feature": name, "importance": float(score)}
+            for name, score in sorted_importances[:5]
+        ]
+
+        untouched_numeric = [
+            col for col in numeric_columns if col not in feature_importances
+        ]
+        if untouched_numeric:
+            context["untouched_numeric_columns"] = untouched_numeric[:5]
+
+    return context
+
+
 def apply_ai_generated_features(
     train_raw: pd.DataFrame,
     test_raw: pd.DataFrame,
@@ -533,44 +637,62 @@ def apply_ai_generated_features(
     summary['attempted'] = len(feature_specs)
     existing_columns = set(train_features.columns)
 
-    for spec in feature_specs:
-        try:
-            normalized = _normalize_ai_feature_spec(spec)
-            feature_name = _resolve_unique_feature_name(normalized['name'], existing_columns)
+        for spec in feature_specs:
+            try:
+                normalized = _normalize_ai_feature_spec(spec)
+                feature_name = _resolve_unique_feature_name(normalized['name'], existing_columns)
 
-            train_series = _compute_ai_feature_series(
-                normalized['operation'],
-                normalized['inputs'],
-                normalized['parameters'],
-                train_source
-            )
-            test_series = _compute_ai_feature_series(
-                normalized['operation'],
-                normalized['inputs'],
-                normalized['parameters'],
-                test_source
-            )
+                missing_inputs = [
+                    column for column in normalized['inputs']
+                    if column not in train_source.columns or column not in test_source.columns
+                ]
+                if missing_inputs:
+                    failure_record = {
+                        'name': normalized['name'],
+                        'operation': normalized['operation'],
+                        'reason': f"missing source columns: {', '.join(missing_inputs)}"
+                    }
+                    summary['failed_features'].append(failure_record)
+                    logger.debug(
+                        "Skipping AI feature %s due to missing inputs: %s",
+                        normalized['name'],
+                        ", ".join(missing_inputs)
+                    )
+                    continue
 
-            train_features[feature_name] = train_series
-            test_features[feature_name] = test_series
-            existing_columns.add(feature_name)
+                train_series = _compute_ai_feature_series(
+                    normalized['operation'],
+                    normalized['inputs'],
+                    normalized['parameters'],
+                    train_source
+                )
+                test_series = _compute_ai_feature_series(
+                    normalized['operation'],
+                    normalized['inputs'],
+                    normalized['parameters'],
+                    test_source
+                )
 
-            summary['successful'] += 1
-            summary['created_features'].append({
-                'name': feature_name,
-                'operation': normalized['operation'],
-                'inputs': normalized['inputs'],
-                'expected_impact': normalized['expected_impact'],
-                'rationale': normalized['rationale']
-            })
-        except Exception as exc:
-            failure_record = {
-                'name': spec.get('name'),
-                'operation': spec.get('operation'),
-                'reason': str(exc)
-            }
-            summary['failed_features'].append(failure_record)
-            logger.warning(f"Failed to apply AI-generated feature {failure_record['name']}: {exc}")
+                train_features[feature_name] = train_series
+                test_features[feature_name] = test_series
+                existing_columns.add(feature_name)
+
+                summary['successful'] += 1
+                summary['created_features'].append({
+                    'name': feature_name,
+                    'operation': normalized['operation'],
+                    'inputs': normalized['inputs'],
+                    'expected_impact': normalized['expected_impact'],
+                    'rationale': normalized['rationale']
+                })
+            except Exception as exc:
+                failure_record = {
+                    'name': spec.get('name'),
+                    'operation': spec.get('operation'),
+                    'reason': str(exc)
+                }
+                summary['failed_features'].append(failure_record)
+                logger.warning(f"Failed to apply AI-generated feature {failure_record['name']}: {exc}")
 
     if summary['successful'] > 0:
         summary['status'] = 'applied'
@@ -926,12 +1048,33 @@ def engineer_features() -> str:
                     # Get detected domain from analysis results
                     detected_domain = analysis_results.get('domain_analysis', {}).get('detected_domains', [None])[0]
 
+                    derived_context = build_derived_feature_context(
+                        df_sample=df_sample,
+                        target_col=target_col,
+                        feature_importances=feature_importances
+                    )
+
+                    if derived_context.get('candidate_ratio_pairs'):
+                        ratio_preview = [
+                            " / ".join(pair) for pair in derived_context['candidate_ratio_pairs'][:3]
+                        ]
+                        print(f"   Candidate ratio pairs: {', '.join(ratio_preview)}")
+
+                    if derived_context.get('target_correlations'):
+                        top_corr = list(derived_context['target_correlations'].items())[:3]
+                        corr_preview = [
+                            f"{feat} ({score:.2f})" for feat, score in top_corr
+                        ]
+                        if corr_preview:
+                            print(f"   Strong target correlations: {', '.join(corr_preview)}")
+
                     suggestions = advisor.suggest_features(
                         df_sample=df_sample,
                         current_features=current_features,
                         target_col=target_col,
                         detected_domain=detected_domain,
-                        feature_importances=feature_importances
+                        feature_importances=feature_importances,
+                        derived_feature_context=derived_context
                     )
 
                     # Display suggestions summary
