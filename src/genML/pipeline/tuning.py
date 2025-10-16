@@ -104,7 +104,7 @@ def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
     """Optuna objective function for XGBoost hyperparameter optimization."""
     logger.info("[XGB Trial %s] Starting XGBoost optimization trial", trial.number)
 
-    params = get_xgboost_params(problem_type)
+    params = get_xgboost_params()
     params.update(
         {
             "n_estimators": trial.suggest_int("xgb_n_estimators", 100, 800),
@@ -117,6 +117,15 @@ def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
         }
     )
 
+    if problem_type == "regression":
+        params["objective"] = "reg:squarederror"
+        scoring = "neg_mean_squared_error"
+        ModelClass = xgb.XGBRegressor
+    else:
+        params["objective"] = "binary:logistic"
+        scoring = "accuracy"
+        ModelClass = xgb.XGBClassifier
+
     if is_xgboost_gpu_available() and not config.GPU_CONFIG["force_cpu"]:
         params["tree_method"] = "gpu_hist"
         params["predictor"] = "gpu_predictor"
@@ -128,12 +137,7 @@ def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
 
     logger.info("[XGB Trial %s] Using %s acceleration", trial.number, device)
 
-    if problem_type == "regression":
-        model = xgb.XGBRegressor(**params)
-        scoring = "neg_mean_squared_error"
-    else:
-        model = xgb.XGBClassifier(**params)
-        scoring = "accuracy"
+    model = ModelClass(**params)
 
     scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
     mean_score = scores.mean()
@@ -186,6 +190,10 @@ def optimize_catboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
         params["devices"] = "0"
     else:
         params["thread_count"] = config.MEMORY_CONFIG["max_parallel_jobs"]
+
+    # Align bootstrap configuration with subsample usage to avoid CatBoost errors.
+    if params["subsample"] < 0.999:
+        params["bootstrap_type"] = "Poisson" if params.get("task_type") == "GPU" else "Bernoulli"
 
     if problem_type == "regression":
         ModelClass = cb.CatBoostRegressor

@@ -9,6 +9,17 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict
 
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings('ignore', category=UserWarning, module='xgboost')
+warnings.filterwarnings('ignore', message='.*`gpu_hist` is deprecated.*', module='xgboost')
+warnings.filterwarnings('ignore', message='.*gpu_hist.*')
+warnings.filterwarnings('ignore', message='Parameters: { \"predictor\" } are not used.')
+warnings.filterwarnings('ignore', message='default bootstrap type.*', module='catboost')
+warnings.filterwarnings('ignore', message='X does not have valid feature names, but .*LGBM', module='sklearn')
+warnings.filterwarnings('ignore', category=ConvergenceWarning, module='catboost')
+
 import joblib
 import numpy as np
 import optuna
@@ -30,6 +41,8 @@ from src.genML.gpu_utils import (
     is_cuml_available,
     is_xgboost_gpu_available,
     log_gpu_memory,
+    is_lightgbm_gpu_available,
+    get_lightgbm_params,
 )
 from src.genML.pipeline import config
 from src.genML.pipeline.ai_tuning import (
@@ -161,7 +174,7 @@ def train_model_pipeline() -> str:
 
         def make_xgb_regressor_factory():
             def factory(overrides=None):
-                params = {'random_state': 42}
+                params = {'random_state': 42, 'objective': 'reg:squarederror', 'eval_metric': 'rmse'}
                 params.update(get_xgboost_params())
                 if overrides:
                     params.update(overrides)
@@ -171,7 +184,7 @@ def train_model_pipeline() -> str:
 
         def make_xgb_classifier_factory():
             def factory(overrides=None):
-                params = {'random_state': 42, 'eval_metric': 'logloss'}
+                params = {'random_state': 42, 'objective': 'binary:logistic', 'eval_metric': 'logloss'}
                 params.update(get_xgboost_params())
                 if overrides:
                     params.update(overrides)
@@ -189,7 +202,8 @@ def train_model_pipeline() -> str:
                     'verbose': False,
                     'allow_writing_files': False
                 }
-                if constructor == cb.CatBoostRegressor:
+                is_regressor = constructor == cb.CatBoostRegressor
+                if is_regressor:
                     params.update({
                         'loss_function': 'RMSE',
                         'eval_metric': 'RMSE'
@@ -200,13 +214,24 @@ def train_model_pipeline() -> str:
                         'eval_metric': 'AUC'
                     })
 
-                if is_catboost_gpu_available():
+                if is_catboost_gpu_available() and not config.GPU_CONFIG['force_cpu']:
                     params.update({'task_type': 'GPU', 'devices': '0'})
+                    default_bootstrap = 'Poisson'
                 else:
-                    params.update({'task_type': 'CPU'})
+                    params.update({'task_type': 'CPU', 'thread_count': config.MEMORY_CONFIG['max_parallel_jobs']})
+                    default_bootstrap = 'Bernoulli'
 
                 if overrides:
                     params.update(overrides)
+
+                subsample = params.get('subsample')
+                bootstrap_type = params.get('bootstrap_type')
+                if subsample is not None and subsample < 0.999:
+                    if not bootstrap_type or str(bootstrap_type).lower() == 'bayesian':
+                        params['bootstrap_type'] = default_bootstrap
+                elif not bootstrap_type:
+                    params['bootstrap_type'] = default_bootstrap
+
                 return constructor(**params)
 
             return factory
@@ -295,6 +320,21 @@ def train_model_pipeline() -> str:
                         'n_jobs': -1
                     }
                 )
+                # If LightGBM GPU is detected and we are not forcing CPU, update default params
+                if is_lightgbm_gpu_available() and not config.GPU_CONFIG.get('force_cpu', False):
+                    # Apply GPU params detected by gpu_utils
+                    lgb_gpu_params = get_lightgbm_params()
+                    # Wrap existing factory to merge GPU params at instantiation time
+                    base_factory = models['LightGBM']
+
+                    def lgb_factory_with_gpu(overrides=None):
+                        params = {'random_state': 42, 'n_estimators': 200, 'learning_rate': 0.05, 'n_jobs': -1}
+                        params.update(lgb_gpu_params)
+                        if overrides:
+                            params.update(overrides)
+                        return lgb.LGBMRegressor(**params)
+
+                    models['LightGBM'] = lgb_factory_with_gpu
             if CATBOOST_AVAILABLE:
                 models['CatBoost'] = make_catboost_factory(cb.CatBoostRegressor)
             if TABNET_AVAILABLE:
@@ -327,6 +367,16 @@ def train_model_pipeline() -> str:
                         'objective': 'binary'
                     }
                 )
+                if is_lightgbm_gpu_available() and not config.GPU_CONFIG.get('force_cpu', False):
+                    lgb_gpu_params = get_lightgbm_params()
+                    def lgb_clf_factory_with_gpu(overrides=None):
+                        params = {'random_state': 42, 'n_estimators': 200, 'learning_rate': 0.05, 'n_jobs': -1, 'objective': 'binary'}
+                        params.update(lgb_gpu_params)
+                        if overrides:
+                            params.update(overrides)
+                        return lgb.LGBMClassifier(**params)
+
+                    models['LightGBM'] = lgb_clf_factory_with_gpu
             if CATBOOST_AVAILABLE:
                 models['CatBoost'] = make_catboost_factory(cb.CatBoostClassifier)
             if TABNET_AVAILABLE:
@@ -614,37 +664,42 @@ def train_model_pipeline() -> str:
 
                 # Evaluate stacking ensemble with cross-validation
                 print("Evaluating stacking ensemble...")
-                ensemble_scores = cross_val_score(ensemble, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=1)
-                ensemble_mean_score = ensemble_scores.mean()
-
-                print(f"Stacking Ensemble CV Score: {ensemble_mean_score:.6f} (+/- {ensemble_scores.std():.6f})")
-
-                # Add ensemble to results
-                results['Stacking Ensemble'] = {
-                    'mean_score': float(ensemble_mean_score),
-                    'std_score': float(ensemble_scores.std()),
-                    'individual_scores': ensemble_scores.tolist(),
-                    'members': [m[0] for m in top_models],
-                    'meta_learner': type(meta_learner).__name__,
-                    'tuned': False
-                }
-
-                # Check if ensemble beats best individual model
-                if ensemble_mean_score > best_score:
-                    print(f"✅ Stacking Ensemble improves over best individual model!")
-                    print(f"   Improvement: {((ensemble_mean_score - best_score) / abs(best_score) * 100):.2f}%")
-                    best_score = ensemble_mean_score
-                    best_model_name = 'Stacking Ensemble'
-                    best_model_factory = None
-                    best_model_params = None
-                    best_model_object = ensemble
+                try:
+                    ensemble_scores = cross_val_score(ensemble, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=1)
+                    ensemble_mean_score = ensemble_scores.mean()
+                except Exception as exc:
+                    logger.warning(f"[Ensemble] Stacking evaluation failed: {exc}")
+                    print(f"⚠️  Stacking ensemble evaluation failed: {exc}")
+                    cleanup_memory("After failed ensemble evaluation", aggressive=False)
                 else:
-                    print(f"Individual model {best_model_name} still wins")
-                    print(f"   Difference: {((best_score - ensemble_mean_score) / abs(best_score) * 100):.2f}%")
-                    # Release ensemble estimators aggressively when not selected
-                    del ensemble
+                    print(f"Stacking Ensemble CV Score: {ensemble_mean_score:.6f} (+/- {ensemble_scores.std():.6f})")
 
-                cleanup_memory("After ensemble evaluation", aggressive=False)
+                    # Add ensemble to results
+                    results['Stacking Ensemble'] = {
+                        'mean_score': float(ensemble_mean_score),
+                        'std_score': float(ensemble_scores.std()),
+                        'individual_scores': ensemble_scores.tolist(),
+                        'members': [m[0] for m in top_models],
+                        'meta_learner': type(meta_learner).__name__,
+                        'tuned': False
+                    }
+
+                    # Check if ensemble beats best individual model
+                    if ensemble_mean_score > best_score:
+                        print(f"✅ Stacking Ensemble improves over best individual model!")
+                        print(f"   Improvement: {((ensemble_mean_score - best_score) / abs(best_score) * 100):.2f}%")
+                        best_score = ensemble_mean_score
+                        best_model_name = 'Stacking Ensemble'
+                        best_model_factory = None
+                        best_model_params = None
+                        best_model_object = ensemble
+                    else:
+                        print(f"Individual model {best_model_name} still wins")
+                        print(f"   Difference: {((best_score - ensemble_mean_score) / abs(best_score) * 100):.2f}%")
+                        # Release ensemble estimators aggressively when not selected
+                        del ensemble
+
+                    cleanup_memory("After ensemble evaluation", aggressive=False)
         else:
             print("Not enough models for ensembling (need at least 2)")
 
@@ -658,11 +713,13 @@ def train_model_pipeline() -> str:
 
         # Log GPU status for transparency
         if is_cuml_available():
-            print(f"ℹ️  Using GPU acceleration (cuML) for {best_model_name}")
+            print(f"\u2139\ufe0f  Using GPU acceleration (cuML) for {best_model_name}")
         elif is_xgboost_gpu_available() and 'XGBoost' in best_model_name:
-            print(f"ℹ️  Using GPU acceleration (XGBoost) for {best_model_name}")
+            print(f"\u2139\ufe0f  Using GPU acceleration (XGBoost) for {best_model_name}")
+        elif is_lightgbm_gpu_available() and 'LightGBM' in best_model_name:
+            print(f"\u2139\ufe0f  Using GPU acceleration (LightGBM) for {best_model_name}")
         else:
-            print(f"ℹ️  Using CPU for {best_model_name}")
+            print(f"\u2139\ufe0f  Using CPU for {best_model_name}")
 
         if best_model_name == 'Stacking Ensemble':
             best_model = best_model_object

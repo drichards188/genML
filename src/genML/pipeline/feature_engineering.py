@@ -457,23 +457,19 @@ def engineer_features() -> str:
                         if corr_preview:
                             print(f"   Strong target correlations: {', '.join(corr_preview)}")
 
-                    ai_feature_suggestions = advisor.generate_feature_ideas(
-                        dataset_summary={
-                            "target_column": target_col,
-                            "problem_type": analysis_results.get("problem_type"),
-                            "detected_domain": detected_domain,
-                            "feature_importances": feature_importances,
-                            "sample_rows": df_sample.to_dict("records"),
-                            "derived_context": derived_context,
-                        },
-                        existing_features=current_features,
+                    ai_feature_suggestions = advisor.suggest_features(
+                        df_sample=df_sample,
+                        current_features=current_features,
+                        target_col=target_col or "",
+                        detected_domain=detected_domain,
+                        feature_importances=feature_importances,
                     )
 
                     if ai_feature_suggestions.get("status") == "success":
                         print("AI Feature Advisor successfully generated suggestions.")
                         print(
                             json.dumps(
-                                ai_feature_suggestions.get("summary", {}) or {},
+                                ai_feature_suggestions.get("feature_analysis", {}) or {},
                                 indent=2,
                             )
                         )
@@ -485,11 +481,18 @@ def engineer_features() -> str:
                 logger.warning("AI Feature Ideation Advisor failed: %s", exc)
                 ai_feature_suggestions = None
 
-        train_features, test_features = feature_engine.transform(train_df, test_df)
+        train_features = feature_engine.transform(train_df)
+        test_features = feature_engine.transform(test_df)
         feature_columns = list(train_features.columns)
-        feature_metadata = feature_engine.get_metadata()
 
-        if ai_feature_suggestions:
+        # Align test features to training feature order to avoid column mismatches.
+        for column in feature_columns:
+            if column not in test_features.columns:
+                test_features[column] = 0.0
+        test_features = test_features[feature_columns]
+        feature_metadata = feature_engine.get_feature_report()
+
+        if ai_feature_suggestions and ai_feature_suggestions.get("engineered_features"):
             train_features, test_features, ai_feature_summary = apply_ai_generated_features(
                 train_raw=train_df,
                 test_raw=test_df,
@@ -498,6 +501,7 @@ def engineer_features() -> str:
                 suggestions=ai_feature_suggestions,
             )
         else:
+            ai_feature_suggestions = None
             ai_feature_summary = {
                 "status": "skipped",
                 "reason": "advisor_disabled" if not config.AI_ADVISORS_CONFIG["enabled"] else "no_suggestions",

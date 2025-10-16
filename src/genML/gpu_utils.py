@@ -16,7 +16,6 @@ Key Features:
 import logging
 import subprocess
 from typing import Dict, Any, Tuple, Optional
-import warnings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -152,6 +151,32 @@ def detect_catboost_gpu() -> bool:
         return False
 
 
+def detect_lightgbm_gpu() -> Tuple[bool, Dict[str, str]]:
+    """
+    Detect LightGBM GPU support by fitting a minimal model.
+
+    Returns:
+        tuple: (gpu_available, lgb_params)
+    """
+    try:
+        import numpy as _np
+        import lightgbm as _lgb
+
+        # Minimal dataset for GPU probing
+        X = _np.array([[0.0], [1.0]], dtype=_np.float32)
+        y = _np.array([0, 1], dtype=_np.int32)
+
+        # Try constructing a small LGBM model asking for GPU device
+        probe = _lgb.LGBMClassifier(n_estimators=1, device='gpu')
+        probe.fit(X, y)
+
+        logger.info("LightGBM GPU support detected")
+        return True, {'device': 'gpu'}
+    except Exception as e:
+        logger.debug(f"LightGBM GPU support not available: {e}")
+        return False, {}
+
+
 def initialize_gpu_detection(force_cpu: bool = False) -> Dict[str, Any]:
     """
     Run comprehensive GPU detection and initialize global configuration.
@@ -179,13 +204,20 @@ def initialize_gpu_detection(force_cpu: bool = False) -> Dict[str, Any]:
     if cuda_info['available']:
         _GPU_CONFIG['cuml_available'] = detect_cuml()
         _GPU_CONFIG['xgboost_gpu_available'], xgb_params = detect_xgboost_gpu()
+        _GPU_CONFIG['lightgbm_gpu_available'], lgb_params = detect_lightgbm_gpu()
         _GPU_CONFIG['xgb_params'] = xgb_params
         _GPU_CONFIG['catboost_gpu_available'] = detect_catboost_gpu()
     else:
         _GPU_CONFIG['cuml_available'] = False
         _GPU_CONFIG['xgboost_gpu_available'] = False
+        _GPU_CONFIG['lightgbm_gpu_available'] = False
         _GPU_CONFIG['catboost_gpu_available'] = False
         _GPU_CONFIG['xgb_params'] = {}
+        _GPU_CONFIG['lgb_params'] = {}
+
+    # Ensure keys exist even when CUDA unavailable
+    _GPU_CONFIG.setdefault('lightgbm_gpu_available', False)
+    _GPU_CONFIG.setdefault('lgb_params', {})
 
     # Log summary
     logger.info("="*60)
@@ -197,6 +229,7 @@ def initialize_gpu_detection(force_cpu: bool = False) -> Dict[str, Any]:
         logger.info(f"  cuML Available: {_GPU_CONFIG['cuml_available']}")
         logger.info(f"  XGBoost GPU Available: {_GPU_CONFIG['xgboost_gpu_available']}")
         logger.info(f"  CatBoost GPU Available: {_GPU_CONFIG['catboost_gpu_available']}")
+        logger.info(f"  LightGBM GPU Available: {_GPU_CONFIG['lightgbm_gpu_available']}")
     logger.info("="*60)
 
     return _GPU_CONFIG
@@ -391,9 +424,19 @@ def is_catboost_gpu_available() -> bool:
     return _GPU_CONFIG.get('catboost_gpu_available', False)
 
 
+def is_lightgbm_gpu_available() -> bool:
+    """Check if LightGBM GPU is available"""
+    return _GPU_CONFIG.get('lightgbm_gpu_available', False)
+
+
 def get_xgboost_params() -> Dict[str, str]:
     """Get XGBoost GPU parameters"""
     return _GPU_CONFIG.get('xgb_params', {})
+
+
+def get_lightgbm_params() -> Dict[str, str]:
+    """Get LightGBM GPU parameters"""
+    return _GPU_CONFIG.get('lgb_params', {})
 
 
 def log_gpu_memory(stage: str = ""):
