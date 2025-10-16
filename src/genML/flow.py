@@ -11,12 +11,12 @@ from crewai import Agent, Task, Crew, Process
 from crewai.flow import Flow, listen, start
 
 # Import ML pipeline functions - these handle the core data science operations
-from src.genML.tools import (
-    load_dataset,            # Data loading and initial exploration
-    engineer_features,       # Feature engineering and preprocessing
+from src.genML.pipeline import (
+    engineer_features,  # Feature engineering and preprocessing
+    generate_predictions,  # Final predictions and submission file creation
+    load_dataset,  # Data loading and initial exploration
     run_model_selection_advisor,  # AI model advisor
-    train_model_pipeline,    # Model training and selection
-    generate_predictions     # Final predictions and submission file creation
+    train_model_pipeline,  # Model training and selection
 )
 
 
