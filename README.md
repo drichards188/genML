@@ -22,9 +22,18 @@ genML/
 ├── src/genML/              # Main source code
 │   ├── main.py                 # Main entry point
 │   ├── flow.py                 # CrewAI Flow orchestration
-│   ├── tools.py                # Core ML pipeline functions
+│   ├── tools.py                # Backwards-compatible shim (re-exports modern pipeline API)
 │   ├── submission_formatter.py # Adaptive submission formatting
-│   └── features/               # Automated feature engineering
+│   ├── pipeline/               # Modular ML pipeline implementation
+│   │   ├── __init__.py         # Public pipeline API (`load_dataset`, `train_model_pipeline`, ...)
+│   │   ├── config.py           # Shared constants, paths, and tuning settings
+│   │   ├── dataset.py          # Dataset discovery / loading utilities
+│   │   ├── feature_engineering.py # Automated feature engineering + AI ideation integration
+│   │   ├── model_advisor.py    # Model guidance + problem type detection
+│   │   ├── training.py         # Optuna tuning, ensemble evaluation, GPU-aware training
+│   │   ├── prediction.py       # Submission + prediction generation
+│   │   └── utils.py            # Memory / GPU cleanup helpers
+│   └── features/               # Automated feature engineering helpers
 │       ├── feature_engine.py   # Main feature engineering orchestrator
 │       ├── data_analyzer.py    # Data type detection
 │       ├── feature_processors.py # Feature transformation modules
@@ -135,11 +144,13 @@ After successful execution, you'll find:
 - **Error handling**: Comprehensive error propagation between pipeline stages
 - **Progress tracking**: Real-time status updates and detailed logging
 - **Modular design**: Each stage is independent and can be modified separately
+- **Pipeline package**: All production logic lives in `src/genML/pipeline/`, while `src/genML/tools.py` keeps the historical API intact for older scripts/tests.
 
 ### 📊 Core ML Functions
+The primary entry points are re-exported via `src.genML.pipeline` (and mirrored in `src.genML.tools` for compatibility):
 - `load_dataset()` - Multi-path dataset loading with validation
-- `engineer_features()` - Automated feature engineering pipeline
-- `train_model_pipeline()` - Multi-model training with automatic selection
+- `engineer_features()` - Automated feature engineering pipeline (with optional AI feature ideation)
+- `train_model_pipeline()` - Multi-model training with Optuna tuning, GPU-aware factories, and optional stacking ensembles
 - `generate_predictions()` - Adaptive prediction generation and formatting
 
 ## Requirements
@@ -186,4 +197,3 @@ Solution: `pip install -r requirements.txt` or `uv sync`
 
 **Pipeline fails on feature engineering:**
 Check that your dataset has proper column names and no completely empty columns.
-

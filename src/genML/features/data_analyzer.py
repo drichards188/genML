@@ -59,7 +59,15 @@ class DataTypeAnalyzer:
             'datetime_columns': [],
             'id_columns': [],
             'target_candidates': [],
-            'recommendations': {}
+            'recommendations': {},
+            'data_quality': {
+                'total_rows': len(df),
+                'total_columns': len(df.columns),
+                'duplicate_rows': df.duplicated().sum(),
+                'total_missing_cells': df.isnull().sum().sum(),
+                'missing_percentage': (df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100 if len(df) > 0 and len(df.columns) > 0 else 0,
+                'memory_usage_mb': df.memory_usage(deep=True).sum() / 1024 / 1024
+            }
         }
 
         # Analyze each column

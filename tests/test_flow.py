@@ -5,7 +5,29 @@ Tests the MLPipelineFlow class and its stage methods that orchestrate
 the complete machine learning pipeline.
 """
 import pytest
+
 from src.genML.flow import MLPipelineFlow, create_ml_pipeline_flow
+from src.genML.pipeline import config as pipeline_config
+
+
+@pytest.fixture
+def flow_paths(tmp_path, monkeypatch):
+    """Provide isolated pipeline directories for flow tests."""
+    outputs_dir = tmp_path / "outputs"
+    mapping = {
+        "OUTPUTS_DIR": outputs_dir,
+        "DATA_DIR": outputs_dir / "data",
+        "FEATURES_DIR": outputs_dir / "features",
+        "MODELS_DIR": outputs_dir / "models",
+        "PREDICTIONS_DIR": outputs_dir / "predictions",
+        "REPORTS_DIR": outputs_dir / "reports",
+    }
+
+    for attr, path in mapping.items():
+        path.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(pipeline_config, attr, path)
+
+    return mapping
 
 
 class TestMLPipelineFlow:
@@ -140,36 +162,23 @@ class TestMLPipelineFlow:
         if 'status' in result:
             assert result['status'] in ['success', 'failed']
 
-    def test_feature_engineering_with_success_input(self, sample_train_df, sample_test_df, temp_dataset_dir, tmp_path, monkeypatch):
+    def test_feature_engineering_with_success_input(self, sample_train_df, sample_test_df, flow_paths):
         """Test feature engineering with successful data loading input"""
-        from src.genML import tools
-
         flow = create_ml_pipeline_flow()
 
-        # Setup directories
-        data_dir = tmp_path / "outputs" / "data"
-        data_dir.mkdir(parents=True)
+        # Save test data into the configured pipeline paths
+        sample_train_df.to_pickle(flow_paths["DATA_DIR"] / "train_data.pkl")
+        sample_test_df.to_pickle(flow_paths["DATA_DIR"] / "test_data.pkl")
 
-        # Save test data
-        sample_train_df.to_pickle(data_dir / 'train_data.pkl')
-        sample_test_df.to_pickle(data_dir / 'test_data.pkl')
+        data_summary = {
+            "status": "success",
+            "train_shape": [10, 9],
+            "test_shape": [5, 8],
+        }
 
-        original_data_dir = tools.DATA_DIR
-        tools.DATA_DIR = data_dir
+        result = flow.feature_engineering_task(data_summary)
 
-        try:
-            # Simulate successful data loading
-            data_summary = {
-                "status": "success",
-                "train_shape": [10, 9],
-                "test_shape": [5, 8]
-            }
-
-            result = flow.feature_engineering_task(data_summary)
-
-            assert isinstance(result, dict)
-        finally:
-            tools.DATA_DIR = original_data_dir
+        assert isinstance(result, dict)
 
     def test_flow_error_handling_consistency(self):
         """Test that all flow stages handle errors consistently"""

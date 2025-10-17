@@ -11,14 +11,26 @@ from crewai import Agent, Task, Crew, Process
 from crewai.flow import Flow, listen, start
 
 # Import ML pipeline functions - these handle the core data science operations
-from src.genML.tools import (
-    load_dataset,            # Data loading and initial exploration
-    engineer_features,       # Feature engineering and preprocessing
+from src.genML.pipeline import (
+    engineer_features,  # Feature engineering and preprocessing
+    generate_predictions,  # Final predictions and submission file creation
+    load_dataset,  # Data loading and initial exploration
     run_model_selection_advisor,  # AI model advisor
-    train_model_pipeline,    # Model training and selection
-    generate_predictions     # Final predictions and submission file creation
+    train_model_pipeline,  # Model training and selection
 )
 
+
+class PipelineAbort(Exception):
+    """Signal that the pipeline should stop immediately."""
+
+
+def _abort_if_failed(stage_result, stage_name):
+    """Raise PipelineAbort when an upstream stage marked itself as failed."""
+    if isinstance(stage_result, dict) and stage_result.get("status") == "failed":
+        reason = stage_result.get("error") or "unknown reason"
+        message = f"{stage_name} reported failure: {reason}"
+        print(f"❌ Aborting pipeline - {message}")
+        raise PipelineAbort(message)
 
 class MLPipelineFlow(Flow):
     """
@@ -55,15 +67,11 @@ class MLPipelineFlow(Flow):
 
             return data_summary
 
+        except PipelineAbort:
+            raise
         except Exception as e:
-            # Error handling is crucial - we need to fail gracefully and propagate
-            # the failure status to prevent downstream stages from executing with bad data
-            error_result = {
-                "error": f"Data loading failed: {str(e)}",
-                "status": "failed"
-            }
             print("❌ DATA LOADING FAILED:", str(e))
-            return error_result
+            raise PipelineAbort(f"Data loading failed: {e}") from e
 
     @listen(load_data_task)
     def feature_engineering_task(self, data_summary):
@@ -84,9 +92,7 @@ class MLPipelineFlow(Flow):
         print("\n🔄 Step 2: Engineering features from the dataset...")
 
         # Check if previous stage failed - critical for pipeline integrity
-        if data_summary.get("status") == "failed":
-            print("❌ Skipping feature engineering - data loading failed")
-            return data_summary
+        _abort_if_failed(data_summary, "Data loading")
 
         # Execute feature engineering pipeline
         try:
@@ -98,14 +104,11 @@ class MLPipelineFlow(Flow):
 
             return feature_results
 
+        except PipelineAbort:
+            raise
         except Exception as e:
-            # Capture and propagate feature engineering failures
-            error_result = {
-                "error": f"Feature engineering failed: {str(e)}",
-                "status": "failed"
-            }
             print("❌ FEATURE ENGINEERING FAILED:", str(e))
-            return error_result
+            raise PipelineAbort(f"Feature engineering failed: {e}") from e
 
     @listen(feature_engineering_task)
     def model_selection_task(self, feature_results):
@@ -116,9 +119,7 @@ class MLPipelineFlow(Flow):
         """
         print("\n🔄 Step 3: Consulting AI model advisor for recommended algorithms...")
 
-        if feature_results.get("status") == "failed":
-            print("❌ Skipping model advisor - feature engineering failed")
-            return feature_results
+        _abort_if_failed(feature_results, "Feature engineering")
 
         try:
             result_json = run_model_selection_advisor()
@@ -131,6 +132,8 @@ class MLPipelineFlow(Flow):
             feature_results['model_advisor'] = advisor_results
             feature_results['model_advisor_status'] = status
             return feature_results
+        except PipelineAbort:
+            raise
         except Exception as e:
             print(f"❌ MODEL ADVISOR FAILED: {e}")
             feature_results['model_advisor_error'] = str(e)
@@ -155,9 +158,7 @@ class MLPipelineFlow(Flow):
         print("\n🔄 Step 4: Training and selecting the best ML model...")
 
         # Ensure previous stage completed successfully
-        if feature_results.get("status") == "failed":
-            print("❌ Skipping model training - feature engineering failed")
-            return feature_results
+        _abort_if_failed(feature_results, "Model advisor / feature engineering")
 
         # Execute model training and selection pipeline
         try:
@@ -169,15 +170,11 @@ class MLPipelineFlow(Flow):
 
             return model_results
 
+        except PipelineAbort:
+            raise
         except Exception as e:
-            # Handle model training failures - these can occur due to data issues,
-            # hyperparameter problems, or computational constraints
-            error_result = {
-                "error": f"Model training failed: {str(e)}",
-                "status": "failed"
-            }
             print("❌ MODEL TRAINING FAILED:", str(e))
-            return error_result
+            raise PipelineAbort(f"Model training failed: {e}") from e
 
     @listen(model_training_task)
     def prediction_task(self, model_results):
@@ -197,9 +194,7 @@ class MLPipelineFlow(Flow):
         print("\n🔄 Step 4: Generating predictions and creating submission file...")
 
         # Verify model training completed successfully
-        if model_results.get("status") == "failed":
-            print("❌ Skipping predictions - model training failed")
-            return model_results
+        _abort_if_failed(model_results, "Model training")
 
         # Execute prediction generation and submission file creation
         try:
@@ -213,15 +208,11 @@ class MLPipelineFlow(Flow):
 
             return prediction_results
 
+        except PipelineAbort:
+            raise
         except Exception as e:
-            # Handle prediction failures - these might occur due to model loading issues,
-            # test data problems, or file writing permissions
-            error_result = {
-                "error": f"Prediction generation failed: {str(e)}",
-                "status": "failed"
-            }
             print("❌ PREDICTION GENERATION FAILED:", str(e))
-            return error_result
+            raise PipelineAbort(f"Prediction generation failed: {e}") from e
 
 
 def create_ml_pipeline_flow():
