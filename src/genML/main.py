@@ -8,8 +8,6 @@ the standard train.csv/test.csv format.
 
 Usage:
     python main.py  (from project root)
-    OR
-    crewai run      (using CrewAI CLI)
 
 Prerequisites:
     - Place train.csv and test.csv dataset files in the project root directory
@@ -25,7 +23,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.genML.flow import create_ml_pipeline_flow
+from src.genML.flow import PipelineAbort, create_ml_pipeline_flow
 from src.genML.logging_config import setup_logging
 
 
@@ -185,6 +183,12 @@ def main():
     except KeyboardInterrupt:
         logger.warning("Pipeline interrupted by user")
         print("\n\n⚠️  Pipeline interrupted by user.")
+        return 1
+    except PipelineAbort as e:
+        logger.error(f"Pipeline aborted: {e}")
+        print(f"\n\n⚠️ Pipeline aborted: {e}")
+        print("Please address the issue above before re-running the pipeline.")
+        print(f"📝 Full log saved to: {log_filepath}")
         return 1
     except Exception as e:
         logger.error(f"Pipeline failed with error: {str(e)}", exc_info=True)

@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 import numpy as np
+from sklearn.linear_model import Ridge
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 
@@ -15,6 +16,7 @@ import xgboost as xgb
 
 from src.genML.gpu_utils import (
     get_gpu_memory_usage,
+    get_linear_model_classifier,
     get_random_forest_classifier,
     get_random_forest_regressor,
     get_xgboost_params,
