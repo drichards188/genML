@@ -125,6 +125,9 @@ After successful execution, you'll find:
 - `outputs/predictions/` - Detailed predictions and submission files
 - `outputs/reports/` - JSON reports from each pipeline stage
 
+go to `http://172.28.165.188:5173/` to see dashboard
+
+
 ## Key Features
 
 ### 🤖 Automated Feature Engineering
