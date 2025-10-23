@@ -51,10 +51,16 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>🤖 GenML Pipeline Dashboard</h1>
+        <h1>GENML PIPELINE DASHBOARD</h1>
         <div className="header-status">
-          <span className={`status-indicator ${connectionStatus}`}>
-            {isConnected ? '● Connected' : '○ Disconnected'}
+          <span className={`status-indicator ${connectionStatus}`} role="status" aria-live="polite">
+            <span
+              className={`status-icon ${connectionStatus}`}
+              aria-hidden="true"
+            />
+            <span className="status-text">
+              {isConnected ? 'Connected' : connectionStatus === 'reconnecting' ? 'Reconnecting…' : 'Disconnected'}
+            </span>
           </span>
         </div>
       </header>
@@ -62,24 +68,24 @@ function App() {
       <main className="app-main">
         {(!currentRun || currentRun.status === 'idle' || !currentRun.run_id) && (
           <div className="empty-state">
-            <h2>💤 No Active Pipeline</h2>
-            <p>{currentRun?.message || 'Waiting for pipeline to start...'}</p>
+            <h2>⚠ SYSTEM IDLE ⚠</h2>
+            <p>{currentRun?.message || 'AWAITING PIPELINE INITIALIZATION...'}</p>
             <p className="hint">
-              To start the pipeline, run: <code>python src/genML/main.py</code>
+              INITIATE SEQUENCE: <code>python src/genML/main.py</code>
             </p>
             <div className="connection-info">
               <p>
-                <strong>Connection Status:</strong>{' '}
+                <strong>NETWORK STATUS:</strong>{' '}
                 <span className={`status-badge ${connectionStatus}`}>
-                  {connectionStatus === 'connected' ? '✓ Connected to API' : '⚠ Disconnected'}
+                  {connectionStatus === 'connected' ? 'LINK ESTABLISHED' : '⚠ LINK DOWN'}
                 </span>
               </p>
               {connectionStatus === 'connected' && (
-                <p className="success-text">✓ Dashboard is ready and waiting for pipeline data</p>
+                <p className="success-text">SYSTEM ONLINE - MONITORING ACTIVE</p>
               )}
               {connectionStatus !== 'connected' && (
                 <p className="warning-text">
-                  ⚠ Cannot connect to API server. Make sure it's running: <code>python run_api.py</code>
+                  ⚠ API SERVER OFFLINE - EXECUTE: <code>python run_api.py</code>
                 </p>
               )}
             </div>
@@ -90,7 +96,7 @@ function App() {
           <div className="dashboard">
             {/* Pipeline Overview */}
             <section className="card">
-              <h2>Pipeline Status</h2>
+              <h2>PIPELINE STATUS</h2>
               <div className="status-grid">
                 <div className="status-item">
                   <span className="label">Run ID:</span>
@@ -118,7 +124,7 @@ function App() {
             {/* Current Task */}
             {isLive && currentRun.current_task && (
               <section className="card highlight">
-                <h2>Current Activity</h2>
+                <h2>ACTIVE PROCESS</h2>
                 <div className="current-task">
                   <div className="task-description">{currentRun.current_task}</div>
                   <div className="progress-bar">
@@ -134,7 +140,7 @@ function App() {
 
             {/* Stages */}
             <section className="card">
-              <h2>Pipeline Stages</h2>
+              <h2>EXECUTION STAGES</h2>
               <div className="stages">
                 {Object.entries(currentRun.stages || {}).map(([num, stage]) => (
                   <div key={num} className={`stage stage-${stage.status}`}>
@@ -158,7 +164,7 @@ function App() {
             {/* Models */}
             {currentRun.models && currentRun.models.length > 0 && (
               <section className="card">
-                <h2>Models Training</h2>
+                <h2>MODEL TRAINING</h2>
                 <div className="models-grid">
                   {currentRun.models.map((model) => (
                     <div key={model.name} className={`model-card model-${model.status}`}>
@@ -183,7 +189,7 @@ function App() {
             {/* Resources */}
             {currentRun.resources && (
               <section className="card">
-                <h2>Resource Usage</h2>
+                <h2>SYSTEM RESOURCES</h2>
                 <div className="resources-grid">
                   <div className="resource-item">
                     <span className="resource-label">GPU Memory:</span>
@@ -216,7 +222,7 @@ function App() {
 
             {/* Raw Data (for debugging) */}
             <details className="card">
-              <summary>Raw Data (Debug)</summary>
+              <summary>RAW DATA [DEBUG MODE]</summary>
               <pre className="json-view">{JSON.stringify(currentRun, null, 2)}</pre>
             </details>
           </div>

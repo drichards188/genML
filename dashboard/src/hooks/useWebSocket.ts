@@ -25,7 +25,8 @@ interface UseWebSocketReturn {
 // Use window.location.host (includes port) so Vite proxy works in dev mode
 // Dev mode: ws://localhost:5173/ws/progress (proxied to :8000)
 // Production: ws://localhost:8000/ws/progress (direct connection)
-const WS_URL = `ws://${window.location.host}/ws/progress`;
+const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss' : 'ws';
+const WS_URL = `${WS_PROTOCOL}://${window.location.host}/ws/progress`;
 
 export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketReturn => {
   const {
