@@ -743,14 +743,19 @@ def train_model_pipeline() -> str:
             scoring_metric = 'neg_mean_squared_error'
             best_score = float('-inf')  # Higher (less negative) is better for MSE
         else:  # classification
+            # cuML uses different parameter names than sklearn
+            # cuML: seed, sklearn: random_state
             logistic_base_params: Dict[str, Any] = {'max_iter': 1000}
-            try:
-                logistic_signature = inspect.signature(LogisticRegressionClass.__init__)
-                if 'random_state' in logistic_signature.parameters:
-                    logistic_base_params['random_state'] = 42
-            except (ValueError, TypeError):
-                # Some constructors (e.g., C extensions) may not expose signatures; fall back to safe defaults
-                pass
+
+            # Check if this is cuML (Cython classes don't expose signatures properly)
+            class_module = LogisticRegressionClass.__module__
+            if 'cuml' in class_module:
+                # cuML uses 'seed' instead of 'random_state'
+                # Note: cuML LogisticRegression doesn't support random_state parameter
+                pass  # No seed parameter needed for cuML LogisticRegression
+            else:
+                # sklearn uses 'random_state'
+                logistic_base_params['random_state'] = 42
 
             models = {
                 'Logistic Regression': make_factory(

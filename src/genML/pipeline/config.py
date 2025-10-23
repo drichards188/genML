@@ -80,7 +80,7 @@ AI_ADVISORS_CONFIG: Dict[str, Any] = {
         "save_report": True,
     },
     "openai_config": {
-        "model": "gpt-4o-mini",
+        "model": "gpt-4o",  # Upgraded from gpt-4o-mini for better reasoning
         "max_cost_per_run": 10.0,
         "enable_cache": True,
         "cache_dir": "outputs/ai_cache",

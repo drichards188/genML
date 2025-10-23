@@ -160,7 +160,16 @@ def optimize_linear_model(trial: optuna.trial.Trial, X, y, problem_type: str, cv
         scoring = "neg_mean_squared_error"
     else:
         LinearModel = get_linear_model_classifier()
-        model = LinearModel(C=1.0 / alpha if alpha > 0 else 1.0, random_state=42, max_iter=1000)
+        # cuML LogisticRegression doesn't support random_state parameter
+        # sklearn LogisticRegression does support it
+        model_params = {'C': 1.0 / alpha if alpha > 0 else 1.0, 'max_iter': 1000}
+
+        # Check if this is cuML or sklearn
+        if 'cuml' not in LinearModel.__module__:
+            # sklearn uses random_state
+            model_params['random_state'] = 42
+
+        model = LinearModel(**model_params)
         scoring = "accuracy"
 
     scaler = StandardScaler()
