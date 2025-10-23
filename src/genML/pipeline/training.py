@@ -8,6 +8,7 @@ import logging
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict
+import inspect
 
 import warnings
 from sklearn.exceptions import ConvergenceWarning
@@ -79,6 +80,67 @@ from src.genML.pipeline.utils import cleanup_memory
 logger = logging.getLogger(__name__)
 
 
+def _compute_adaptive_tuning_limits(
+    shape: tuple[int, ...],
+) -> dict[str, Any]:
+    """
+    Derive dataset-aware overrides for Optuna tuning so small tabular datasets
+    do not spend excessive time in hyperparameter optimization loops.
+    """
+    base_trials = config.TUNING_CONFIG["n_trials"]
+    base_timeout = config.TUNING_CONFIG["timeout"]
+
+    n_samples = int(shape[0]) if shape else 0
+    n_features = int(shape[1]) if len(shape) > 1 else 0
+
+    overrides: dict[str, Any] = {
+        "global": {
+            "n_trials": base_trials,
+            "timeout": base_timeout,
+        },
+        "per_model": {},
+        "notes": [],
+    }
+
+    if n_samples == 0:
+        return overrides
+
+    # Heuristic caps for compact datasets where long searches bring diminishing returns.
+    very_small_dataset = n_samples <= 2000
+    small_dataset = 2000 < n_samples <= 5000 or (n_samples <= 5000 and n_features <= 50)
+
+    if very_small_dataset:
+        overrides["global"]["n_trials"] = min(base_trials, 25)
+        overrides["global"]["timeout"] = min(base_timeout, 240)
+        overrides["per_model"]["CatBoost"] = {
+            "n_trials": min(overrides["global"]["n_trials"], 15),
+            "timeout": min(overrides["global"]["timeout"], 180),
+        }
+        overrides["per_model"]["TabNet"] = {
+            "n_trials": min(overrides["global"]["n_trials"], 10),
+            "timeout": min(overrides["global"]["timeout"], 180),
+        }
+        overrides["notes"].append(
+            f"Detected small dataset (n={n_samples}, features={n_features}); capping tuning to "
+            f"{overrides['global']['n_trials']} trials with CatBoost limited to "
+            f"{overrides['per_model']['CatBoost']['n_trials']} trials."
+        )
+    elif small_dataset:
+        overrides["global"]["n_trials"] = min(base_trials, 40)
+        overrides["global"]["timeout"] = min(base_timeout, 360)
+        overrides["per_model"]["CatBoost"] = {
+            "n_trials": min(overrides["global"]["n_trials"], 20),
+            "timeout": min(overrides["global"]["timeout"], 240),
+        }
+        overrides["notes"].append(
+            f"Detected mid-sized dataset (n={n_samples}, features={n_features}); reducing tuning to "
+            f"{overrides['global']['n_trials']} trials overall and CatBoost to "
+            f"{overrides['per_model']['CatBoost']['n_trials']} trials."
+        )
+
+    return overrides
+
+
 def train_model_pipeline() -> str:
     """
     Train multiple ML models using cross-validation and select the best performer.
@@ -106,6 +168,15 @@ def train_model_pipeline() -> str:
         y_train = np.load(config.FEATURES_DIR / 'y_train.npy')
         logger.info(f"Loaded training data: X_train.shape={X_train.shape}, y_train.shape={y_train.shape}")
         logger.info(f"Data types: X_train.dtype={X_train.dtype}, y_train.dtype={y_train.dtype}")
+
+        n_samples = int(X_train.shape[0])
+        n_features = int(X_train.shape[1]) if X_train.ndim > 1 else 0
+        lightgbm_n_jobs_default = -1 if n_samples > 1500 else config.MEMORY_CONFIG["max_parallel_jobs"]
+        lightgbm_gpu_ready = (
+            LIGHTGBM_AVAILABLE
+            and is_lightgbm_gpu_available()
+            and not config.GPU_CONFIG.get('force_cpu', False)
+        )
 
         # Automatically detect problem type
         logger.info("Detecting problem type...")
@@ -154,6 +225,14 @@ def train_model_pipeline() -> str:
         LogisticRegressionClass = get_linear_model_classifier()
         RandomForestRegressorClass = get_random_forest_regressor()
         RandomForestClassifierClass = get_random_forest_classifier()
+
+        tuning_overrides = _compute_adaptive_tuning_limits(X_train.shape)
+        global_tuning_trials = tuning_overrides["global"]["n_trials"]
+        global_tuning_timeout = tuning_overrides["global"]["timeout"]
+        per_model_tuning_limits: Dict[str, Dict[str, Any]] = tuning_overrides["per_model"]
+
+        for note in tuning_overrides.get("notes", []):
+            print(f"⚙️ {note}")
 
         def make_factory(constructor, base_params=None):
             """
@@ -311,24 +390,34 @@ def train_model_pipeline() -> str:
                 'XGBoost': make_xgb_regressor_factory()  # Gradient boosting, high performance (GPU if available)
             }
             if LIGHTGBM_AVAILABLE:
-                models['LightGBM'] = make_factory(
-                    lgb.LGBMRegressor,
-                    {
-                        'random_state': 42,
-                        'n_estimators': 200,
-                        'learning_rate': 0.05,
-                        'n_jobs': -1
-                    }
-                )
-                # If LightGBM GPU is detected and we are not forcing CPU, update default params
-                if is_lightgbm_gpu_available() and not config.GPU_CONFIG.get('force_cpu', False):
-                    # Apply GPU params detected by gpu_utils
+                lightgbm_base_params = {
+                    'random_state': 42,
+                    'n_estimators': 200,
+                    'learning_rate': 0.05,
+                    'n_jobs': lightgbm_n_jobs_default,
+                    'verbosity': -1,
+                }
+                if n_samples <= 1500:
+                    lightgbm_base_params.update(
+                        {
+                            'n_estimators': 120,
+                            'min_child_samples': 5,
+                            'min_gain_to_split': 0.0,
+                            'feature_pre_filter': False,
+                        }
+                    )
+                    print(
+                        f"ℹ️ Adjusting LightGBM for small dataset (n={n_samples}, features={n_features}) "
+                        "to avoid degenerate splits and excessive CPU usage."
+                    )
+                if not lightgbm_gpu_ready:
+                    print("ℹ️ LightGBM GPU build not detected; training will run on CPU.")
+                models['LightGBM'] = make_factory(lgb.LGBMRegressor, lightgbm_base_params)
+                if lightgbm_gpu_ready:
                     lgb_gpu_params = get_lightgbm_params()
-                    # Wrap existing factory to merge GPU params at instantiation time
-                    base_factory = models['LightGBM']
 
                     def lgb_factory_with_gpu(overrides=None):
-                        params = {'random_state': 42, 'n_estimators': 200, 'learning_rate': 0.05, 'n_jobs': -1}
+                        params = lightgbm_base_params.copy()
                         params.update(lgb_gpu_params)
                         if overrides:
                             params.update(overrides)
@@ -345,10 +434,19 @@ def train_model_pipeline() -> str:
             scoring_metric = 'neg_mean_squared_error'
             best_score = float('-inf')  # Higher (less negative) is better for MSE
         else:  # classification
+            logistic_base_params: Dict[str, Any] = {'max_iter': 1000}
+            try:
+                logistic_signature = inspect.signature(LogisticRegressionClass.__init__)
+                if 'random_state' in logistic_signature.parameters:
+                    logistic_base_params['random_state'] = 42
+            except (ValueError, TypeError):
+                # Some constructors (e.g., C extensions) may not expose signatures; fall back to safe defaults
+                pass
+
             models = {
                 'Logistic Regression': make_factory(
                     LogisticRegressionClass,
-                    {'random_state': 42, 'max_iter': 1000}
+                    logistic_base_params
                 ),  # Linear, interpretable
                 'Random Forest': make_factory(
                     RandomForestClassifierClass,
@@ -357,20 +455,35 @@ def train_model_pipeline() -> str:
                 'XGBoost': make_xgb_classifier_factory()  # Gradient boosting, high performance (GPU if available)
             }
             if LIGHTGBM_AVAILABLE:
-                models['LightGBM'] = make_factory(
-                    lgb.LGBMClassifier,
-                    {
-                        'random_state': 42,
-                        'n_estimators': 200,
-                        'learning_rate': 0.05,
-                        'n_jobs': -1,
-                        'objective': 'binary'
-                    }
-                )
-                if is_lightgbm_gpu_available() and not config.GPU_CONFIG.get('force_cpu', False):
+                lightgbm_base_params = {
+                    'random_state': 42,
+                    'n_estimators': 200,
+                    'learning_rate': 0.05,
+                    'n_jobs': lightgbm_n_jobs_default,
+                    'objective': 'binary',
+                    'verbosity': -1,
+                }
+                if n_samples <= 1500:
+                    lightgbm_base_params.update(
+                        {
+                            'n_estimators': 120,
+                            'min_child_samples': 5,
+                            'min_gain_to_split': 0.0,
+                            'feature_pre_filter': False,
+                        }
+                    )
+                    print(
+                        f"ℹ️ Adjusting LightGBM for small dataset (n={n_samples}, features={n_features}) "
+                        "to avoid degenerate splits and excessive CPU usage."
+                    )
+                if not lightgbm_gpu_ready:
+                    print("ℹ️ LightGBM GPU build not detected; training will run on CPU.")
+                models['LightGBM'] = make_factory(lgb.LGBMClassifier, lightgbm_base_params)
+                if lightgbm_gpu_ready:
                     lgb_gpu_params = get_lightgbm_params()
+
                     def lgb_clf_factory_with_gpu(overrides=None):
-                        params = {'random_state': 42, 'n_estimators': 200, 'learning_rate': 0.05, 'n_jobs': -1, 'objective': 'binary'}
+                        params = lightgbm_base_params.copy()
                         params.update(lgb_gpu_params)
                         if overrides:
                             params.update(overrides)
@@ -441,12 +554,20 @@ def train_model_pipeline() -> str:
         # Suppress Optuna's default logging to reduce clutter
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+        # Track overall model training progress
+        total_models = len(models)
+        models_completed = 0
+
         for name, model_factory in models.items():
             print(f"\n{'='*60}")
             print(f"Training {name}...")
             print(f"{'='*60}")
             logger.info(f"[Training] Starting training for {name}")
             logger.info(f"[Training] Training data shape: X={X_train.shape}, y={y_train.shape}")
+
+            # Track model start in progress tracker
+            if config.PROGRESS_TRACKER:
+                config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
 
             model_override_values = ai_model_overrides.get(name, {})
             used_params = None
@@ -459,8 +580,18 @@ def train_model_pipeline() -> str:
             if config.TUNING_CONFIG['enabled'] and name in config.TUNING_CONFIG['models_to_tune']:
                 print(f"🔧 Tuning hyperparameters for {name}...")
                 print(f"   Strategy: Optuna Bayesian Optimization")
-                print(f"   Trials: {config.TUNING_CONFIG['n_trials']}")
-                logger.info(f"[Training] {name} - Hyperparameter tuning enabled with {config.TUNING_CONFIG['n_trials']} trials")
+                model_limit = per_model_tuning_limits.get(name, {})
+                model_n_trials = int(model_limit.get("n_trials", global_tuning_trials))
+                model_timeout = int(model_limit.get("timeout", global_tuning_timeout))
+                print(f"   Trials: {model_n_trials}")
+                print(f"   Timeout: {model_timeout}s")
+                if model_n_trials < config.TUNING_CONFIG['n_trials'] or model_timeout < config.TUNING_CONFIG['timeout']:
+                    print("   (Adaptive tuning limits applied for dataset size)")
+                logger.info(f"[Training] {name} - Hyperparameter tuning enabled with {model_n_trials} trials")
+
+                # Track model start with tuning info
+                if config.PROGRESS_TRACKER:
+                    config.PROGRESS_TRACKER.track_model_start(name, total_trials=model_n_trials)
 
                 # Create Optuna study for hyperparameter optimization
                 study = optuna.create_study(
@@ -488,14 +619,21 @@ def train_model_pipeline() -> str:
 
                 if objective:
                     # Run hyperparameter optimization
-                    logger.info(f"[Training] {name} - Starting Optuna optimization (n_trials={config.TUNING_CONFIG['n_trials']}, timeout={config.TUNING_CONFIG['timeout']}s)")
+                    logger.info(f"[Training] {name} - Starting Optuna optimization (n_trials={model_n_trials}, timeout={model_timeout}s)")
+
+                    # Define callback to track trial progress
+                    def trial_callback(study, trial):
+                        if config.PROGRESS_TRACKER and trial.value is not None:
+                            config.PROGRESS_TRACKER.track_model_trial(name, trial.number + 1, trial.value)
+
                     try:
                         study.optimize(
                             objective,
-                            n_trials=config.TUNING_CONFIG['n_trials'],
-                            timeout=config.TUNING_CONFIG['timeout'],
+                            n_trials=model_n_trials,
+                            timeout=model_timeout,
                             show_progress_bar=config.TUNING_CONFIG['show_progress_bar'],
-                            n_jobs=1  # Serial execution for stability
+                            n_jobs=1,  # Serial execution for stability
+                            callbacks=[trial_callback]  # Track trial progress
                         )
                         logger.info(f"[Training] {name} - Optimization completed successfully")
                     except Exception as e:
@@ -546,6 +684,15 @@ def train_model_pipeline() -> str:
                     used_params = clean_params
                     tuned_flag = True
 
+                    # Track model completion
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.track_model_complete(
+                            name,
+                            mean_score=model_mean_score,
+                            std_score=model_std_score,
+                            best_params=clean_params
+                        )
+
                     results[name] = {
                         'mean_score': model_mean_score,
                         'std_score': model_std_score,
@@ -565,6 +712,15 @@ def train_model_pipeline() -> str:
                     model_mean_score = float(scores.mean())
                     model_std_score = float(scores.std())
                     model_scores_list = scores.tolist()
+
+                    # Track model completion
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.track_model_complete(
+                            name,
+                            mean_score=model_mean_score,
+                            std_score=model_std_score
+                        )
+
                     results[name] = {
                         'mean_score': model_mean_score,
                         'std_score': model_std_score,
@@ -578,10 +734,22 @@ def train_model_pipeline() -> str:
                 # Model tuning disabled or not in tuning list - use defaults
                 print(f"   Using default hyperparameters...")
 
+                # Track model start (no tuning)
+                if config.PROGRESS_TRACKER:
+                    config.PROGRESS_TRACKER.track_model_start(name, total_trials=None)
+
                 scores = evaluate_with_default_params(name, model_factory, model_override_values)
                 model_mean_score = float(scores.mean())
                 model_std_score = float(scores.std())
                 model_scores_list = scores.tolist()
+
+                # Track model completion
+                if config.PROGRESS_TRACKER:
+                    config.PROGRESS_TRACKER.track_model_complete(
+                        name,
+                        mean_score=model_mean_score,
+                        std_score=model_std_score
+                    )
 
                 results[name] = {
                     'mean_score': model_mean_score,
@@ -607,6 +775,11 @@ def train_model_pipeline() -> str:
             cleanup_memory(f"After {name} evaluation", aggressive=is_rf)
             logger.info(f"[Training] {name} - Post-evaluation cleanup completed")
             logger.info(f"[Training] {name} - Training completed")
+
+            # Update model training progress
+            models_completed += 1
+            if config.PROGRESS_TRACKER:
+                config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
 
         # Create stacking ensemble of top models
         print(f"\n{'='*60}")
@@ -653,7 +826,14 @@ def train_model_pipeline() -> str:
                 else:
                     # Use LogisticRegression as meta-learner for classification
                     LogisticClass = get_linear_model_classifier()
-                    meta_learner = LogisticClass(random_state=42, max_iter=1000)
+                    meta_params: Dict[str, Any] = {'max_iter': 1000}
+                    try:
+                        logistic_sig = inspect.signature(LogisticClass.__init__)
+                        if 'random_state' in logistic_sig.parameters:
+                            meta_params['random_state'] = 42
+                    except (ValueError, TypeError):
+                        pass
+                    meta_learner = LogisticClass(**meta_params)
                     ensemble = StackingClassifier(
                         estimators=ensemble_estimators,
                         final_estimator=meta_learner,

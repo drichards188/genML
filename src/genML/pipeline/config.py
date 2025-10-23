@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 # Directory structure for organizing pipeline outputs. The directories are created at import time
 # so downstream stages can rely on them existing.
@@ -16,6 +16,9 @@ REPORTS_DIR = OUTPUTS_DIR / "reports"
 
 for directory in (OUTPUTS_DIR, DATA_DIR, FEATURES_DIR, MODELS_DIR, PREDICTIONS_DIR, REPORTS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
+
+# Global progress tracker instance (set by flow.py)
+PROGRESS_TRACKER: Optional[Any] = None
 
 
 # Hyperparameter Tuning Configuration

@@ -387,6 +387,10 @@ def engineer_features() -> str:
         feature_engine = AutoFeatureEngine(config_dict)
         analysis_results = feature_engine.analyze_data(train_df)
 
+        # Track progress: Data analysis complete
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_stage_progress(2, 20, "Analyzing data types and patterns")
+
         train_cols = set(train_df.columns)
         test_cols = set(test_df.columns)
         train_only_cols = train_cols - test_cols
@@ -402,7 +406,15 @@ def engineer_features() -> str:
         else:
             print("Warning: Could not detect target column")
 
+        # Track progress: Fitting feature engine
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_stage_progress(2, 40, "Fitting feature transformations")
+
         feature_engine.fit(train_df, target_col)
+
+        # Track progress: Feature engine fitted
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_stage_progress(2, 60, "Transforming features")
 
         ai_feature_suggestions: Optional[Dict[str, Any]] = None
 
@@ -485,6 +497,10 @@ def engineer_features() -> str:
         test_features = feature_engine.transform(test_df)
         feature_columns = list(train_features.columns)
 
+        # Track progress: Features transformed
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_stage_progress(2, 80, "Finalizing feature matrices")
+
         # Align test features to training feature order to avoid column mismatches.
         for column in feature_columns:
             if column not in test_features.columns:
@@ -532,7 +548,31 @@ def engineer_features() -> str:
         target_max = np.max(train_target)
         apply_logit_transform = False
 
-        if target_min >= 0 and target_max <= 1 and target_max > target_min:
+        target_series = pd.Series(train_target)
+        unique_values = pd.unique(target_series)
+        unique_count = len(unique_values)
+        unique_ratio = unique_count / max(len(target_series), 1)
+
+        is_bool_like = pd.api.types.is_bool_dtype(target_series)
+        is_categorical_like = pd.api.types.is_categorical_dtype(target_series) or target_series.dtype == object
+
+        unique_numeric = pd.to_numeric(pd.Series(unique_values), errors="coerce")
+        numeric_mask = ~unique_numeric.isna()
+        integer_like_numeric = (
+            numeric_mask.any()
+            and np.allclose(unique_numeric[numeric_mask], np.round(unique_numeric[numeric_mask]))
+        )
+
+        is_integer_like = pd.api.types.is_integer_dtype(target_series) or integer_like_numeric
+
+        likely_classification = bool(
+            is_bool_like
+            or is_categorical_like
+            or unique_count <= 20
+            or (unique_ratio <= 0.05 and is_integer_like)
+        )
+
+        if target_min >= 0 and target_max <= 1 and target_max > target_min and not likely_classification:
             apply_logit_transform = True
             print(f"Detected bounded target in [{target_min:.3f}, {target_max:.3f}]")
             print("Applying logit transformation: logit(y) = log(y / (1-y))")
@@ -551,9 +591,19 @@ def engineer_features() -> str:
             joblib.dump(transform_info, config.FEATURES_DIR / "target_transform.pkl")
             train_target = train_target_transformed
         else:
-            transform_info = {"applied": False}
+            transform_info = {
+                "applied": False,
+                "reason": "classification_like_target" if likely_classification else "unbounded_target",
+            }
             joblib.dump(transform_info, config.FEATURES_DIR / "target_transform.pkl")
-            print("Target transformation: None (unbounded target)")
+            if likely_classification:
+                print("Target transformation: None (classification target detected)")
+            else:
+                print("Target transformation: None (unbounded target)")
+
+        # Track progress: Saving features
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_stage_progress(2, 95, "Saving feature matrices")
 
         np.save(config.FEATURES_DIR / "X_train.npy", train_features_final)
         np.save(config.FEATURES_DIR / "X_test.npy", test_features_final)

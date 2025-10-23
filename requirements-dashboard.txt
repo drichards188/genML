@@ -1,0 +1,18 @@
+# Dashboard Backend Dependencies
+# Install with: pip install -r requirements-dashboard.txt
+
+# FastAPI and ASGI server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# WebSocket support
+websockets>=12.0
+
+# File system watching for progress updates
+watchdog>=3.0.0
+
+# System resource monitoring
+psutil>=5.9.0
+
+# Note: These are in addition to the base requirements.txt
+# The frontend (React) dependencies are managed separately with npm

@@ -171,7 +171,12 @@ def detect_lightgbm_gpu() -> Tuple[bool, Dict[str, str]]:
         probe.fit(X, y)
 
         logger.info("LightGBM GPU support detected")
-        return True, {'device': 'gpu'}
+        return True, {
+            'device': 'gpu',
+            'device_type': 'gpu',
+            'gpu_platform_id': 0,
+            'gpu_device_id': 0,
+        }
     except Exception as e:
         logger.debug(f"LightGBM GPU support not available: {e}")
         return False, {}
@@ -266,6 +271,33 @@ def get_gpu_memory_usage() -> Optional[float]:
             return memory_gb
     except Exception as e:
         logger.debug(f"Failed to get GPU memory usage: {e}")
+    return None
+
+
+def get_gpu_memory_info() -> Optional[Dict[str, float]]:
+    """
+    Get current GPU memory usage and total memory in MB.
+
+    Returns:
+        dict or None: {used_mb, total_mb} or None if unavailable
+    """
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.returncode == 0:
+            values = result.stdout.strip().split(',')
+            used_mb = float(values[0].strip())
+            total_mb = float(values[1].strip())
+            return {
+                'used_mb': used_mb,
+                'total_mb': total_mb
+            }
+    except Exception as e:
+        logger.debug(f"Failed to get GPU memory info: {e}")
     return None
 
 

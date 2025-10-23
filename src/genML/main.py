@@ -124,7 +124,7 @@ def main():
 
         # Initialize and run the flow
         logger.info("Initializing ML Pipeline Flow")
-        flow = create_ml_pipeline_flow()
+        flow = create_ml_pipeline_flow(dataset_name=dataset_name)
         logger.info("Starting flow execution")
         flow.kickoff()
 

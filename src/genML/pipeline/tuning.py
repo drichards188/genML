@@ -177,8 +177,17 @@ def optimize_catboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
 
     logger.info("[CatBoost Trial %s] Starting CatBoost optimization trial", trial.number)
 
+    n_samples = X.shape[0] if hasattr(X, "shape") else len(X)
+    max_iterations = 1000
+    if n_samples <= 1000:
+        max_iterations = 400
+    elif n_samples <= 5000:
+        max_iterations = 700
+
+    logger.info("[CatBoost Trial %s] Sample count=%s, iteration cap=%s", trial.number, n_samples, max_iterations)
+
     params: dict[str, Any] = {
-        "iterations": trial.suggest_int("cb_iterations", 200, 1000),
+        "iterations": trial.suggest_int("cb_iterations", 200, max_iterations),
         "learning_rate": trial.suggest_float("cb_learning_rate", 0.01, 0.3, log=True),
         "depth": trial.suggest_int("cb_depth", 4, 10),
         "l2_leaf_reg": trial.suggest_float("cb_l2_leaf_reg", 1.0, 10.0),
