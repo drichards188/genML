@@ -6,8 +6,9 @@ import copy
 import json
 import logging
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Callable, Tuple, List
 import inspect
 
 import warnings
@@ -20,6 +21,8 @@ warnings.filterwarnings('ignore', message='Parameters: { \"predictor\" } are not
 warnings.filterwarnings('ignore', message='default bootstrap type.*', module='catboost')
 warnings.filterwarnings('ignore', message='X does not have valid feature names, but .*LGBM', module='sklearn')
 warnings.filterwarnings('ignore', category=ConvergenceWarning, module='catboost')
+warnings.filterwarnings('ignore', message='.*Default metric period is 5 because AUC.*')
+warnings.filterwarnings('ignore', message='.*AUC is/are not implemented for GPU.*')
 
 import joblib
 import numpy as np
@@ -139,6 +142,308 @@ def _compute_adaptive_tuning_limits(
         )
 
     return overrides
+
+
+def _categorize_models_by_resource(
+    models: Dict[str, Callable],
+    problem_type: str
+) -> Tuple[Dict[str, Callable], Dict[str, Callable]]:
+    """
+    Categorize models into CPU-only and GPU-capable pools.
+
+    GPU models are kept sequential to avoid OOM errors.
+    CPU models can be trained in parallel safely.
+
+    Returns:
+        Tuple of (cpu_models, gpu_models) dictionaries
+    """
+    cpu_models = {}
+    gpu_models = {}
+
+    # Models that use GPU acceleration
+    gpu_model_names = {'XGBoost', 'CatBoost', 'LightGBM', 'TabNet'}
+
+    for name, factory in models.items():
+        if name in gpu_model_names:
+            # Check if GPU is actually available for this model
+            if name == 'XGBoost' and is_xgboost_gpu_available():
+                gpu_models[name] = factory
+            elif name == 'CatBoost' and is_catboost_gpu_available():
+                gpu_models[name] = factory
+            elif name == 'LightGBM' and is_lightgbm_gpu_available():
+                gpu_models[name] = factory
+            elif name == 'TabNet' and TABNET_AVAILABLE:
+                # TabNet can use GPU if torch has CUDA
+                try:
+                    if torch.cuda.is_available():
+                        gpu_models[name] = factory
+                    else:
+                        cpu_models[name] = factory
+                except:
+                    cpu_models[name] = factory
+            else:
+                # GPU not available, treat as CPU model
+                cpu_models[name] = factory
+        else:
+            cpu_models[name] = factory
+
+    return cpu_models, gpu_models
+
+
+def _train_single_model(
+    name: str,
+    model_factory: Callable,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    problem_type: str,
+    cv: Any,
+    scoring_metric: str,
+    tuning_enabled: bool,
+    models_to_tune: List[str],
+    ai_model_overrides: Dict[str, Dict],
+    per_model_tuning_limits: Dict[str, Dict[str, Any]],
+    global_tuning_trials: int,
+    global_tuning_timeout: int,
+    base_optuna_n_trials: int,
+    base_optuna_timeout: int,
+    is_cpu_pool: bool
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Train a single model with hyperparameter tuning.
+
+    This function is designed to be called in parallel for CPU models
+    or sequentially for GPU models.
+
+    Returns:
+        Tuple of (model_name, results_dict)
+    """
+    print(f"\n{'='*60}")
+    print(f"Training {name}...")
+    print(f"{'='*60}")
+    logger.info(f"[Training] Starting training for {name}")
+    logger.info(f"[Training] Training data shape: X={X_train.shape}, y={y_train.shape}")
+
+    # Track model start in progress tracker
+    if config.PROGRESS_TRACKER:
+        config.PROGRESS_TRACKER.track_model_start(name)
+
+    model_override_values = ai_model_overrides.get(name, {})
+    used_params = None
+    model_mean_score = None
+    model_std_score = 0.0
+    model_scores_list = []
+    tuned_flag = False
+
+    # Helper function for default evaluation
+    def evaluate_with_default_params(overrides=None):
+        import warnings
+        estimator = model_factory(overrides)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
+                # For CPU pool models, we can use parallel CV
+                # For GPU models, use n_jobs=1 (GPU parallelizes internally)
+                n_jobs_param = -1 if is_cpu_pool else 1
+                return cross_val_score(
+                    estimator,
+                    X_train,
+                    y_train,
+                    cv=cv,
+                    scoring=scoring_metric,
+                    n_jobs=n_jobs_param
+                )
+        finally:
+            del estimator
+
+    # Check if this model should be tuned
+    if tuning_enabled and name in models_to_tune:
+        print(f"🔧 Tuning hyperparameters for {name}...")
+        print(f"   Strategy: Optuna Bayesian Optimization")
+        model_limit = per_model_tuning_limits.get(name, {})
+        model_n_trials = int(model_limit.get("n_trials", global_tuning_trials))
+        model_timeout = int(model_limit.get("timeout", global_tuning_timeout))
+        print(f"   Trials: {model_n_trials}")
+        print(f"   Timeout: {model_timeout}s")
+        if model_n_trials < base_optuna_n_trials or model_timeout < base_optuna_timeout:
+            print("   (Adaptive tuning limits applied for dataset size)")
+        logger.info(f"[Training] {name} - Hyperparameter tuning enabled with {model_n_trials} trials")
+
+        # Track model start with tuning info
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_model_start(name, total_trials=model_n_trials)
+
+        # Create Optuna study for hyperparameter optimization
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=TPESampler(seed=42)
+        )
+        logger.info(f"[Training] {name} - Optuna study created")
+
+        # Select appropriate optimization function
+        if name == 'Random Forest':
+            logger.info(f"[Training] Random Forest - Entering hyperparameter optimization")
+            objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
+        elif name == 'XGBoost':
+            objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
+        elif name == 'CatBoost':
+            objective = lambda trial: optimize_catboost(trial, X_train, y_train, problem_type, cv)
+        elif name == 'TabNet':
+            objective = lambda trial: optimize_tabnet(trial, X_train, y_train, problem_type, cv)
+        elif name == 'Logistic Regression' or name == 'Linear Regression':
+            objective = lambda trial: optimize_linear_model(trial, X_train, y_train, problem_type, cv)
+        else:
+            objective = None
+
+        if objective:
+            # Run hyperparameter optimization
+            logger.info(f"[Training] {name} - Starting Optuna optimization (n_trials={model_n_trials}, timeout={model_timeout}s)")
+
+            # Define callback to track trial progress
+            def trial_callback(study, trial):
+                if config.PROGRESS_TRACKER and trial.value is not None:
+                    config.PROGRESS_TRACKER.track_model_trial(name, trial.number + 1, trial.value)
+
+            # For CPU pool models, allow parallel trials based on config
+            # For GPU models, keep serial to avoid memory issues
+            cpu_optuna_n_jobs = config.PARALLEL_TRAINING_CONFIG.get('cpu_optuna_n_jobs', 2)
+            optuna_n_jobs = cpu_optuna_n_jobs if is_cpu_pool else 1
+
+            try:
+                study.optimize(
+                    objective,
+                    n_trials=model_n_trials,
+                    timeout=model_timeout,
+                    show_progress_bar=config.TUNING_CONFIG['show_progress_bar'],
+                    n_jobs=optuna_n_jobs,
+                    callbacks=[trial_callback]
+                )
+                logger.info(f"[Training] {name} - Optimization completed successfully")
+            except Exception as e:
+                logger.error(f"[Training] {name} - Optimization FAILED: {str(e)}")
+                raise
+
+            # Clean up memory after optimization
+            is_rf = name == 'Random Forest'
+            logger.info(f"[Training] {name} - Starting memory cleanup (aggressive={is_rf})")
+            cleanup_memory(f"After {name} optimization", aggressive=is_rf)
+            logger.info(f"[Training] {name} - Memory cleanup completed")
+
+            # Extract best parameters
+            best_params = study.best_params
+
+            # Remove model-specific prefixes from parameter names
+            prefix_map = {
+                'Random Forest': 'rf_',
+                'XGBoost': 'xgb_',
+                'CatBoost': 'cb_',
+                'TabNet': 'tabnet_',
+                'Logistic Regression': 'lr_',
+                'Linear Regression': 'linreg_'
+            }
+            prefix = prefix_map.get(name, '')
+            clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
+
+            applied_overrides = model_override_values
+            if applied_overrides:
+                clean_params.update(applied_overrides)
+
+            # Use best score from optimization
+            best_trial_score = study.best_value
+            trial_scores = [trial.value for trial in study.trials if trial.value is not None]
+
+            print(f"   ✅ Optimization complete!")
+            print(f"   Best score: {best_trial_score:.6f}")
+            print(f"   Best params: {clean_params}")
+
+            model_mean_score = float(best_trial_score)
+            model_std_score = float(np.std(trial_scores[-5:])) if len(trial_scores) >= 5 else 0.0
+            model_scores_list = trial_scores[-5:]
+            used_params = clean_params
+            tuned_flag = True
+
+            # Track model completion
+            if config.PROGRESS_TRACKER:
+                config.PROGRESS_TRACKER.track_model_complete(
+                    name,
+                    mean_score=model_mean_score,
+                    std_score=model_std_score,
+                    best_params=clean_params
+                )
+
+            results = {
+                'mean_score': model_mean_score,
+                'std_score': model_std_score,
+                'individual_scores': model_scores_list,
+                'best_params': clean_params,
+                'n_trials': len(study.trials),
+                'tuned': True,
+                'ai_overrides': applied_overrides
+            }
+
+            del study
+        else:
+            # Model doesn't have tuning function, use default
+            print(f"   ⚠️  No tuning function available for {name}, using defaults")
+            scores = evaluate_with_default_params(ai_model_overrides.get(name))
+            model_mean_score = float(scores.mean())
+            model_std_score = float(scores.std())
+            model_scores_list = scores.tolist()
+
+            if config.PROGRESS_TRACKER:
+                config.PROGRESS_TRACKER.track_model_complete(
+                    name,
+                    mean_score=model_mean_score,
+                    std_score=model_std_score
+                )
+
+            results = {
+                'mean_score': model_mean_score,
+                'std_score': model_std_score,
+                'individual_scores': model_scores_list,
+                'tuned': False,
+                'ai_overrides': model_override_values
+            }
+            print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
+    else:
+        # Model tuning disabled or not in tuning list
+        print(f"   Using default hyperparameters...")
+
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_model_start(name, total_trials=None)
+
+        scores = evaluate_with_default_params(model_override_values)
+        model_mean_score = float(scores.mean())
+        model_std_score = float(scores.std())
+        model_scores_list = scores.tolist()
+
+        if config.PROGRESS_TRACKER:
+            config.PROGRESS_TRACKER.track_model_complete(
+                name,
+                mean_score=model_mean_score,
+                std_score=model_std_score
+            )
+
+        results = {
+            'mean_score': model_mean_score,
+            'std_score': model_std_score,
+            'individual_scores': model_scores_list,
+            'tuned': False,
+            'ai_overrides': model_override_values
+        }
+        print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
+
+    # Store best params if tuned
+    if tuned_flag and used_params:
+        results['best_params'] = used_params
+
+    # Clean up memory after each model evaluation
+    is_rf = name == 'Random Forest'
+    logger.info(f"[Training] {name} - Starting post-evaluation cleanup (aggressive={is_rf})")
+    cleanup_memory(f"After {name} evaluation", aggressive=is_rf)
+    logger.info(f"[Training] {name} - Post-evaluation cleanup completed")
+    logger.info(f"[Training] {name} - Training completed")
+
+    return name, results
 
 
 def train_model_pipeline() -> str:
@@ -282,18 +587,22 @@ def train_model_pipeline() -> str:
                     'allow_writing_files': False
                 }
                 is_regressor = constructor == cb.CatBoostRegressor
+                is_gpu = is_catboost_gpu_available() and not config.GPU_CONFIG['force_cpu']
+
                 if is_regressor:
                     params.update({
                         'loss_function': 'RMSE',
                         'eval_metric': 'RMSE'
                     })
                 else:
+                    # Use GPU-compatible metrics when on GPU (AUC not supported on GPU)
+                    eval_metric = 'Logloss' if is_gpu else 'AUC'
                     params.update({
                         'loss_function': 'Logloss',
-                        'eval_metric': 'AUC'
+                        'eval_metric': eval_metric
                     })
 
-                if is_catboost_gpu_available() and not config.GPU_CONFIG['force_cpu']:
+                if is_gpu:
                     params.update({'task_type': 'GPU', 'devices': '0'})
                     default_bootstrap = 'Poisson'
                 else:
@@ -558,228 +867,176 @@ def train_model_pipeline() -> str:
         total_models = len(models)
         models_completed = 0
 
-        for name, model_factory in models.items():
-            print(f"\n{'='*60}")
-            print(f"Training {name}...")
-            print(f"{'='*60}")
-            logger.info(f"[Training] Starting training for {name}")
-            logger.info(f"[Training] Training data shape: X={X_train.shape}, y={y_train.shape}")
+        # Categorize models into CPU and GPU pools for parallel/sequential execution
+        cpu_models, gpu_models = _categorize_models_by_resource(models, problem_type)
 
-            # Track model start in progress tracker
-            if config.PROGRESS_TRACKER:
-                config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
+        # Check if parallel training is enabled
+        parallel_enabled = config.PARALLEL_TRAINING_CONFIG.get('enabled', True)
+        max_cpu_workers_config = config.PARALLEL_TRAINING_CONFIG.get('max_cpu_workers', 3)
 
-            model_override_values = ai_model_overrides.get(name, {})
-            used_params = None
-            model_mean_score = None
-            model_std_score = 0.0
-            model_scores_list = []
-            tuned_flag = False
+        print(f"\n{'='*60}")
+        print(f"Model Training Strategy:")
+        if parallel_enabled and len(cpu_models) > 1:
+            print(f"  CPU Models ({len(cpu_models)}): {list(cpu_models.keys())} - Will train in parallel")
+        else:
+            print(f"  CPU Models ({len(cpu_models)}): {list(cpu_models.keys())} - Will train sequentially")
+        print(f"  GPU Models ({len(gpu_models)}): {list(gpu_models.keys())} - Will train sequentially")
+        print(f"{'='*60}")
 
-            # Check if this model should be tuned
-            if config.TUNING_CONFIG['enabled'] and name in config.TUNING_CONFIG['models_to_tune']:
-                print(f"🔧 Tuning hyperparameters for {name}...")
-                print(f"   Strategy: Optuna Bayesian Optimization")
-                model_limit = per_model_tuning_limits.get(name, {})
-                model_n_trials = int(model_limit.get("n_trials", global_tuning_trials))
-                model_timeout = int(model_limit.get("timeout", global_tuning_timeout))
-                print(f"   Trials: {model_n_trials}")
-                print(f"   Timeout: {model_timeout}s")
-                if model_n_trials < config.TUNING_CONFIG['n_trials'] or model_timeout < config.TUNING_CONFIG['timeout']:
-                    print("   (Adaptive tuning limits applied for dataset size)")
-                logger.info(f"[Training] {name} - Hyperparameter tuning enabled with {model_n_trials} trials")
+        # Train CPU models in parallel using ThreadPoolExecutor
+        if cpu_models and parallel_enabled and len(cpu_models) > 1:
+            # Determine max workers - limit to avoid overloading system
+            max_workers = min(len(cpu_models), max_cpu_workers_config) if max_cpu_workers_config > 0 else min(len(cpu_models), 3)
+            print(f"\n🚀 Training CPU models in parallel (max {max_workers} concurrent)...")
 
-                # Track model start with tuning info
-                if config.PROGRESS_TRACKER:
-                    config.PROGRESS_TRACKER.track_model_start(name, total_trials=model_n_trials)
-
-                # Create Optuna study for hyperparameter optimization
-                study = optuna.create_study(
-                    direction='maximize',  # Maximize score (works for both neg_mse and accuracy)
-                    sampler=TPESampler(seed=42)
-                )
-                logger.info(f"[Training] {name} - Optuna study created")
-
-                # Select appropriate optimization function
-                if name == 'Random Forest':
-                    logger.info(f"[Training] Random Forest - Entering hyperparameter optimization")
-                    logger.info(f"[Training] Random Forest - Memory config: max_trees={config.MEMORY_CONFIG['max_trees_random_forest']}, cv_folds={config.MEMORY_CONFIG['rf_cv_folds']}, aggressive_cleanup={config.MEMORY_CONFIG['aggressive_rf_cleanup']}")
-                    objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
-                elif name == 'XGBoost':
-                    objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
-                elif name == 'CatBoost':
-                    objective = lambda trial: optimize_catboost(trial, X_train, y_train, problem_type, cv)
-                elif name == 'TabNet':
-                    objective = lambda trial: optimize_tabnet(trial, X_train, y_train, problem_type, cv)
-                elif name == 'Logistic Regression' or name == 'Linear Regression':
-                    objective = lambda trial: optimize_linear_model(trial, X_train, y_train, problem_type, cv)
-                else:
-                    # Fallback for any other models
-                    objective = None
-
-                if objective:
-                    # Run hyperparameter optimization
-                    logger.info(f"[Training] {name} - Starting Optuna optimization (n_trials={model_n_trials}, timeout={model_timeout}s)")
-
-                    # Define callback to track trial progress
-                    def trial_callback(study, trial):
-                        if config.PROGRESS_TRACKER and trial.value is not None:
-                            config.PROGRESS_TRACKER.track_model_trial(name, trial.number + 1, trial.value)
-
-                    try:
-                        study.optimize(
-                            objective,
-                            n_trials=model_n_trials,
-                            timeout=model_timeout,
-                            show_progress_bar=config.TUNING_CONFIG['show_progress_bar'],
-                            n_jobs=1,  # Serial execution for stability
-                            callbacks=[trial_callback]  # Track trial progress
-                        )
-                        logger.info(f"[Training] {name} - Optimization completed successfully")
-                    except Exception as e:
-                        logger.error(f"[Training] {name} - Optimization FAILED: {str(e)}")
-                        logger.error(f"[Training] {name} - Error type: {type(e).__name__}")
-                        import traceback as tb
-                        logger.error(f"[Training] {name} - Traceback:\n{tb.format_exc()}")
-                        raise
-
-                    # Clean up memory after optimization to prevent leaks
-                    # Use aggressive cleanup for Random Forest to combat cuML memory leaks
-                    is_rf = name == 'Random Forest'
-                    logger.info(f"[Training] {name} - Starting memory cleanup (aggressive={is_rf})")
-                    cleanup_memory(f"After {name} optimization", aggressive=is_rf)
-                    logger.info(f"[Training] {name} - Memory cleanup completed")
-
-                    # Extract best parameters
-                    best_params = study.best_params
-                    tuned_params[name] = best_params
-
-                    # Remove model-specific prefixes from parameter names
-                    prefix_map = {
-                        'Random Forest': 'rf_',
-                        'XGBoost': 'xgb_',
-                        'CatBoost': 'cb_',
-                        'TabNet': 'tabnet_',
-                        'Logistic Regression': 'lr_',
-                        'Linear Regression': 'linreg_'
-                    }
-                    prefix = prefix_map.get(name, '')
-                    clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
-
-                    applied_overrides = model_override_values
-                    if applied_overrides:
-                        clean_params.update(applied_overrides)
-
-                    # Use best score from optimization
-                    best_trial_score = study.best_value
-                    trial_scores = [trial.value for trial in study.trials if trial.value is not None]
-
-                    print(f"   ✅ Optimization complete!")
-                    print(f"   Best score: {best_trial_score:.6f}")
-                    print(f"   Best params: {clean_params}")
-
-                    model_mean_score = float(best_trial_score)
-                    model_std_score = float(np.std(trial_scores[-5:])) if len(trial_scores) >= 5 else 0.0
-                    model_scores_list = trial_scores[-5:]  # Last 5 trial scores
-                    used_params = clean_params
-                    tuned_flag = True
-
-                    # Track model completion
-                    if config.PROGRESS_TRACKER:
-                        config.PROGRESS_TRACKER.track_model_complete(
-                            name,
-                            mean_score=model_mean_score,
-                            std_score=model_std_score,
-                            best_params=clean_params
-                        )
-
-                    results[name] = {
-                        'mean_score': model_mean_score,
-                        'std_score': model_std_score,
-                        'individual_scores': model_scores_list,
-                        'best_params': clean_params,
-                        'n_trials': len(study.trials),
-                        'tuned': True,
-                        'ai_overrides': applied_overrides
-                    }
-
-                    # Ensure Optuna study objects don't linger in memory
-                    del study
-                else:
-                    # Model doesn't have tuning function, use default
-                    print(f"   ⚠️  No tuning function available for {name}, using defaults")
-                    scores = evaluate_with_default_params(name, model_factory, ai_model_overrides.get(name))
-                    model_mean_score = float(scores.mean())
-                    model_std_score = float(scores.std())
-                    model_scores_list = scores.tolist()
-
-                    # Track model completion
-                    if config.PROGRESS_TRACKER:
-                        config.PROGRESS_TRACKER.track_model_complete(
-                            name,
-                            mean_score=model_mean_score,
-                            std_score=model_std_score
-                        )
-
-                    results[name] = {
-                        'mean_score': model_mean_score,
-                        'std_score': model_std_score,
-                        'individual_scores': model_scores_list,
-                        'tuned': False,
-                        'ai_overrides': model_override_values
-                    }
-                    print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
-
-            else:
-                # Model tuning disabled or not in tuning list - use defaults
-                print(f"   Using default hyperparameters...")
-
-                # Track model start (no tuning)
-                if config.PROGRESS_TRACKER:
-                    config.PROGRESS_TRACKER.track_model_start(name, total_trials=None)
-
-                scores = evaluate_with_default_params(name, model_factory, model_override_values)
-                model_mean_score = float(scores.mean())
-                model_std_score = float(scores.std())
-                model_scores_list = scores.tolist()
-
-                # Track model completion
-                if config.PROGRESS_TRACKER:
-                    config.PROGRESS_TRACKER.track_model_complete(
-                        name,
-                        mean_score=model_mean_score,
-                        std_score=model_std_score
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all CPU model training tasks
+                future_to_model = {}
+                for name, model_factory in cpu_models.items():
+                    future = executor.submit(
+                        _train_single_model,
+                        name=name,
+                        model_factory=model_factory,
+                        X_train=X_train,
+                        y_train=y_train,
+                        problem_type=problem_type,
+                        cv=cv,
+                        scoring_metric=scoring_metric,
+                        tuning_enabled=config.TUNING_CONFIG['enabled'],
+                        models_to_tune=config.TUNING_CONFIG['models_to_tune'],
+                        ai_model_overrides=ai_model_overrides,
+                        per_model_tuning_limits=per_model_tuning_limits,
+                        global_tuning_trials=global_tuning_trials,
+                        global_tuning_timeout=global_tuning_timeout,
+                        base_optuna_n_trials=config.TUNING_CONFIG['n_trials'],
+                        base_optuna_timeout=config.TUNING_CONFIG['timeout'],
+                        is_cpu_pool=True
                     )
+                    future_to_model[future] = name
 
-                results[name] = {
-                    'mean_score': model_mean_score,
-                    'std_score': model_std_score,
-                    'individual_scores': model_scores_list,
-                    'tuned': False,
-                    'ai_overrides': model_override_values
-                }
+                # Collect results as they complete
+                for future in as_completed(future_to_model):
+                    name = future_to_model[future]
+                    try:
+                        model_name, model_results = future.result()
+                        results[model_name] = model_results
 
-                print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
+                        # Store tuned params if available
+                        if model_results.get('tuned') and model_results.get('best_params'):
+                            tuned_params[model_name] = model_results['best_params']
 
-            if model_mean_score is not None and model_mean_score > best_score:
-                best_score = model_mean_score
+                        # Update progress
+                        models_completed += 1
+                        if config.PROGRESS_TRACKER:
+                            config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
+
+                        print(f"✅ {model_name} training completed")
+                    except Exception as e:
+                        logger.error(f"CPU model {name} training failed: {e}")
+                        print(f"❌ {name} training failed: {e}")
+                        # Continue with other models
+                        models_completed += 1
+                        if config.PROGRESS_TRACKER:
+                            config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
+
+        elif cpu_models:
+            # Parallel training disabled or only 1 CPU model - train sequentially
+            print(f"\n⚙️  Training CPU models sequentially...")
+
+            for name, model_factory in cpu_models.items():
+                try:
+                    model_name, model_results = _train_single_model(
+                        name=name,
+                        model_factory=model_factory,
+                        X_train=X_train,
+                        y_train=y_train,
+                        problem_type=problem_type,
+                        cv=cv,
+                        scoring_metric=scoring_metric,
+                        tuning_enabled=config.TUNING_CONFIG['enabled'],
+                        models_to_tune=config.TUNING_CONFIG['models_to_tune'],
+                        ai_model_overrides=ai_model_overrides,
+                        per_model_tuning_limits=per_model_tuning_limits,
+                        global_tuning_trials=global_tuning_trials,
+                        global_tuning_timeout=global_tuning_timeout,
+                        base_optuna_n_trials=config.TUNING_CONFIG['n_trials'],
+                        base_optuna_timeout=config.TUNING_CONFIG['timeout'],
+                        is_cpu_pool=True
+                    )
+                    results[model_name] = model_results
+
+                    # Store tuned params if available
+                    if model_results.get('tuned') and model_results.get('best_params'):
+                        tuned_params[model_name] = model_results['best_params']
+
+                    # Update progress
+                    models_completed += 1
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
+
+                    print(f"✅ {model_name} training completed")
+                except Exception as e:
+                    logger.error(f"CPU model {name} training failed: {e}")
+                    print(f"❌ {name} training failed: {e}")
+                    # Continue with other models
+                    models_completed += 1
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
+
+        # Train GPU models sequentially to avoid OOM
+        if gpu_models:
+            print(f"\n🎮 Training GPU models sequentially to avoid memory issues...")
+
+            for name, model_factory in gpu_models.items():
+                try:
+                    model_name, model_results = _train_single_model(
+                        name=name,
+                        model_factory=model_factory,
+                        X_train=X_train,
+                        y_train=y_train,
+                        problem_type=problem_type,
+                        cv=cv,
+                        scoring_metric=scoring_metric,
+                        tuning_enabled=config.TUNING_CONFIG['enabled'],
+                        models_to_tune=config.TUNING_CONFIG['models_to_tune'],
+                        ai_model_overrides=ai_model_overrides,
+                        per_model_tuning_limits=per_model_tuning_limits,
+                        global_tuning_trials=global_tuning_trials,
+                        global_tuning_timeout=global_tuning_timeout,
+                        base_optuna_n_trials=config.TUNING_CONFIG['n_trials'],
+                        base_optuna_timeout=config.TUNING_CONFIG['timeout'],
+                        is_cpu_pool=False
+                    )
+                    results[model_name] = model_results
+
+                    # Store tuned params if available
+                    if model_results.get('tuned') and model_results.get('best_params'):
+                        tuned_params[model_name] = model_results['best_params']
+
+                    # Update progress
+                    models_completed += 1
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
+
+                    print(f"✅ {model_name} training completed")
+                except Exception as e:
+                    logger.error(f"GPU model {name} training failed: {e}")
+                    print(f"❌ {name} training failed: {e}")
+                    # Continue with other models
+                    models_completed += 1
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
+
+        # Find best model from all results
+        best_score = float('-inf') if problem_type == 'regression' else 0
+        for name, model_results in results.items():
+            model_score = model_results.get('mean_score')
+            if model_score is not None and model_score > best_score:
+                best_score = model_score
                 best_model_name = name
-                best_model_factory = model_factory
-                best_model_params = used_params
+                best_model_factory = models.get(name)
+                best_model_params = model_results.get('best_params') if model_results.get('tuned') else None
                 best_model_object = None
-
-            # Clean up memory after each model evaluation
-            # Use aggressive cleanup for Random Forest to combat cuML memory leaks
-            is_rf = name == 'Random Forest'
-            logger.info(f"[Training] {name} - Starting post-evaluation cleanup (aggressive={is_rf})")
-            cleanup_memory(f"After {name} evaluation", aggressive=is_rf)
-            logger.info(f"[Training] {name} - Post-evaluation cleanup completed")
-            logger.info(f"[Training] {name} - Training completed")
-
-            # Update model training progress
-            models_completed += 1
-            if config.PROGRESS_TRACKER:
-                config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
 
         # Create stacking ensemble of top models
         print(f"\n{'='*60}")

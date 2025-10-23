@@ -58,6 +58,14 @@ MEMORY_CONFIG: Dict[str, Any] = {
     "aggressive_rf_cleanup": True,
 }
 
+# Parallel Training Configuration
+PARALLEL_TRAINING_CONFIG: Dict[str, Any] = {
+    "enabled": True,  # Enable parallel training for CPU models
+    "max_cpu_workers": 3,  # Max concurrent CPU models (0 = auto-detect, limited to 3)
+    "cpu_optuna_n_jobs": 2,  # Optuna parallel trials for CPU models (0 = serial)
+    "gpu_models_sequential": True,  # Always keep GPU models sequential to avoid OOM
+}
+
 # AI Advisors Configuration (OpenAI-powered intelligent analysis)
 AI_ADVISORS_CONFIG: Dict[str, Any] = {
     "enabled": True,
