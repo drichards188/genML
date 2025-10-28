@@ -22,6 +22,26 @@ uv run kickoff
 uv run run_pipeline
 ```
 
+### Running the Dashboard
+```bash
+# Terminal 1: Start API Backend
+python run_api.py
+
+# Terminal 2: Start Dashboard UI (development mode)
+cd dashboard
+npm install  # First time only
+npm run dev
+
+# Terminal 3: Run the pipeline to see live updates
+python src/genML/main.py
+
+# Production build
+cd dashboard
+npm run build
+cd ..
+python run_api.py  # Serves built dashboard at http://localhost:8000
+```
+
 ### Development Commands
 ```bash
 # Install dependencies
@@ -110,8 +130,14 @@ The codebase has been refactored into a modular structure with `src/genML/pipeli
 - `model_selector.py` - AI-powered model selection guidance
 - See `AI_ADVISORS_README.md` for comprehensive documentation
 
+**Real-Time Dashboard** (`src/genML/api/`):
+- `server.py` - FastAPI server with REST endpoints and WebSocket support
+- `websocket_manager.py` - WebSocket connection manager for real-time progress updates
+- `__init__.py` - API app factory
+
 **Utilities**:
 - `submission_formatter.py` - Adaptive submission formatting for competition platforms
+- `progress_tracker.py` - Pipeline progress tracking for dashboard integration
 - `logging_config.py` - Centralized logging configuration
 - `gpu_utils.py` - GPU detection and memory management utilities
 
@@ -181,9 +207,10 @@ src/genML/
 ├── flow.py              # CrewAI Flow orchestration
 ├── tools.py             # Legacy API (re-exports pipeline)
 ├── submission_formatter.py
+├── progress_tracker.py  # Pipeline progress tracking
 ├── logging_config.py
 ├── gpu_utils.py
-├── pipeline/            # Modular ML pipeline (NEW)
+├── pipeline/            # Modular ML pipeline
 │   ├── __init__.py
 │   ├── config.py
 │   ├── dataset.py
@@ -194,12 +221,16 @@ src/genML/
 │   ├── ai_tuning.py
 │   ├── tuning.py
 │   └── utils.py
-├── ai_advisors/         # AI-powered advisors (NEW)
+├── ai_advisors/         # AI-powered advisors
 │   ├── __init__.py
 │   ├── openai_client.py
 │   ├── error_analyzer.py
 │   ├── feature_ideation.py
 │   └── model_selector.py
+├── api/                 # Dashboard backend (FastAPI)
+│   ├── __init__.py
+│   ├── server.py
+│   └── websocket_manager.py
 └── features/            # Feature engineering modules
     ├── __init__.py
     ├── feature_engine.py
@@ -207,6 +238,34 @@ src/genML/
     ├── feature_processors.py
     ├── feature_selector.py
     └── domain_researcher.py
+```
+
+**Dashboard** - Real-time monitoring UI:
+```
+dashboard/
+├── src/
+│   ├── api/             # API client for backend
+│   │   └── client.ts
+│   ├── hooks/           # React hooks (WebSocket, data fetching)
+│   │   ├── useWebSocket.ts
+│   │   └── useProgressData.ts
+│   ├── store/           # Zustand state management
+│   │   └── progressStore.ts
+│   ├── types/           # TypeScript type definitions
+│   │   └── pipeline.ts
+│   ├── App.tsx          # Main dashboard component
+│   ├── App.css          # Styling
+│   └── main.tsx         # Entry point
+├── package.json         # Node.js dependencies
+├── vite.config.ts       # Vite configuration
+└── tsconfig.json        # TypeScript configuration
+```
+
+**Root Scripts**:
+```
+├── run_api.py           # FastAPI server runner
+├── test_ai_advisors.py  # AI advisors test script
+└── test_random_forest_memory.py
 ```
 
 **Datasets** - Organized by problem type:
@@ -240,12 +299,13 @@ tests/
 
 **Documentation**:
 ```
-├── README.md                       # User-facing documentation
+├── README.md                       # User-facing documentation (includes dashboard setup)
 ├── CLAUDE.md                       # This file (AI assistant guidance)
-├── AGENTS.md                       # Repository coding guidelines (NEW)
-├── AI_ADVISORS_README.md           # AI advisors comprehensive guide (NEW)
-├── AI_IMPLEMENTATION_SUMMARY.md    # AI implementation details (NEW)
-└── SETUP.md                        # Setup instructions
+├── AGENTS.md                       # Repository coding guidelines
+├── AI_ADVISORS_README.md           # AI advisors comprehensive guide
+├── AI_IMPLEMENTATION_SUMMARY.md    # AI implementation details
+├── SETUP.md                        # Setup instructions
+└── dashboard/README.md             # Dashboard-specific documentation
 ```
 
 ## Problem Type Detection
@@ -525,12 +585,38 @@ AI_ADVISORS_CONFIG = {
 3. Verify data files in `outputs/data/`
 4. Check feature engineering artifacts in `outputs/features/`
 5. Examine error details in failed stage JSON responses
+6. Use dashboard for real-time monitoring (if enabled)
+
+**Dashboard Development Workflow**:
+1. Start API backend: `python run_api.py`
+2. Start dashboard dev server: `cd dashboard && npm run dev`
+3. Run pipeline in separate terminal: `python src/genML/main.py`
+4. Monitor real-time progress at `http://localhost:5173`
+5. Review WebSocket connection status and live updates
+6. Check browser console for client-side debugging
+7. Review API logs for backend issues
 
 ## Environment Variables
 
 **Optional**:
 - `OPENAI_API_KEY` - Enable AI advisors (Feature Ideation, Error Analysis, Model Selection)
 - `CUDA_VISIBLE_DEVICES` - Control GPU device selection
+
+**Security Best Practices for API Keys**:
+- ✅ Use `.env` (with a dot) for environment variables - it's in `.gitignore`
+- ✅ Use `export OPENAI_API_KEY='...'` in terminal sessions (not persisted)
+- ✅ Add `.env.example` showing format without actual keys
+- ❌ Never commit files named `env`, `keys.txt`, `secrets.py` without proper gitignore protection
+- ❌ Never hardcode API keys in source code
+- ❌ Never commit `.env` files or files containing actual API keys
+
+**Updated .gitignore Protection**:
+The `.gitignore` now protects:
+- Environment files: `.env`, `env`, `.env.*`, `*.env.local`
+- Output files: `outputs/`, `catboost_info/`, `visuals/`
+- IDE files: `.idea/`, `.vscode/`
+- Build artifacts: `dashboard/.vite/`, `dashboard/dist/`
+- Logs: `*.log`, `pipeline_run_log.txt`
 
 ## Dependencies
 
@@ -540,26 +626,101 @@ AI_ADVISORS_CONFIG = {
 - pandas, numpy, scikit-learn
 - xgboost, catboost, lightgbm
 
-**Optional**:
-- OpenAI Python SDK (for AI advisors)
-- CUDA + RAPIDS (for GPU acceleration)
-- pytest (for testing)
+**Optional - AI Advisors**:
+- OpenAI Python SDK: `pip install openai`
+- Expected cost: $0.03-0.08 per pipeline run
+
+**Optional - GPU Acceleration**:
+- CUDA + RAPIDS (cuML, cuDF)
+- GPU-enabled XGBoost, CatBoost, LightGBM
+- Install via: `mamba env create -f environment.yml`
+
+**Optional - Dashboard**:
+- FastAPI + uvicorn + websockets: `pip install fastapi uvicorn[standard] websockets`
+- Node.js 18+ and npm for frontend
+- React 18 + TypeScript + Vite (frontend dependencies)
+
+**Optional - Testing**:
+- pytest: `pip install pytest pytest-cov`
 
 **Installation Options**:
 ```bash
-# Minimal (CPU only)
+# Minimal (CPU only, no dashboard)
 pip install -r requirements.txt
 
-# Full (GPU + AI)
+# With Dashboard
+pip install -r requirements.txt
+pip install -r requirements-dashboard.txt
+cd dashboard && npm install
+
+# Full (GPU + AI + Dashboard)
 mamba env create -f environment.yml
 conda activate genml
 pip install openai
+pip install fastapi uvicorn[standard] websockets
+cd dashboard && npm install
 ```
+
+## Dashboard Features
+
+The project includes a **real-time monitoring dashboard** built with React + TypeScript:
+
+**Current Features**:
+- ✅ Real-time WebSocket connection with auto-reconnect
+- ✅ Pipeline status overview (run ID, dataset, status, progress)
+- ✅ Current activity monitoring with progress bars
+- ✅ Stage tracking (all 5 stages with status indicators)
+- ✅ Model training progress (Optuna trials, CV scores)
+- ✅ Resource monitoring (GPU memory, CPU, RAM)
+- ✅ Debug view (raw JSON data explorer)
+
+**Architecture**:
+- Frontend: React 18 + TypeScript + Vite
+- Backend: FastAPI with WebSocket support
+- State Management: Zustand
+- API Client: Axios with React Query
+- Charts: Recharts (for future visualizations)
+
+**API Endpoints**:
+- `GET /api/health` - Health check
+- `GET /api/status` - Current pipeline status
+- `GET /api/runs` - List all runs
+- `GET /api/runs/{run_id}` - Get specific run details
+- `GET /api/reports` - List available reports
+- `GET /api/reports/{name}` - Get report contents
+- `GET /api/logs/{run_id}` - Get log file
+- `GET /api/models` - Model comparison data
+- `WS /ws/progress` - Real-time progress stream
+
+**Dashboard URLs**:
+- Development: `http://localhost:5173` (Vite dev server with HMR)
+- Production: `http://localhost:8000` (FastAPI serves built React app)
+
+## Project Statistics
+
+**Code Size**: ~16,400 lines total
+- Python Backend: ~9,800 lines (33 files)
+  - Pipeline modules: ~3,300 lines
+  - Feature engineering: ~2,600 lines
+  - AI advisors: ~1,200 lines
+  - API server: ~600 lines
+  - Core & utils: ~1,100 lines
+- TypeScript Dashboard: ~740 lines (7 files)
+- Tests: ~5,600 lines
+- Config files: ~100 lines
+
+**Top Files by Size**:
+1. `training.py`: 1,355 lines - Model training & Optuna tuning
+2. `feature_processors.py`: 674 lines - Feature transformations
+3. `feature_engineering.py`: 668 lines - Feature orchestration
+4. `feature_engine.py`: 599 lines - AutoFeatureEngine
+5. `data_analyzer.py`: 520 lines - Data type detection
 
 ## Additional Resources
 
-- **AI Advisors**: See `AI_ADVISORS_README.md` for comprehensive documentation
+- **User Guide**: See `README.md` - Includes quickstart and dashboard setup
+- **Dashboard Documentation**: See `dashboard/README.md` - Detailed UI guide
+- **AI Advisors**: See `AI_ADVISORS_README.md` - Comprehensive AI documentation
 - **Implementation Details**: See `AI_IMPLEMENTATION_SUMMARY.md`
-- **Repository Guidelines**: See `AGENTS.md` for coding standards
-- **Setup Instructions**: See `SETUP.md`
-- **User Guide**: See `README.md`
+- **Repository Guidelines**: See `AGENTS.md` - Coding standards and conventions
+- **Setup Instructions**: See `SETUP.md` - Environment setup
