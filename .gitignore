@@ -1,7 +1,17 @@
+# Environment files with secrets
 .env
+env
+*.env.local
+.env.*
+
+# Python
 __pycache__/
 lib/
+
+# OS files
 .DS_Store
+
+# Data
 /datasets/
 
 # UV lock file (no longer using uv)
@@ -10,3 +20,38 @@ uv.lock
 # Conda environment
 environment_backup.yml
 .venv/
+.condarc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Output files
+outputs/
+catboost_info/
+visuals/
+
+# Logs
+*.log
+pipeline_run_log.txt
+
+# Jupyter
+notebook.ipynb
+.ipynb_checkpoints/
+
+# Testing
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Build artifacts
+dashboard/.vite/
+dashboard/dist/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/

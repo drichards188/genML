@@ -1,4 +1,4 @@
-# CrewAI Generic ML Pipeline 🤖
+# CrewAI Generic ML Pipeline
 
 A generalized machine learning pipeline using CrewAI Flows that can work with any dataset following the standard train.csv/test.csv format. Originally designed for the Kaggle Titanic challenge, it has evolved into a flexible ML automation tool.
 
