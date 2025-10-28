@@ -19,11 +19,13 @@ genML/
 ├── CLAUDE.md                    # Development guidance for Claude Code
 ├── requirements.txt             # Python dependencies
 ├── pyproject.toml              # Package configuration
+├── run_api.py                  # FastAPI server for dashboard backend
 ├── src/genML/              # Main source code
 │   ├── main.py                 # Main entry point
 │   ├── flow.py                 # CrewAI Flow orchestration
 │   ├── tools.py                # Backwards-compatible shim (re-exports modern pipeline API)
 │   ├── submission_formatter.py # Adaptive submission formatting
+│   ├── api/                    # Dashboard API backend
 │   ├── pipeline/               # Modular ML pipeline implementation
 │   │   ├── __init__.py         # Public pipeline API (`load_dataset`, `train_model_pipeline`, ...)
 │   │   ├── config.py           # Shared constants, paths, and tuning settings
@@ -39,6 +41,15 @@ genML/
 │       ├── feature_processors.py # Feature transformation modules
 │       ├── feature_selector.py # Intelligent feature selection
 │       └── domain_researcher.py # Domain-specific strategies
+├── dashboard/                  # Real-time monitoring dashboard
+│   ├── src/                   # React + TypeScript source
+│   │   ├── api/               # API client
+│   │   ├── hooks/             # React hooks (WebSocket, data fetching)
+│   │   ├── store/             # State management
+│   │   ├── types/             # TypeScript types
+│   │   └── App.tsx            # Main dashboard component
+│   ├── package.json           # Node.js dependencies
+│   └── vite.config.ts         # Vite configuration
 ├── datasets/                   # Organized dataset storage
 │   ├── current/               # Active dataset (recommended location)
 │   ├── titanic/               # Titanic-specific data
@@ -61,7 +72,18 @@ genML/
    uv sync
    ```
 
-2. **Prepare your dataset:**
+2. **Optional: Install dashboard dependencies**
+   ```bash
+   # For the real-time monitoring dashboard
+   pip install fastapi uvicorn[standard] websockets
+
+   # Frontend dependencies
+   cd dashboard
+   npm install
+   cd ..
+   ```
+
+3. **Prepare your dataset:**
    - Place `train.csv` and `test.csv` in `datasets/current/` (recommended)
    - Optionally include `sample_submission.csv` for automatic format detection
    - The pipeline works with any ML dataset following this structure
@@ -125,7 +147,65 @@ After successful execution, you'll find:
 - `outputs/predictions/` - Detailed predictions and submission files
 - `outputs/reports/` - JSON reports from each pipeline stage
 
-go to `http://172.28.165.188:5173/` to see dashboard
+## Real-Time Dashboard 📊
+
+The project includes a **real-time monitoring dashboard** built with React + TypeScript that provides live updates of pipeline execution.
+
+### Dashboard Features
+
+- **Live Pipeline Status**: Real-time progress tracking via WebSocket
+- **Stage Monitoring**: Visual indicators for all 5 pipeline stages (pending/running/completed/failed)
+- **Model Training Progress**: Track each model's training status and Optuna trials
+- **Resource Monitoring**: GPU memory, CPU, and RAM usage
+- **Current Activity**: See exactly what the pipeline is doing right now
+- **Debug View**: Raw JSON data explorer for development
+
+### Quick Start - Dashboard
+
+**Prerequisites:**
+- Node.js 18+ and npm
+- FastAPI dependencies: `pip install fastapi uvicorn[standard] websockets`
+
+**Development Mode (Recommended):**
+
+```bash
+# Terminal 1: Start API Backend
+python run_api.py
+
+# Terminal 2: Start Dashboard (in new terminal)
+cd dashboard
+npm install  # First time only
+npm run dev
+
+# Terminal 3: Run the ML Pipeline (in new terminal)
+python src/genML/main.py
+```
+
+Then open your browser to **http://localhost:5173** to watch the pipeline run in real-time!
+
+**Production Mode:**
+
+```bash
+# Build and serve the dashboard
+cd dashboard
+npm run build
+cd ..
+python run_api.py
+
+# Open browser to http://localhost:8000
+```
+
+### Dashboard Architecture
+
+- **Frontend**: React 18 + TypeScript + Vite
+- **Backend**: FastAPI with WebSocket support
+- **State Management**: Zustand
+- **Charts**: Recharts (for future visualizations)
+- **API Client**: Axios with React Query
+
+The dashboard auto-connects to the backend and displays real-time updates as the pipeline executes. When no pipeline is running, it shows "No Active Pipeline" status.
+
+**For more details**, see `dashboard/README.md`
 
 
 ## Key Features
@@ -158,10 +238,16 @@ The primary entry points are re-exported via `src.genML.pipeline` (and mirrored 
 
 ## Requirements
 
+**Core Dependencies:**
 - Python 3.10+ (as specified in pyproject.toml)
 - CrewAI 0.193.2+ with tools support
 - Standard ML libraries (pandas, scikit-learn, xgboost, numpy)
 - Any dataset following train.csv/test.csv format
+
+**Optional - For Real-Time Dashboard:**
+- Node.js 18+ and npm
+- FastAPI + uvicorn + websockets
+- Modern web browser
 
 ## Working with Different Datasets
 
@@ -200,3 +286,9 @@ Solution: `pip install -r requirements.txt` or `uv sync`
 
 **Pipeline fails on feature engineering:**
 Check that your dataset has proper column names and no completely empty columns.
+
+**Dashboard not connecting:**
+- Ensure FastAPI backend is running: `python run_api.py`
+- Check that port 8000 is available
+- Verify dashboard is running: `cd dashboard && npm run dev`
+- See `dashboard/README.md` for detailed troubleshooting
