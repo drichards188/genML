@@ -1,67 +1,39 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useProgressStore } from './store/progressStore';
-import { api } from './api/client';
 import './App.css';
 
 function App() {
-  const { updateProgress, setConnectionStatus, currentRun, connectionStatus, isLive } = useProgressStore();
-
-  // Fetch initial data on mount (fallback if WebSocket is slow)
-  useEffect(() => {
-    const fetchInitialData = async () => {
-      try {
-        const data = await api.getStatus();
-        console.log('Fetched initial status via REST API:', data);
-        updateProgress(data);
-      } catch (error) {
-        console.error('Failed to fetch initial status:', error);
-      }
-    };
-
-    fetchInitialData();
-  }, [updateProgress]);
+  const { updateProgress, currentRun, isLive } = useProgressStore();
+  const [showStatus, setShowStatus] = useState(false);
 
   // Connect to WebSocket for real-time updates
-  const { isConnected, lastMessage } = useWebSocket({
+  // Note: WebSocket sends current state immediately on connection,
+  // so no separate REST API fetch is needed
+  const { connectionState } = useWebSocket({
     onMessage: (data) => {
-      console.log('Received WebSocket update:', data);
       updateProgress(data);
-    },
-    onConnect: () => {
-      console.log('WebSocket connected');
-      setConnectionStatus('connected');
-    },
-    onDisconnect: () => {
-      console.log('WebSocket disconnected');
-      setConnectionStatus('disconnected');
-    },
-    onError: () => {
-      console.log('WebSocket error');
-      setConnectionStatus('reconnecting');
     },
   });
 
+  // Simple: show status once connected, hide initially
   useEffect(() => {
-    if (lastMessage) {
-      console.log('Received progress update:', lastMessage);
+    if (connectionState === 'connected') {
+      setShowStatus(true);
     }
-  }, [lastMessage]);
+  }, [connectionState]);
 
   return (
     <div className="app">
       <header className="app-header">
         <h1>GENML PIPELINE DASHBOARD</h1>
         <div className="header-status">
-          <span className={`status-indicator ${connectionStatus}`} role="status" aria-live="polite">
-            <span
-              className={`status-icon ${connectionStatus}`}
-              aria-hidden="true"
-            />
-            <span className="status-text">
-              {isConnected ? 'Connected' : connectionStatus === 'reconnecting' ? 'Reconnecting…' : 'Disconnected'}
+          {showStatus && (
+            <span className="status-indicator connected" role="status" aria-live="polite">
+              <span className="status-icon connected" aria-hidden="true" />
+              <span className="status-text">Connected</span>
             </span>
-          </span>
+          )}
         </div>
       </header>
 
@@ -76,17 +48,15 @@ function App() {
             <div className="connection-info">
               <p>
                 <strong>NETWORK STATUS:</strong>{' '}
-                <span className={`status-badge ${connectionStatus}`}>
-                  {connectionStatus === 'connected' ? 'LINK ESTABLISHED' : '⚠ LINK DOWN'}
+                <span className={`status-badge ${showStatus ? 'connected' : 'connecting'}`}>
+                  {showStatus ? 'LINK ESTABLISHED' : 'INITIALIZING...'}
                 </span>
               </p>
-              {connectionStatus === 'connected' && (
+              {showStatus && (
                 <p className="success-text">SYSTEM ONLINE - MONITORING ACTIVE</p>
               )}
-              {connectionStatus !== 'connected' && (
-                <p className="warning-text">
-                  ⚠ API SERVER OFFLINE - EXECUTE: <code>python run_api.py</code>
-                </p>
+              {!showStatus && (
+                <p className="warning-text">ESTABLISHING CONNECTION...</p>
               )}
             </div>
           </div>

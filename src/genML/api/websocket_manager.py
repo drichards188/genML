@@ -107,8 +107,26 @@ class WebSocketManager:
         """
         try:
             if self.progress_file.exists():
-                with open(self.progress_file, 'r') as f:
-                    progress_data = json.load(f)
+                try:
+                    with open(self.progress_file, 'r') as f:
+                        content = f.read()
+                        if not content or content.isspace():
+                            # File is empty, send idle status
+                            await websocket.send_json({
+                                "status": "idle",
+                                "message": "No active pipeline run"
+                            })
+                            return
+                        progress_data = json.loads(content)
+                except json.JSONDecodeError as je:
+                    # File has invalid JSON, likely being written - send idle for now
+                    logger.debug(f"Progress file has invalid JSON on initial connect: {je}")
+                    await websocket.send_json({
+                        "status": "idle",
+                        "message": "Pipeline starting..."
+                    })
+                    return
+
                 self._last_payload = progress_data
                 try:
                     self._last_mtime = self.progress_file.stat().st_mtime
@@ -133,8 +151,22 @@ class WebSocketManager:
 
         try:
             if self.progress_file.exists():
-                with open(self.progress_file, 'r') as f:
-                    progress_data = json.load(f)
+                # Read file with error handling for concurrent writes
+                try:
+                    with open(self.progress_file, 'r') as f:
+                        content = f.read()
+                        if not content or content.isspace():
+                            # File is empty or being written, skip this update
+                            logger.debug("Progress file is empty, skipping broadcast")
+                            return
+                        progress_data = json.loads(content)
+                except json.JSONDecodeError as je:
+                    # File is being written to, skip this update
+                    logger.debug(f"Progress file has invalid JSON (likely being written): {je}")
+                    return
+                except Exception as read_error:
+                    logger.warning(f"Error reading progress file: {read_error}")
+                    return
 
                 if self._last_payload == progress_data:
                     return

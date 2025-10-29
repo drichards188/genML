@@ -1,128 +1,274 @@
 /**
  * WebSocket hook for real-time progress updates.
- * Manages WebSocket connection lifecycle and auto-reconnect.
+ * Manages WebSocket connection lifecycle, heartbeat, and auto-reconnect with exponential backoff.
  */
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { RunProgress } from '../types/pipeline';
+
+export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'reconnecting' | 'error';
 
 interface UseWebSocketOptions {
   onMessage?: (data: RunProgress) => void;
   onConnect?: () => void;
   onDisconnect?: () => void;
   onError?: (error: Event) => void;
+  onStateChange?: (state: ConnectionState) => void;
   autoReconnect?: boolean;
-  reconnectInterval?: number;
+  heartbeatInterval?: number;
+  staleConnectionTimeout?: number;
 }
 
 interface UseWebSocketReturn {
+  connectionState: ConnectionState;
   isConnected: boolean;
   lastMessage: RunProgress | null;
   error: Event | null;
   reconnect: () => void;
 }
 
-// Use window.location.host (includes port) so Vite proxy works in dev mode
-// Dev mode: ws://localhost:5173/ws/progress (proxied to :8000)
-// Production: ws://localhost:8000/ws/progress (direct connection)
 const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_URL = `${WS_PROTOCOL}://${window.location.host}/ws/progress`;
 
+const MIN_RECONNECT_DELAY = 1000;
+const MAX_RECONNECT_DELAY = 30000;
+const DEFAULT_HEARTBEAT_INTERVAL = 30000;
+const DEFAULT_STALE_TIMEOUT = 120000;  // 2 minutes (increased from 90s)
+
 export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketReturn => {
   const {
-    onMessage,
-    onConnect,
-    onDisconnect,
-    onError,
     autoReconnect = true,
-    reconnectInterval = 3000,
+    heartbeatInterval = DEFAULT_HEARTBEAT_INTERVAL,
+    staleConnectionTimeout = DEFAULT_STALE_TIMEOUT,
   } = options;
 
-  const [isConnected, setIsConnected] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [lastMessage, setLastMessage] = useState<RunProgress | null>(null);
   const [error, setError] = useState<Event | null>(null);
 
+  // Store all callbacks in refs to avoid re-renders
+  const optionsRef = useRef(options);
+  optionsRef.current = options;  // Update immediately, not in useEffect
+
+  // Connection management refs
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const heartbeatIntervalRef = useRef<number | null>(null);
+  const staleCheckIntervalRef = useRef<number | null>(null);
   const shouldReconnectRef = useRef(true);
+  const reconnectAttemptsRef = useRef(0);
+  const lastMessageTimeRef = useRef<number>(Date.now());
+  const isConnectingRef = useRef(false);  // Prevent multiple simultaneous connections
 
-  const connect = useCallback(() => {
-    try {
-      // Close existing connection if any
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-
-      const ws = new WebSocket(WS_URL);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log('[WebSocket] Connected');
-        setIsConnected(true);
-        setError(null);
-        onConnect?.();
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data: RunProgress = JSON.parse(event.data);
-          setLastMessage(data);
-          onMessage?.(data);
-        } catch (err) {
-          console.error('[WebSocket] Failed to parse message:', err);
-        }
-      };
-
-      ws.onerror = (event) => {
-        console.error('[WebSocket] Error:', event);
-        setError(event);
-        onError?.(event);
-      };
-
-      ws.onclose = () => {
-        console.log('[WebSocket] Disconnected');
-        setIsConnected(false);
-        onDisconnect?.();
-
-        // Auto-reconnect if enabled
-        if (shouldReconnectRef.current && autoReconnect) {
-          console.log(`[WebSocket] Reconnecting in ${reconnectInterval}ms...`);
-          reconnectTimeoutRef.current = window.setTimeout(() => {
-            connect();
-          }, reconnectInterval);
-        }
-      };
-    } catch (err) {
-      console.error('[WebSocket] Connection error:', err);
-    }
-  }, [onMessage, onConnect, onDisconnect, onError, autoReconnect, reconnectInterval]);
-
-  const reconnect = useCallback(() => {
-    console.log('[WebSocket] Manual reconnect triggered');
-    connect();
-  }, [connect]);
+  // Manual reconnect function
+  const reconnectRef = useRef<() => void>();
 
   useEffect(() => {
+    // Helper to update state
+    const updateState = (newState: ConnectionState) => {
+      setConnectionState(prevState => {
+        if (prevState !== newState) {
+          console.log(`[WebSocket] ${prevState} → ${newState}`);
+          optionsRef.current.onStateChange?.(newState);
+        }
+        return newState;
+      });
+    };
+
+    // Clear all intervals
+    const clearIntervals = () => {
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
+      if (staleCheckIntervalRef.current) {
+        clearInterval(staleCheckIntervalRef.current);
+        staleCheckIntervalRef.current = null;
+      }
+    };
+
+    // Send heartbeat ping
+    const sendHeartbeat = () => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(JSON.stringify({ type: 'ping' }));
+        } catch (err) {
+          console.error('[WebSocket] Failed to send ping:', err);
+        }
+      }
+    };
+
+    // Check for stale connection
+    const checkStale = () => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        const timeSinceLastMessage = Date.now() - lastMessageTimeRef.current;
+        if (timeSinceLastMessage > staleConnectionTimeout) {
+          console.warn(`[WebSocket] Stale connection (${timeSinceLastMessage}ms), closing...`);
+          wsRef.current.close();
+        }
+      }
+    };
+
+    // Start heartbeat and stale check
+    const startMonitoring = () => {
+      clearIntervals();
+
+      heartbeatIntervalRef.current = window.setInterval(sendHeartbeat, heartbeatInterval);
+      staleCheckIntervalRef.current = window.setInterval(checkStale, 60000); // Check every minute
+
+      console.log('[WebSocket] Monitoring started');
+    };
+
+    // Calculate reconnect delay with exponential backoff
+    const getReconnectDelay = () => {
+      return Math.min(
+        MIN_RECONNECT_DELAY * Math.pow(2, reconnectAttemptsRef.current),
+        MAX_RECONNECT_DELAY
+      );
+    };
+
+    // Main connection function
+    const connect = () => {
+      if (!shouldReconnectRef.current || isConnectingRef.current) {
+        console.log('[WebSocket] Skipping connect - shouldReconnect:', shouldReconnectRef.current, 'isConnecting:', isConnectingRef.current);
+        return;
+      }
+
+      // Close existing connection
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch (e) {
+          // Ignore errors when closing
+        }
+        wsRef.current = null;
+      }
+
+      isConnectingRef.current = true;
+      console.log(`[WebSocket] Connecting to ${WS_URL}...`);
+      updateState(reconnectAttemptsRef.current > 0 ? 'reconnecting' : 'connecting');
+
+      try {
+        const ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          console.log('[WebSocket] Connected');
+          isConnectingRef.current = false;
+          updateState('connected');
+          setError(null);
+          reconnectAttemptsRef.current = 0;
+          lastMessageTimeRef.current = Date.now();
+          optionsRef.current.onConnect?.();
+          startMonitoring();
+        };
+
+        ws.onmessage = (event) => {
+
+          try {
+            const data = JSON.parse(event.data);
+            lastMessageTimeRef.current = Date.now();
+
+            if (data.type === 'ping') {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'pong' }));
+              }
+              return;
+            }
+
+            if (data.type === 'pong') {
+              return;
+            }
+
+            setLastMessage(data);
+            optionsRef.current.onMessage?.(data);
+          } catch (err) {
+            console.error('[WebSocket] Parse error:', err);
+          }
+        };
+
+        ws.onerror = (event) => {
+          console.error('[WebSocket] Error');
+          isConnectingRef.current = false;
+          setError(event);
+          updateState('error');
+          optionsRef.current.onError?.(event);
+        };
+
+        ws.onclose = (event) => {
+          console.log(`[WebSocket] Closed (code: ${event.code})`);
+          isConnectingRef.current = false;
+          clearIntervals();
+          updateState('disconnected');
+          optionsRef.current.onDisconnect?.();
+
+          // Auto-reconnect
+          if (shouldReconnectRef.current && autoReconnect) {
+            const delay = getReconnectDelay();
+            reconnectAttemptsRef.current++;
+            reconnectTimeoutRef.current = window.setTimeout(() => {
+              if (shouldReconnectRef.current) {
+                connect();
+              }
+            }, delay);
+          }
+        };
+      } catch (err) {
+        console.error('[WebSocket] Connection error:', err);
+        isConnectingRef.current = false;
+        updateState('error');
+      }
+    };
+
+    // Manual reconnect function
+    reconnectRef.current = () => {
+      console.log('[WebSocket] Manual reconnect');
+      reconnectAttemptsRef.current = 0;
+
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+
+      connect();
+    };
+
+    // Initialize connection
     shouldReconnectRef.current = true;
     connect();
 
+    // Cleanup
     return () => {
-      // Cleanup on unmount
+      console.log('[WebSocket] Cleanup - disabling reconnect and closing connection');
       shouldReconnectRef.current = false;
+      isConnectingRef.current = false;  // Reset flag so next mount can connect
+
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
       }
-      if (wsRef.current) {
-        wsRef.current.close();
+
+      clearIntervals();
+
+      // Only close if connection is established or still connecting
+      // Don't interfere with connections that are in progress
+      if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+        console.log('[WebSocket] Closing WebSocket in cleanup, readyState:', wsRef.current.readyState);
+        try {
+          wsRef.current.close();
+        } catch (e) {
+          console.error('[WebSocket] Error closing in cleanup:', e);
+        }
       }
     };
-  }, [connect]);
+  }, []); // Empty deps - only run once on mount!
 
   return {
-    isConnected,
+    connectionState,
+    isConnected: connectionState === 'connected',
     lastMessage,
     error,
-    reconnect,
+    reconnect: () => reconnectRef.current?.(),
   };
 };
 
