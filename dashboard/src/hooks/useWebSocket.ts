@@ -64,20 +64,12 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
   const reconnectRef = useRef<() => void>();
 
   useEffect(() => {
-    // Helper to update state (no mounted check - React handles this)
+    // Helper to update state
     const updateState = (newState: ConnectionState) => {
-      console.log(`[WebSocket] updateState called with: ${newState}`);
-
       setConnectionState(prevState => {
-        console.log(`[WebSocket] State update: ${prevState} → ${newState}`);
         if (prevState !== newState) {
-          console.log('[WebSocket] Calling onStateChange callback...');
-          try {
-            optionsRef.current.onStateChange?.(newState);
-            console.log('[WebSocket] onStateChange callback complete');
-          } catch (e) {
-            console.error('[WebSocket] Error in onStateChange callback:', e);
-          }
+          console.log(`[WebSocket] ${prevState} → ${newState}`);
+          optionsRef.current.onStateChange?.(newState);
         }
         return newState;
       });
@@ -100,7 +92,6 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         try {
           wsRef.current.send(JSON.stringify({ type: 'ping' }));
-          console.log('[WebSocket] Sent ping');
         } catch (err) {
           console.error('[WebSocket] Failed to send ping:', err);
         }
@@ -161,28 +152,15 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
         const ws = new WebSocket(WS_URL);
         wsRef.current = ws;
 
-        console.log('[WebSocket] WebSocket created, readyState:', ws.readyState, '(0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED)');
-
         ws.onopen = () => {
-          console.log('[WebSocket] onopen fired!');
-
-          console.log('[WebSocket] Connected successfully!');
+          console.log('[WebSocket] Connected');
           isConnectingRef.current = false;
-
-          console.log('[WebSocket] Setting state to connected...');
           updateState('connected');
-
           setError(null);
           reconnectAttemptsRef.current = 0;
           lastMessageTimeRef.current = Date.now();
-
-          console.log('[WebSocket] Calling onConnect callback...');
           optionsRef.current.onConnect?.();
-
-          console.log('[WebSocket] Starting monitoring...');
           startMonitoring();
-
-          console.log('[WebSocket] onopen complete');
         };
 
         ws.onmessage = (event) => {
@@ -192,7 +170,6 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
             lastMessageTimeRef.current = Date.now();
 
             if (data.type === 'ping') {
-              console.log('[WebSocket] Received ping');
               if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'pong' }));
               }
@@ -200,7 +177,6 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
             }
 
             if (data.type === 'pong') {
-              console.log('[WebSocket] Received pong');
               return;
             }
 
@@ -212,10 +188,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
         };
 
         ws.onerror = (event) => {
-          console.error('[WebSocket] onerror fired:', event);
-          console.log('[WebSocket] Error readyState:', ws.readyState);
-
-          console.error('[WebSocket] Processing error...');
+          console.error('[WebSocket] Error');
           isConnectingRef.current = false;
           setError(event);
           updateState('error');
@@ -223,7 +196,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
         };
 
         ws.onclose = (event) => {
-          console.log(`[WebSocket] onclose fired (code: ${event.code})`);
+          console.log(`[WebSocket] Closed (code: ${event.code})`);
           isConnectingRef.current = false;
           clearIntervals();
           updateState('disconnected');
@@ -232,9 +205,7 @@ export const useWebSocket = (options: UseWebSocketOptions = {}): UseWebSocketRet
           // Auto-reconnect
           if (shouldReconnectRef.current && autoReconnect) {
             const delay = getReconnectDelay();
-            console.log(`[WebSocket] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1})`);
             reconnectAttemptsRef.current++;
-
             reconnectTimeoutRef.current = window.setTimeout(() => {
               if (shouldReconnectRef.current) {
                 connect();
