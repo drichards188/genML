@@ -5,16 +5,16 @@
 
 import { create } from 'zustand';
 import type { RunProgress } from '../types/pipeline';
+import type { ConnectionState } from '../hooks/useWebSocket';
 
 export type ViewMode = 'live' | 'post-run' | 'history';
-export type ConnectionStatus = 'connected' | 'disconnected' | 'reconnecting';
 
 interface ProgressState {
   // Current run progress data
   currentRun: RunProgress | null;
 
   // Connection status
-  connectionStatus: ConnectionStatus;
+  connectionStatus: ConnectionState;
   isLive: boolean;
 
   // View mode
@@ -25,7 +25,7 @@ interface ProgressState {
 
   // Actions
   updateProgress: (data: RunProgress) => void;
-  setConnectionStatus: (status: ConnectionStatus) => void;
+  setConnectionStatus: (status: ConnectionState) => void;
   setViewMode: (mode: ViewMode) => void;
   setSelectedRunId: (runId: string | null) => void;
   reset: () => void;
@@ -33,7 +33,7 @@ interface ProgressState {
 
 const initialState = {
   currentRun: null,
-  connectionStatus: 'disconnected' as ConnectionStatus,
+  connectionStatus: 'disconnected' as ConnectionState,
   isLive: false,
   viewMode: 'live' as ViewMode,
   selectedRunId: null,
@@ -59,7 +59,7 @@ export const useProgressStore = create<ProgressState>((set) => ({
       };
     }),
 
-  setConnectionStatus: (status: ConnectionStatus) =>
+  setConnectionStatus: (status: ConnectionState) =>
     set({ connectionStatus: status }),
 
   setViewMode: (mode: ViewMode) =>

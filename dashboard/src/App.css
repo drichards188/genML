@@ -156,6 +156,22 @@
   animation: pulse-yellow 1.5s infinite;
 }
 
+.status-icon.connecting {
+  background-color: #00bfff;
+  box-shadow:
+    0 0 10px rgba(0, 191, 255, 1),
+    0 0 20px rgba(0, 191, 255, 0.6);
+  animation: pulse-blue 1s infinite;
+}
+
+.status-icon.error {
+  background-color: #ff0000;
+  box-shadow:
+    0 0 10px rgba(255, 0, 0, 1),
+    0 0 20px rgba(255, 0, 0, 0.6);
+  animation: pulse-red 0.8s infinite;
+}
+
 .status-indicator.connected {
   color: #00ffff;
   background-color: rgba(0, 255, 255, 0.1);
@@ -172,6 +188,18 @@
   color: #ffff00;
   background-color: rgba(255, 255, 0, 0.1);
   border-color: #ffff00;
+}
+
+.status-indicator.connecting {
+  color: #00bfff;
+  background-color: rgba(0, 191, 255, 0.1);
+  border-color: #00bfff;
+}
+
+.status-indicator.error {
+  color: #ff0000;
+  background-color: rgba(255, 0, 0, 0.1);
+  border-color: #ff0000;
 }
 
 .status-text {
@@ -203,6 +231,34 @@
       0 0 15px rgba(255, 255, 0, 1),
       0 0 30px rgba(255, 255, 0, 0.8),
       0 0 40px rgba(255, 255, 0, 0.6);
+  }
+}
+
+@keyframes pulse-blue {
+  0%, 100% {
+    box-shadow:
+      0 0 10px rgba(0, 191, 255, 1),
+      0 0 20px rgba(0, 191, 255, 0.6);
+  }
+  50% {
+    box-shadow:
+      0 0 15px rgba(0, 191, 255, 1),
+      0 0 30px rgba(0, 191, 255, 0.8),
+      0 0 40px rgba(0, 191, 255, 0.6);
+  }
+}
+
+@keyframes pulse-red {
+  0%, 100% {
+    box-shadow:
+      0 0 10px rgba(255, 0, 0, 1),
+      0 0 20px rgba(255, 0, 0, 0.6);
+  }
+  50% {
+    box-shadow:
+      0 0 15px rgba(255, 0, 0, 1),
+      0 0 30px rgba(255, 0, 0, 0.8),
+      0 0 40px rgba(255, 0, 0, 0.6);
   }
 }
 

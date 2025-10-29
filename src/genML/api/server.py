@@ -5,6 +5,7 @@ Provides REST API endpoints and WebSocket support for real-time monitoring
 of the ML pipeline execution.
 """
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -256,16 +257,48 @@ def create_app() -> FastAPI:
     @app.websocket("/ws/progress")
     async def websocket_endpoint(websocket: WebSocket):
         """WebSocket endpoint for real-time progress updates."""
+        client_id = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown"
+        logger.info(f"[WebSocket] Client {client_id} attempting to connect")
+
         await ws_manager.connect(websocket)
+        logger.info(f"[WebSocket] Client {client_id} connected successfully")
+
         try:
-            # Keep connection alive and listen for client messages
+            # Keep connection alive by listening for client messages (ping/pong)
+            # This loop handles incoming messages but doesn't block broadcasting
             while True:
-                # Wait for any message from client (ping/pong)
-                await websocket.receive_text()
+                try:
+                    # Wait for client message with timeout to prevent indefinite blocking
+                    message = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=60.0  # 60 second timeout
+                    )
+
+                    # Handle ping messages from client
+                    try:
+                        msg_data = json.loads(message)
+                        if msg_data.get("type") == "ping":
+                            logger.debug(f"[WebSocket] Client {client_id} sent ping")
+                            # Send pong response
+                            await websocket.send_json({"type": "pong"})
+                    except json.JSONDecodeError:
+                        # Not a JSON message, ignore
+                        logger.debug(f"[WebSocket] Client {client_id} sent non-JSON message: {message[:100]}")
+
+                except asyncio.TimeoutError:
+                    # No message received in timeout period - send keepalive ping
+                    logger.debug(f"[WebSocket] Sending keepalive ping to client {client_id}")
+                    try:
+                        await websocket.send_json({"type": "ping"})
+                    except Exception as ping_error:
+                        logger.warning(f"[WebSocket] Failed to send keepalive ping to {client_id}: {ping_error}")
+                        break  # Connection likely dead
+
         except WebSocketDisconnect:
+            logger.info(f"[WebSocket] Client {client_id} disconnected normally")
             ws_manager.disconnect(websocket)
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            logger.error(f"[WebSocket] Error with client {client_id}: {e}")
             ws_manager.disconnect(websocket)
 
     # ========================================================================
