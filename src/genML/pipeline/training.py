@@ -1106,15 +1106,39 @@ def train_model_pipeline() -> str:
 
                 # Evaluate stacking ensemble with cross-validation
                 print("Evaluating stacking ensemble...")
+
+                # Track ensemble evaluation in progress tracker
+                if config.PROGRESS_TRACKER:
+                    config.PROGRESS_TRACKER.track_model_start('Stacking Ensemble', total_trials=None)
+
                 try:
                     ensemble_scores = cross_val_score(ensemble, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=1)
                     ensemble_mean_score = ensemble_scores.mean()
                 except Exception as exc:
                     logger.warning(f"[Ensemble] Stacking evaluation failed: {exc}")
                     print(f"⚠️  Stacking ensemble evaluation failed: {exc}")
+
+                    # Track failed ensemble evaluation
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.track_model_complete(
+                            'Stacking Ensemble',
+                            mean_score=0.0,
+                            std_score=0.0,
+                            best_params=None
+                        )
+
                     cleanup_memory("After failed ensemble evaluation", aggressive=False)
                 else:
                     print(f"Stacking Ensemble CV Score: {ensemble_mean_score:.6f} (+/- {ensemble_scores.std():.6f})")
+
+                    # Track successful ensemble evaluation
+                    if config.PROGRESS_TRACKER:
+                        config.PROGRESS_TRACKER.track_model_complete(
+                            'Stacking Ensemble',
+                            mean_score=float(ensemble_mean_score),
+                            std_score=float(ensemble_scores.std()),
+                            best_params={'members': [m[0] for m in top_models], 'meta_learner': type(meta_learner).__name__}
+                        )
 
                     # Add ensemble to results
                     results['Stacking Ensemble'] = {

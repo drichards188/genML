@@ -34,12 +34,53 @@ def _discover_dataset_paths() -> tuple[Path | None, Path | None]:
 
 def load_dataset() -> str:
     """
-    Load train/test CSVs, persist them as pickle files for downstream stages,
+    Load train/test data, persist them as pickle files for downstream stages,
     and emit a JSON summary.
+
+    Supports two modes:
+    1. Ingestion mode: Uses INGESTION_CONFIG for flexible data loading from databases, APIs, etc.
+    2. Legacy mode: Discovers train.csv/test.csv files (backward compatible)
 
     Returns:
         JSON string with dataset summary or error payload.
     """
+    # Check if ingestion pipeline is configured
+    if config.INGESTION_CONFIG is not None:
+        logger.info("Using ingestion pipeline mode")
+        return _load_via_ingestion_pipeline()
+
+    # Fall back to legacy CSV discovery mode
+    logger.info("Using legacy CSV discovery mode")
+    return _load_via_legacy_csv()
+
+
+def _load_via_ingestion_pipeline() -> str:
+    """Load data using the flexible ingestion pipeline."""
+    try:
+        from .ingestion import run_ingestion_pipeline
+
+        result_json = run_ingestion_pipeline(config.INGESTION_CONFIG)
+
+        # Parse result to save report
+        result = json.loads(result_json)
+        with open(config.REPORTS_DIR / "data_exploration_report.json", "w") as f:
+            json.dump(result, f, indent=2)
+
+        return result_json
+
+    except Exception as exc:
+        logger.exception("Error in ingestion pipeline")
+        return json.dumps(
+            {
+                "error": f"Ingestion pipeline failed: {exc}",
+                "status": "failed",
+                "pipeline_mode": "ingestion",
+            }
+        )
+
+
+def _load_via_legacy_csv() -> str:
+    """Load data using legacy CSV discovery (backward compatible)."""
     try:
         train_path, test_path = _discover_dataset_paths()
 
@@ -51,6 +92,7 @@ def load_dataset() -> str:
                         "Please place dataset files in datasets/current/ or project root directory."
                     ),
                     "status": "failed",
+                    "pipeline_mode": "legacy_csv",
                 }
             )
 
@@ -106,10 +148,11 @@ def load_dataset() -> str:
         return json.dumps(summary, indent=2)
 
     except Exception as exc:
-        logger.exception("Error loading data")
+        logger.exception("Error loading data in legacy CSV mode")
         return json.dumps(
             {
                 "error": f"Error loading data: {exc}",
                 "status": "failed",
+                "pipeline_mode": "legacy_csv",
             }
         )

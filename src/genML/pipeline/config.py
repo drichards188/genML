@@ -99,6 +99,92 @@ AI_FEATURE_EPSILON = 1e-6
 
 AI_TUNING_OVERRIDE_PATH = REPORTS_DIR / "ai_tuning_overrides.json"
 
+# Data Ingestion Configuration (for non-Kaggle datasets)
+# Set INGESTION_CONFIG to None to use legacy CSV discovery mode
+INGESTION_CONFIG: Optional[Dict[str, Any]] = None
+
+# Example ingestion configurations (uncomment and customize as needed):
+
+# # Example 1: PostgreSQL Database
+# INGESTION_CONFIG = {
+#     'data_source': {
+#         'type': 'postgresql',
+#         'connection_string': 'postgresql://user:password@localhost:5432/database',
+#         'query': 'SELECT * FROM customers WHERE created_at >= \'2024-01-01\'',
+#         # Or use table instead of query:
+#         # 'table': 'customers',
+#         # 'schema': 'public',
+#     },
+#     'target_column': 'churn',  # Column to predict
+#     'id_column': 'customer_id',  # Optional: ID column for submissions
+#     'split': {
+#         'method': 'random',  # Options: 'random', 'time', 'custom'
+#         'test_size': 0.2,
+#         'stratify': True,  # Stratify split by target (for classification)
+#         'random_state': 42,
+#     },
+#     'cleaning': {
+#         'drop_duplicates': True,
+#         'missing_strategy': 'auto',  # Options: 'auto', 'drop', 'none'
+#         # Optional: Specify fill values for specific columns
+#         # 'missing_fill_values': {'age': 0, 'name': 'Unknown'},
+#     },
+#     'validation': {
+#         'required_columns': ['customer_id', 'churn'],
+#         'column_types': {
+#             'customer_id': 'int',
+#             'churn': 'int',
+#         },
+#     },
+#     'transformations': [
+#         # Optional: Add custom transformations
+#         # {'type': 'drop_columns', 'columns': ['internal_id']},
+#         # {'type': 'rename_columns', 'mapping': {'old_name': 'new_name'}},
+#     ],
+# }
+
+# # Example 2: MongoDB
+# INGESTION_CONFIG = {
+#     'data_source': {
+#         'type': 'mongodb',
+#         'connection_string': 'mongodb://localhost:27017/',
+#         'database': 'mydb',
+#         'collection': 'customers',
+#         'query': {'status': 'active'},  # MongoDB query filter
+#         'limit': 10000,  # Optional: limit number of documents
+#     },
+#     'target_column': 'churned',
+#     'id_column': '_id',
+#     'split': {
+#         'method': 'random',
+#         'test_size': 0.2,
+#         'stratify': True,
+#         'random_state': 42,
+#     },
+#     'cleaning': {
+#         'drop_duplicates': True,
+#         'missing_strategy': 'auto',
+#     },
+# }
+
+# # Example 3: Time-based split for time series
+# INGESTION_CONFIG = {
+#     'data_source': {
+#         'type': 'csv',
+#         'file_path': 'data/sales_data.csv',
+#     },
+#     'target_column': 'revenue',
+#     'split': {
+#         'method': 'time',  # Time-based split
+#         'time_column': 'date',
+#         'test_size': 0.2,  # Most recent 20% as test
+#     },
+#     'cleaning': {
+#         'drop_duplicates': False,
+#         'missing_strategy': 'auto',
+#     },
+# }
+
 AI_TUNING_SUPPORTED_PARAMETERS: Dict[str, Dict[str, Tuple[str, Any, Any]]] = {
     "CatBoost": {
         "iterations": ("int", 200, 2000),

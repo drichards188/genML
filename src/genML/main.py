@@ -25,10 +25,37 @@ sys.path.insert(0, str(project_root))
 
 from src.genML.flow import PipelineAbort, create_ml_pipeline_flow
 from src.genML.logging_config import setup_logging
+from src.genML.pipeline import config as pipeline_config
 
 
 def check_data_files():
-    """Check if required dataset files are present in datasets/current or project root"""
+    """
+    Check if data source is configured.
+
+    Supports two modes:
+    1. Ingestion mode: INGESTION_CONFIG is set (no CSV files needed)
+    2. Legacy mode: train.csv and test.csv files must exist
+    """
+    # Check if using ingestion pipeline mode
+    if pipeline_config.INGESTION_CONFIG is not None:
+        print("✅ Using ingestion pipeline mode")
+        data_source = pipeline_config.INGESTION_CONFIG.get('data_source', {})
+        source_type = data_source.get('type', 'unknown')
+        print(f"   Data source type: {source_type}")
+
+        # Validate data source configuration
+        if source_type in ['sql', 'postgresql', 'mysql', 'sqlite']:
+            print(f"   Connection: {data_source.get('connection_string', 'N/A')[:50]}...")
+        elif source_type in ['nosql', 'mongodb']:
+            print(f"   Database: {data_source.get('database', 'N/A')}")
+            print(f"   Collection: {data_source.get('collection', 'N/A')}")
+        elif source_type == 'csv':
+            print(f"   File: {data_source.get('file_path', 'N/A')}")
+
+        return True
+
+    # Legacy CSV mode: check for train.csv and test.csv
+    print("Using legacy CSV discovery mode")
     required_files = ['train.csv', 'test.csv']
 
     # Check datasets/current first, then project root
@@ -52,9 +79,12 @@ def check_data_files():
 
     print("❌ Missing required data files:")
     print("   - train.csv and/or test.csv not found")
-    print("\nPlease place dataset files in one of these locations:")
-    print("- datasets/current/ (recommended for organized datasets)")
-    print("- project root directory")
+    print("\nPlease either:")
+    print("1. Place dataset files in one of these locations:")
+    print("   - datasets/current/ (recommended for organized datasets)")
+    print("   - project root directory")
+    print("2. OR configure INGESTION_CONFIG in src/genML/pipeline/config.py")
+    print("   to load data from databases or other sources")
     return False
 
 

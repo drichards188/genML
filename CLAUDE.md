@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **CrewAI ML Pipeline** project that demonstrates automated machine learning workflows using CrewAI Flows. The system is designed to work with any dataset following the standard train.csv/test.csv format, making it a generalized ML pipeline tool with AI-powered intelligent advisors for automated improvement suggestions.
+This is a **CrewAI ML Pipeline** project that demonstrates automated machine learning workflows using CrewAI Flows. The system supports flexible data ingestion from multiple sources (databases, APIs, files) and can work with both Kaggle-style datasets and real-world production data, making it a generalized ML pipeline tool with AI-powered intelligent advisors for automated improvement suggestions.
 
 ## Key Commands
 
@@ -141,6 +141,65 @@ The codebase has been refactored into a modular structure with `src/genML/pipeli
 - `logging_config.py` - Centralized logging configuration
 - `gpu_utils.py` - GPU detection and memory management utilities
 
+### Data Ingestion Pipeline (NEW)
+
+The system now includes a flexible data ingestion pipeline that supports loading data from various sources beyond CSV files:
+
+**Ingestion Package** (`src/genML/pipeline/`):
+- `ingestion.py` - Core ingestion orchestrator with split, clean, validate, and transform logic
+- `data_validation.py` - Schema validation, data quality checks, and type inference
+- `data_sources/` - Adapter pattern for different data sources:
+  - `base.py` - Abstract `DataSourceAdapter` interface
+  - `sql_adapter.py` - SQL databases (PostgreSQL, MySQL, SQLite, SQL Server)
+  - `nosql_adapter.py` - NoSQL databases (MongoDB)
+  - `csv_adapter.py` - Local files (CSV, Parquet, Excel, JSON)
+
+**Key Features**:
+- **Multiple data sources**: SQL, NoSQL, CSV, Parquet, Excel, JSON
+- **Automatic train/test splitting**: Random, time-based, or custom strategies
+- **Data cleaning**: Missing value handling, duplicate removal, type conversion
+- **Schema validation**: Required columns, type checks, custom constraints
+- **Quality reporting**: Automated data quality scores and issue detection
+- **Backward compatible**: Falls back to CSV discovery if `INGESTION_CONFIG` is None
+
+**Configuration** (in `src/genML/pipeline/config.py`):
+```python
+INGESTION_CONFIG = {
+    'data_source': {
+        'type': 'postgresql',  # or 'mysql', 'mongodb', 'csv', etc.
+        'connection_string': 'postgresql://user:pass@host:port/db',
+        'query': 'SELECT * FROM customers WHERE active = true',
+    },
+    'target_column': 'churn',
+    'id_column': 'customer_id',
+    'split': {
+        'method': 'random',  # or 'time', 'custom'
+        'test_size': 0.2,
+        'stratify': True,
+        'random_state': 42,
+    },
+    'cleaning': {
+        'drop_duplicates': True,
+        'missing_strategy': 'auto',  # or 'drop', 'none'
+    },
+    'validation': {
+        'required_columns': ['customer_id', 'churn'],
+        'column_types': {'customer_id': 'int', 'churn': 'int'},
+    },
+}
+```
+
+**Usage Modes**:
+1. **Legacy CSV Mode** (default): Set `INGESTION_CONFIG = None`, place `train.csv`/`test.csv` in `datasets/current/`
+2. **Ingestion Mode**: Configure `INGESTION_CONFIG` with data source details
+
+**Output**: Both modes produce identical outputs:
+- `outputs/data/train_data.pkl` - Training DataFrame with target column
+- `outputs/data/test_data.pkl` - Test DataFrame without target column
+- `outputs/reports/data_exploration_report.json` - Dataset metadata and stats
+
+See `INGESTION_GUIDE.md` for comprehensive documentation and examples.
+
 ### AI Advisors Integration
 
 The pipeline includes AI-powered intelligent advisors using OpenAI's GPT-4o-mini:
@@ -214,6 +273,14 @@ src/genML/
 │   ├── __init__.py
 │   ├── config.py
 │   ├── dataset.py
+│   ├── ingestion.py         # NEW: Data ingestion orchestrator
+│   ├── data_validation.py   # NEW: Schema and quality validation
+│   ├── data_sources/        # NEW: Data source adapters
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── sql_adapter.py
+│   │   ├── nosql_adapter.py
+│   │   └── csv_adapter.py
 │   ├── feature_engineering.py
 │   ├── model_advisor.py
 │   ├── training.py
@@ -294,7 +361,8 @@ outputs/
 ```
 tests/
 ├── conftest.py               # Shared pytest fixtures
-└── test_pipeline_modules.py  # Pipeline module tests (NEW)
+├── test_pipeline_modules.py  # Pipeline module tests
+└── test_ingestion.py         # NEW: Ingestion pipeline tests
 ```
 
 **Documentation**:
@@ -302,6 +370,7 @@ tests/
 ├── README.md                       # User-facing documentation (includes dashboard setup)
 ├── CLAUDE.md                       # This file (AI assistant guidance)
 ├── AGENTS.md                       # Repository coding guidelines
+├── INGESTION_GUIDE.md              # NEW: Data ingestion pipeline guide
 ├── AI_ADVISORS_README.md           # AI advisors comprehensive guide
 ├── AI_IMPLEMENTATION_SUMMARY.md    # AI implementation details
 ├── SETUP.md                        # Setup instructions
@@ -316,12 +385,42 @@ The system automatically detects whether a problem is regression or classificati
 
 This drives automatic model selection and evaluation metrics.
 
-## Dataset Path Resolution
+## Data Loading and Ingestion
 
-The system searches for `train.csv` and `test.csv` in this order:
+The system supports two data loading modes:
+
+### Legacy CSV Mode (Default)
+When `INGESTION_CONFIG` is `None`, the system searches for `train.csv` and `test.csv` in this order:
 1. `datasets/current/` (recommended)
-2. `datasets/active/`
+2. `datasets/`
 3. Project root directory
+
+This mode is fully backward compatible with existing workflows.
+
+### Ingestion Pipeline Mode (NEW)
+When `INGESTION_CONFIG` is set in `config.py`, the system uses the flexible ingestion pipeline:
+
+**Workflow**:
+1. **Load**: Connect to data source (SQL, NoSQL, CSV, etc.) using appropriate adapter
+2. **Validate**: Check schema requirements and data quality (optional)
+3. **Transform**: Apply custom transformations (drop columns, rename, filter, etc.)
+4. **Clean**: Handle missing values, remove duplicates
+5. **Split**: Create train/test split (random, time-based, or custom)
+6. **Save**: Output standard `train_data.pkl` and `test_data.pkl` files
+
+**Supported Sources**:
+- **SQL Databases**: PostgreSQL, MySQL, SQLite, SQL Server
+- **NoSQL Databases**: MongoDB
+- **Local Files**: CSV, Parquet, Excel, JSON
+
+**Key Benefits**:
+- Work with production databases without exporting to CSV
+- Automated train/test splitting with stratification
+- Built-in data validation and quality checks
+- Custom transformation pipelines
+- Maintains full compatibility with downstream ML pipeline
+
+See `INGESTION_GUIDE.md` for detailed configuration examples.
 
 ## GPU Support
 
@@ -354,11 +453,48 @@ conda activate genml
 
 ## Working with Different Datasets
 
-To work with a new dataset:
+### Option 1: CSV Files (Legacy Mode)
+To work with a new CSV dataset:
 1. Place `train.csv` and `test.csv` in `datasets/current/`
 2. Optionally include `sample_submission.csv` for format detection
 3. Optionally set `OPENAI_API_KEY` environment variable for AI advisors
 4. Run the pipeline - it will automatically adapt to the new data structure
+
+### Option 2: Databases or Other Sources (Ingestion Pipeline)
+To work with data from databases or other sources:
+1. Edit `src/genML/pipeline/config.py` and configure `INGESTION_CONFIG`
+2. Specify data source (SQL, NoSQL, or file path)
+3. Define target column and split strategy
+4. Optionally configure cleaning, validation, and transformations
+5. Run the pipeline - data will be loaded and split automatically
+
+**Examples**:
+```python
+# PostgreSQL
+INGESTION_CONFIG = {
+    'data_source': {
+        'type': 'postgresql',
+        'connection_string': os.environ.get('DB_URL'),
+        'query': 'SELECT * FROM customers WHERE active = true',
+    },
+    'target_column': 'churn',
+    'split': {'method': 'random', 'test_size': 0.2, 'stratify': True},
+}
+
+# MongoDB
+INGESTION_CONFIG = {
+    'data_source': {
+        'type': 'mongodb',
+        'connection_string': 'mongodb://localhost:27017/',
+        'database': 'mydb',
+        'collection': 'transactions',
+    },
+    'target_column': 'is_fraud',
+    'split': {'method': 'random', 'test_size': 0.25},
+}
+```
+
+See `INGESTION_GUIDE.md` for comprehensive examples and configuration options.
 
 ## Feature Engineering
 
