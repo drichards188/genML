@@ -11,6 +11,12 @@ This project demonstrates how to use CrewAI's Flow system to orchestrate a compl
 - **Adaptive Model Training**: Automatically detects problem type (regression vs classification) and trains appropriate models
 - **Smart Submission Generation**: Detects submission format from sample files and creates properly formatted outputs
 
+### Real-Time Dashboard
+
+![GenML Dashboard](dashboard/genmlDashboard.png)
+
+![GenML Dashboard - Model Training](dashboard/genmlDashboard2.png)
+
 ## Project Structure
 
 ```
