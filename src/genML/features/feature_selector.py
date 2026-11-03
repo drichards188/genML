@@ -349,9 +349,12 @@ class AdvancedFeatureSelector:
 
         elif self.selection_strategy == 'union':
             # Union: features selected by any method
-            all_selected = set()
+            # Ordered union (dict keys keep first-seen order) so the result does not
+            # depend on PYTHONHASHSEED and runs are reproducible
+            all_selected: Dict[str, None] = {}
             for method, features in selected_features_list:
-                all_selected.update(features)
+                for feature in features:
+                    all_selected.setdefault(feature, None)
             return list(all_selected)
 
         else:

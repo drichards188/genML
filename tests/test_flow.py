@@ -6,7 +6,7 @@ the complete machine learning pipeline.
 """
 import pytest
 
-from src.genML.flow import MLPipelineFlow, create_ml_pipeline_flow
+from src.genML.flow import MLPipelineFlow, PipelineAbort, create_ml_pipeline_flow
 from src.genML.pipeline import config as pipeline_config
 
 
@@ -64,11 +64,9 @@ class TestMLPipelineFlow:
         # Simulate failed data loading
         failed_result = {"status": "failed", "error": "Test error"}
 
-        # Feature engineering should skip and propagate error
-        fe_result = flow.feature_engineering_task(failed_result)
-
-        assert fe_result['status'] == 'failed'
-        assert 'error' in fe_result
+        # A failed upstream stage aborts the pipeline with the upstream error
+        with pytest.raises(PipelineAbort, match="Test error"):
+            flow.feature_engineering_task(failed_result)
 
     def test_error_propagation_model_training(self):
         """Test that errors propagate from feature engineering to model training"""
@@ -77,10 +75,8 @@ class TestMLPipelineFlow:
         # Simulate failed feature engineering
         failed_result = {"status": "failed", "error": "Feature engineering error"}
 
-        # Model training should skip and propagate error
-        mt_result = flow.model_training_task(failed_result)
-
-        assert mt_result['status'] == 'failed'
+        with pytest.raises(PipelineAbort, match="Feature engineering error"):
+            flow.model_training_task(failed_result)
 
     def test_error_propagation_prediction(self):
         """Test that errors propagate from model training to prediction"""
@@ -89,10 +85,8 @@ class TestMLPipelineFlow:
         # Simulate failed model training
         failed_result = {"status": "failed", "error": "Model training error"}
 
-        # Prediction should skip and propagate error
-        pred_result = flow.prediction_task(failed_result)
-
-        assert pred_result['status'] == 'failed'
+        with pytest.raises(PipelineAbort, match="Model training error"):
+            flow.prediction_task(failed_result)
 
     def test_load_data_task_returns_dict(self, sample_train_df, sample_test_df, temp_dataset_dir, monkeypatch):
         """Test that load_data_task returns a dictionary"""
@@ -145,7 +139,7 @@ class TestMLPipelineFlow:
 
         # Verify that stages have proper decorators
         # This is more of a structural test
-        assert hasattr(flow.load_data_task, '__wrapped__') or hasattr(flow.load_data_task, '_crewai_start')
+        assert getattr(flow.load_data_task, '__is_start_method__', False)
 
     def test_successful_data_loading_returns_success_status(self, sample_train_df, sample_test_df, temp_dataset_dir, monkeypatch):
         """Test that successful data loading returns success status"""
@@ -186,15 +180,10 @@ class TestMLPipelineFlow:
 
         failed_input = {"status": "failed", "error": "Previous stage failed"}
 
-        # All stages should handle failed input the same way
-        fe_result = flow.feature_engineering_task(failed_input)
-        assert fe_result['status'] == 'failed'
-
-        mt_result = flow.model_training_task(failed_input)
-        assert mt_result['status'] == 'failed'
-
-        pred_result = flow.prediction_task(failed_input)
-        assert pred_result['status'] == 'failed'
+        # All stages abort the same way on failed input
+        for stage in (flow.feature_engineering_task, flow.model_training_task, flow.prediction_task):
+            with pytest.raises(PipelineAbort, match="Previous stage failed"):
+                stage(failed_input)
 
 
 class TestCreateMLPipelineFlow:

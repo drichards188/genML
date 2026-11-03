@@ -281,7 +281,9 @@ class TestFeatureQuality:
         X = engine.fit_transform(df, target_col='target')
 
         # Sin/cos features should be in [-1, 1]
-        cyclical_features = [col for col in X.columns if '_sin' in col or '_cos' in col]
+        # Match the suffix only: '_sin' also appears inside names like 'date_days_since_min'
+        cyclical_features = [col for col in X.columns if col.endswith(('_sin', '_cos'))]
+        assert cyclical_features, "expected cyclical datetime features"
         for col in cyclical_features:
             assert X[col].min() >= -1.1  # Small tolerance
             assert X[col].max() <= 1.1

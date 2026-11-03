@@ -12,6 +12,7 @@ import pandas as pd
 
 from src.genML.gpu_utils import get_gpu_config
 from src.genML.pipeline import config
+from src.genML.pipeline.inference import infer_task_type
 from src.genML.pipeline.optional_dependencies import (
     CATBOOST_AVAILABLE,
     LIGHTGBM_AVAILABLE,
@@ -280,38 +281,10 @@ def detect_problem_type() -> str:
     try:
         y_train = np.load(config.FEATURES_DIR / "y_train.npy")
 
-        unique_values = len(np.unique(y_train))
-        total_samples = len(y_train)
-        unique_ratio = unique_values / total_samples
+        task, reason = infer_task_type(y_train)
+        problem_type = "regression" if task == "regression" else "classification"
 
-        is_integer_like = np.allclose(y_train, np.round(y_train))
-        value_range = np.max(y_train) - np.min(y_train)
-
-        if unique_values <= 20:
-            problem_type = "classification"
-            confidence = "high"
-            reason = f"Only {unique_values} unique target values"
-        elif unique_ratio < 0.05 and is_integer_like:
-            problem_type = "classification"
-            confidence = "medium"
-            reason = f"Low unique ratio ({unique_ratio:.3f}) with integer-like values"
-        elif unique_ratio > 0.1:
-            problem_type = "regression"
-            confidence = "high"
-            reason = f"High unique ratio ({unique_ratio:.3f}) indicates continuous target"
-        elif not is_integer_like:
-            problem_type = "regression"
-            confidence = "medium"
-            reason = "Non-integer target values indicate regression"
-        else:
-            problem_type = "classification"
-            confidence = "low"
-            reason = "Ambiguous case - defaulting to classification"
-
-        print(f"Problem type detected: {problem_type} (confidence: {confidence})")
-        print(f"Reason: {reason}")
-        print(f"Target statistics: {unique_values} unique values, {unique_ratio:.3f} ratio, range: {value_range:.3f}")
-
+        logger.info("Problem type detected: %s (%s; %s)", problem_type, task, reason)
         return problem_type
 
     except Exception as exc:

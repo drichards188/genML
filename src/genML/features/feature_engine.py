@@ -46,7 +46,10 @@ class AutoFeatureEngine:
         """
         self.config = config or {}
         self.analyzer = DataTypeAnalyzer()
-        self.feature_selector = AdvancedFeatureSelector(self.config.get('feature_selection', {}))
+        selector_config = dict(self.config.get('feature_selection', {}))
+        if 'max_features' in self.config:
+            selector_config.setdefault('max_features', self.config['max_features'])
+        self.feature_selector = AdvancedFeatureSelector(selector_config)
         self.domain_researcher = DomainResearcher(self.config.get('domain_research', {}))
         self.processors = {}
         self.feature_map = {}

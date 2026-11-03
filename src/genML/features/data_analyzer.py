@@ -188,17 +188,16 @@ class DataTypeAnalyzer:
         if len(non_null_series) == 0:
             return False
 
-        # Check column name patterns
-        id_name_patterns = ['id', 'key', 'index', 'identifier', 'pk', 'uuid']
-        name_matches = any(pattern in col_name.lower() for pattern in id_name_patterns)
+        # Check column name patterns on whole words ("PassengerId", "customer_id"),
+        # so substrings like "accidents" or "paid" do not count
+        id_name_tokens = {'id', 'ids', 'key', 'index', 'idx', 'identifier', 'pk', 'uuid', 'guid'}
+        name_matches = bool(id_name_tokens & set(self._name_tokens(col_name)))
 
         unique_count = non_null_series.nunique()
         total_count = len(non_null_series)
         uniqueness_ratio = unique_count / total_count if total_count else 0.0
 
         if name_matches and uniqueness_ratio >= 0.9:
-            if pd.api.types.is_numeric_dtype(non_null_series) and self._is_small_int_range(non_null_series):
-                return False
             return True
 
         if uniqueness_ratio < 0.98:
@@ -214,12 +213,21 @@ class DataTypeAnalyzer:
 
         return False
 
+    @staticmethod
+    def _name_tokens(col_name: str) -> List[str]:
+        """Split a column name into lowercase words (snake_case, kebab-case, camelCase)."""
+        spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', str(col_name))
+        return [token for token in re.split(r'[^A-Za-z0-9]+', spaced.lower()) if token]
+
     def _is_sequential(self, series: pd.Series) -> bool:
-        """Check if series contains sequential values."""
-        if pd.api.types.is_numeric_dtype(series):
-            sorted_series = series.sort_values()
-            diff = sorted_series.diff().dropna()
-            return (diff == 1).all() or (diff.std() < 0.1)
+        """Check if series is a run of consecutive integers (step exactly 1).
+
+        Evenly spaced values with other steps (timestamps, sorted measurements)
+        are not treated as sequential IDs.
+        """
+        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+            diff = series.sort_values().diff().dropna()
+            return len(diff) > 0 and bool((diff == 1).all())
         return False
 
     def _has_id_patterns(self, series: pd.Series) -> bool:

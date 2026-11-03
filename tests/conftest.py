@@ -9,6 +9,35 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+from src.genML.pipeline import config as pipeline_config
+
+
+@pytest.fixture(autouse=True)
+def isolate_outputs(tmp_path, monkeypatch):
+    """Run every test from its own temporary directory.
+
+    Pipeline code writes to relative paths (outputs/, submission files,
+    progress and log files), so without this the suite writes into the real
+    project outputs/ folder.
+    """
+    monkeypatch.chdir(tmp_path)
+    outputs_dir = tmp_path / "outputs"
+    for attr, sub in {
+        "OUTPUTS_DIR": "",
+        "DATA_DIR": "data",
+        "FEATURES_DIR": "features",
+        "MODELS_DIR": "models",
+        "PREDICTIONS_DIR": "predictions",
+        "REPORTS_DIR": "reports",
+    }.items():
+        path = outputs_dir / sub if sub else outputs_dir
+        path.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(pipeline_config, attr, path)
+    monkeypatch.setattr(
+        pipeline_config, "AI_TUNING_OVERRIDE_PATH", outputs_dir / "reports" / "ai_tuning_overrides.json"
+    )
+    yield tmp_path
+
 
 @pytest.fixture
 def sample_train_df():

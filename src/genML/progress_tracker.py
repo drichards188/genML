@@ -68,7 +68,9 @@ class ProgressTracker:
         }
 
         # Set up progress directory
-        self.progress_dir = Path("outputs/progress")
+        # Resolve once so background writers (resource monitor thread) keep writing
+        # to the same place even if the working directory changes later
+        self.progress_dir = Path("outputs/progress").resolve()
         self.progress_dir.mkdir(parents=True, exist_ok=True)
 
         self.progress_file = self.progress_dir / "current_run.json"

@@ -170,7 +170,7 @@ class NumericalProcessor(BaseProcessor):
         if not self.is_fitted:
             raise ValueError("Processor must be fitted before transform")
 
-        result = pd.DataFrame()
+        result = pd.DataFrame(index=data.index)
         base_name = self.base_name
 
         # Handle missing values
@@ -316,7 +316,7 @@ class CategoricalProcessor(BaseProcessor):
         if not self.is_fitted:
             raise ValueError("Processor must be fitted before transform")
 
-        result = pd.DataFrame()
+        result = pd.DataFrame(index=data.index)
         base_name = self.base_name
 
         # Handle missing values and convert to string
@@ -457,7 +457,7 @@ class TextProcessor(BaseProcessor):
         if not self.is_fitted:
             raise ValueError("Processor must be fitted before transform")
 
-        result = pd.DataFrame()
+        result = pd.DataFrame(index=data.index)
         base_name = self.base_name
 
         # Handle missing values
@@ -579,7 +579,7 @@ class DateTimeProcessor(BaseProcessor):
         if not self.is_fitted:
             raise ValueError("Processor must be fitted before transform")
 
-        result = pd.DataFrame()
+        result = pd.DataFrame(index=data.index)
         base_name = self.base_name
 
         # Convert to datetime if not already

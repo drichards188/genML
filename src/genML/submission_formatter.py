@@ -57,9 +57,9 @@ class SubmissionFormatter:
 
         # Look for sample submission files in organized directory structure first
         dataset_paths = [
-            Path("datasets/current"),
-            Path("datasets/active"),
-            Path(".")
+            self.project_dir / "datasets" / "current",
+            self.project_dir / "datasets" / "active",
+            self.project_dir,
         ]
 
         sample_files = []
@@ -86,7 +86,8 @@ class SubmissionFormatter:
                     break
 
         if not sample_files:
-            return self._create_fallback_format()
+            self.format_info = self._create_fallback_format()
+            return self.format_info
 
         # Use the first found sample file
         # TODO: Could be enhanced to prefer certain file names or ask user
@@ -110,7 +111,8 @@ class SubmissionFormatter:
 
         except Exception as e:
             print(f"Error reading sample submission {sample_file}: {e}")
-            return self._create_fallback_format()
+            self.format_info = self._create_fallback_format()
+            return self.format_info
 
     def _analyze_sample_format(self, sample_df: pd.DataFrame, filename: str) -> Dict[str, Any]:
         """
@@ -164,26 +166,30 @@ class SubmissionFormatter:
             One of: 'binary', 'probability', 'continuous', 'categorical'
         """
 
-        unique_values = set(values.unique())
+        values = values.dropna()
 
-        # Check for binary classification (0, 1)
-        if unique_values.issubset({0, 1}):
-            return 'binary'
-
-        # Check for probability values (0.0 to 1.0)
-        if all(0.0 <= val <= 1.0 for val in values if not pd.isna(val)):
-            # If all values are exactly 0.5, it's likely a probability placeholder
-            if len(unique_values) == 1 and 0.5 in unique_values:
-                return 'probability'
-            # If we have diverse values between 0 and 1, it's probability
-            elif len(unique_values) > 2:
-                return 'probability'
-
-        # Check for categorical (strings or small number of discrete values)
-        if values.dtype == 'object' or len(unique_values) < 20:
+        # Strings (or anything non-numeric) are class labels
+        if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values):
             return 'categorical'
 
-        # Default to continuous for everything else
+        numeric = values.astype(float)
+        unique_values = set(numeric.unique())
+
+        # Only 0/1 present: binary class labels
+        if unique_values.issubset({0.0, 1.0}):
+            return 'binary'
+
+        is_integer_like = bool(np.allclose(numeric, np.round(numeric)))
+
+        # Non-integer values inside [0, 1] (including constant placeholders such as
+        # 0.5 or a base rate like 0.0167) are probabilities
+        if not is_integer_like and numeric.min() >= 0.0 and numeric.max() <= 1.0:
+            return 'probability'
+
+        # A handful of integer values are class labels
+        if is_integer_like and len(unique_values) < 20:
+            return 'categorical'
+
         return 'continuous'
 
     def _create_fallback_format(self) -> Dict[str, Any]:
@@ -197,7 +203,10 @@ class SubmissionFormatter:
         """
 
         # Try to analyze test data for hints
-        test_files = ['test.csv']
+        test_files = [
+            self.project_dir / "datasets" / "current" / "test.csv",
+            self.project_dir / "test.csv",
+        ]
         id_column = 'id'  # Generic default
 
         for test_file in test_files:
