@@ -21,6 +21,7 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,7 +33,7 @@ from src.genML.pipeline import config
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
+OUTPUTS_ROOT = Path(os.environ.get("GENML_OUTPUTS", PROJECT_ROOT / "outputs"))
 RUN_SUBDIRS = ("data", "features", "models", "predictions", "reports")
 INDEX_FIELDS = (
     "run_id", "started_at", "finished_at", "status", "metric", "cv_score", "best_model",

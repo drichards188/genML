@@ -328,7 +328,8 @@ def create_ml_pipeline_flow(dataset_name: str = "unknown", run_id: Optional[str]
 
 
 def run_pipeline(problem: Optional[str] = None, spec=None, download: bool = False,
-                 notes: str = "", setup_log: bool = True, outputs_root=None) -> Dict[str, Any]:
+                 notes: str = "", setup_log: bool = True, outputs_root=None,
+                 run_id: Optional[str] = None) -> Dict[str, Any]:
     """Run the full pipeline for one problem in its own output folder.
 
     Args:
@@ -340,6 +341,7 @@ def run_pipeline(problem: Optional[str] = None, spec=None, download: bool = Fals
         notes: Free text stored with the run (e.g. what changed).
         setup_log: Tee stdout/stderr into the run's pipeline.log.
         outputs_root: Root for run folders (default: <project>/outputs).
+        run_id: Use this run id (the job queue assigns ids before runs start).
 
     Returns:
         The run summary (also written to outputs/<problem>/<run_id>/run.json).
@@ -361,6 +363,8 @@ def run_pipeline(problem: Optional[str] = None, spec=None, download: bool = Fals
         problem_name = "current"
 
     run_kwargs = {"outputs_root": Path(outputs_root)} if outputs_root else {}
+    if run_id:
+        run_kwargs["run_id"] = run_id
     run = RunContext(problem_name, notes=notes, **run_kwargs).activate()
     if setup_log:
         setup_logging(problem_name, log_path=run.log_file)

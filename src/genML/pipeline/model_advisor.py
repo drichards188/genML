@@ -202,73 +202,19 @@ def get_available_model_summaries(problem_type: str) -> Dict[str, Dict[str, Any]
 
 
 def run_model_selection_advisor() -> str:
-    """Execute the model selection advisor and persist its guidance."""
-    if not config.AI_ADVISORS_CONFIG.get("enabled", False):
-        logger.info("AI advisors disabled; skipping model selection advisor")
-        skipped = {"status": "skipped", "reason": "AI advisors disabled"}
-        save_model_selection_guidance(skipped)
-        return json.dumps(skipped, indent=2)
+    """Model selection guidance stage (stage 3).
 
-    try:
-        logger.info("Running AI model selection advisor...")
-
-        train_df = pd.read_pickle(config.DATA_DIR / "train_data.pkl")
-
-        feature_report_path = config.REPORTS_DIR / "feature_engineering_report.json"
-        if not feature_report_path.exists():
-            raise FileNotFoundError("feature_engineering_report.json not found")
-
-        with open(feature_report_path, "r") as f:
-            feature_metadata = json.load(f)
-
-        feature_names_file = config.FEATURES_DIR / "feature_names.txt"
-        feature_names: List[str] = []
-        if feature_names_file.exists():
-            with open(feature_names_file, "r") as f:
-                feature_names = [line.strip() for line in f.readlines() if line.strip()]
-
-        problem_type = detect_problem_type()
-        dataset_profile = build_dataset_profile(train_df, feature_metadata, feature_names, problem_type)
-
-        supported_models = get_available_model_summaries(problem_type)
-
-        historical_context = {}
-        training_report_path = config.REPORTS_DIR / "model_training_report.json"
-        if training_report_path.exists():
-            try:
-                with open(training_report_path, "r") as f:
-                    historical_context = json.load(f)
-            except Exception as exc:
-                logger.warning("Could not load historical model report: %s", exc)
-
-        from src.genML.ai_advisors import ModelSelectionAdvisor, OpenAIClient
-
-        openai_client = OpenAIClient(config=config.AI_ADVISORS_CONFIG["openai_config"])
-        advisor = ModelSelectionAdvisor(openai_client=openai_client)
-        guidance = advisor.recommend_models(
-            dataset_profile=dataset_profile,
-            supported_models=supported_models,
-            historical_context=historical_context,
-        )
-
-        guidance["problem_type"] = problem_type
-        guidance["dataset_profile_digest"] = {
-            "row_count": dataset_profile.get("row_count"),
-            "engineered_feature_count": dataset_profile.get("engineered_feature_count"),
-            "detected_domains": dataset_profile.get("detected_domains"),
-        }
-
-        save_model_selection_guidance(guidance)
-        return json.dumps(guidance, indent=2)
-
-    except Exception as exc:
-        logger.warning("Model selection advisor failed: %s", exc)
-        fallback = {
-            "status": "failed",
-            "error": str(exc),
-        }
-        save_model_selection_guidance(fallback)
-        return json.dumps(fallback, indent=2)
+    The OpenAI-based advisor was never committed to this repository and has been
+    removed. Model choice now comes from the problem spec (``models``) or from an
+    LLM client through the MCP server (``start_run(models=...)``). The stage is
+    kept so the dashboard's five stages stay stable; it records a skip.
+    """
+    skipped = {
+        "status": "skipped",
+        "reason": "model choice comes from the problem spec or the MCP server (start_run models=...)",
+    }
+    save_model_selection_guidance(skipped)
+    return json.dumps(skipped, indent=2)
 
 
 def detect_problem_type() -> str:

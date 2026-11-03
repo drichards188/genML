@@ -69,28 +69,10 @@ PARALLEL_TRAINING_CONFIG: Dict[str, Any] = {
     "gpu_models_sequential": True,  # Always keep GPU models sequential to avoid OOM
 }
 
-# AI Advisors Configuration (OpenAI-powered intelligent analysis)
-# Disabled by default: the src/genML/ai_advisors package is not present in this
-# repository. Re-enable once that package (OpenAIClient and the advisors) is added.
-AI_ADVISORS_CONFIG: Dict[str, Any] = {
-    "enabled": False,
-    "feature_ideation": {
-        "enabled": True,
-        "sample_size": 100,
-        "save_report": True,
-    },
-    "error_analysis": {
-        "enabled": True,
-        "top_n_errors": 100,
-        "save_report": True,
-    },
-    "openai_config": {
-        "model": "gpt-4o",  # Upgraded from gpt-4o-mini for better reasoning
-        "max_cost_per_run": 10.0,
-        "enable_cache": True,
-        "cache_dir": "outputs/ai_cache",
-    },
-}
+# Kept for backward compatibility (src/genML/tools.py re-exports it). The OpenAI
+# advisors were never committed and have been removed; LLM guidance now comes from
+# an MCP client (src/genML/mcp_server.py).
+AI_ADVISORS_CONFIG: Dict[str, Any] = {"enabled": False}
 
 AI_SUPPORTED_FEATURE_OPERATIONS = {
     "ratio",

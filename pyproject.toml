@@ -26,6 +26,10 @@ dashboard = [
 ]
 kaggle = [
     "kagglehub>=0.3.0",
+    "kaggle>=2.0; python_version >= '3.11'",  # submitting (kagglehub cannot submit)
+]
+mcp = [
+    "mcp>=2.0; python_version >= '3.11'",
 ]
 
 [project.scripts]

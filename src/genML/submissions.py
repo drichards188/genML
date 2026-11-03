@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.genML.pipeline.problem import load_problem
-from src.genML.run_context import OUTPUTS_ROOT, list_runs, load_run
+from src.genML import run_context
+from src.genML.run_context import list_runs, load_run
 
 LOG_FIELDS = ("submitted_at", "run_id", "metric", "cv_score", "best_model", "message", "file",
               "status", "public_score", "private_score", "kaggle_ref")
@@ -24,7 +25,7 @@ TAG = re.compile(r"\[genml ([^\]\s]+)")
 
 
 def _log_path(problem_name: str, outputs_root: Optional[Path] = None) -> Path:
-    return Path(outputs_root or OUTPUTS_ROOT) / problem_name / "submissions.csv"
+    return Path(outputs_root or run_context.OUTPUTS_ROOT) / problem_name / "submissions.csv"
 
 
 def read_log(problem_name: str, outputs_root: Optional[Path] = None) -> List[Dict[str, Any]]:

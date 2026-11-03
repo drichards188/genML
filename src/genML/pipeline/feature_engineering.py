@@ -454,81 +454,6 @@ def engineer_features() -> str:
 
         ai_feature_suggestions: Optional[Dict[str, Any]] = None
 
-        if config.AI_ADVISORS_CONFIG["enabled"] and config.AI_ADVISORS_CONFIG["feature_ideation"]["enabled"]:
-            try:
-                print("\n" + "=" * 60)
-                print("🤖 AI Feature Ideation Advisor")
-                print("=" * 60)
-                print("Analyzing current features and suggesting improvements...")
-
-                from src.genML.ai_advisors import FeatureIdeationAdvisor, OpenAIClient
-
-                openai_client = OpenAIClient(config=config.AI_ADVISORS_CONFIG["openai_config"])
-
-                if openai_client.is_available():
-                    current_features = [col for col in train_df.columns if col != target_col]
-
-                    feature_importances = None
-                    if hasattr(feature_engine, "feature_selector") and hasattr(
-                        feature_engine.feature_selector, "feature_importances_"
-                    ):
-                        importance_dict = {
-                            feat: float(imp)
-                            for feat, imp in zip(
-                                current_features, feature_engine.feature_selector.feature_importances_
-                            )
-                        }
-                        feature_importances = importance_dict
-
-                    advisor = FeatureIdeationAdvisor(openai_client=openai_client)
-
-                    sample_size = config.AI_ADVISORS_CONFIG["feature_ideation"]["sample_size"]
-                    df_sample = train_df.head(sample_size)
-
-                    detected_domain = analysis_results.get("domain_analysis", {}).get("detected_domains", [None])[0]
-
-                    derived_context = build_derived_feature_context(
-                        df_sample=df_sample,
-                        target_col=target_col,
-                        feature_importances=feature_importances,
-                    )
-
-                    if derived_context.get("candidate_ratio_pairs"):
-                        ratio_preview = [
-                            " / ".join(pair) for pair in derived_context["candidate_ratio_pairs"][:3]
-                        ]
-                        print(f"   Candidate ratio pairs: {', '.join(ratio_preview)}")
-
-                    if derived_context.get("target_correlations"):
-                        top_corr = list(derived_context["target_correlations"].items())[:3]
-                        corr_preview = [f"{feat} ({score:.2f})" for feat, score in top_corr]
-                        if corr_preview:
-                            print(f"   Strong target correlations: {', '.join(corr_preview)}")
-
-                    ai_feature_suggestions = advisor.suggest_features(
-                        df_sample=df_sample,
-                        current_features=current_features,
-                        target_col=target_col or "",
-                        detected_domain=detected_domain,
-                        feature_importances=feature_importances,
-                    )
-
-                    if ai_feature_suggestions.get("status") == "success":
-                        print("AI Feature Advisor successfully generated suggestions.")
-                        print(
-                            json.dumps(
-                                ai_feature_suggestions.get("feature_analysis", {}) or {},
-                                indent=2,
-                            )
-                        )
-                    else:
-                        print("AI Feature Advisor did not produce successful suggestions.")
-                else:
-                    print("OpenAI client unavailable; skipping feature ideation.")
-            except Exception as exc:  # pragma: no cover - advisor failures do not break pipeline
-                logger.warning("AI Feature Ideation Advisor failed: %s", exc)
-                ai_feature_suggestions = None
-
         train_features = feature_engine.transform(train_df)
         test_features = feature_engine.transform(test_df)
         feature_columns = list(train_features.columns)
@@ -556,7 +481,7 @@ def engineer_features() -> str:
             ai_feature_suggestions = None
             ai_feature_summary = {
                 "status": "skipped",
-                "reason": "advisor_disabled" if not config.AI_ADVISORS_CONFIG["enabled"] else "no_suggestions",
+                "reason": "advisor_removed",
                 "created_features": [],
             }
 

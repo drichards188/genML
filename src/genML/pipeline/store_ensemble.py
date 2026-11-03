@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 
 def ensemble_from_store(problem_name: str, method: str = "stack", top: int = 10,
-                        outputs_root: Optional[Path] = None, notes: str = "") -> Dict[str, Any]:
+                        outputs_root: Optional[Path] = None, notes: str = "",
+                        run_id: Optional[str] = None) -> Dict[str, Any]:
     from src.genML.pipeline.prediction import generate_predictions
     from src.genML.run_context import RunContext, list_runs, OUTPUTS_ROOT
 
@@ -77,8 +78,9 @@ def ensemble_from_store(problem_name: str, method: str = "stack", top: int = 10,
                  "best_single": {"experiment_id": best_single.experiment_id,
                                  "oof_score": best_single.meta["oof_score"]}})
 
+    run_kwargs = {"run_id": run_id} if run_id else {}
     run = RunContext(problem_name, notes=notes or f"ensemble ({method}) of {len(ranked)} stored experiments",
-                     outputs_root=root).activate()
+                     outputs_root=root, **run_kwargs).activate()
     shutil.copy(source_dir / "data" / "test_data.pkl", config.DATA_DIR / "test_data.pkl")
     shutil.copy(source_dir / "reports" / "resolved_spec.json", config.REPORTS_DIR / "resolved_spec.json")
     joblib.dump(transform_info, config.FEATURES_DIR / "target_transform.pkl")

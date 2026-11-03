@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,7 +36,7 @@ from src.genML.pipeline.metrics import Metric, default_metric_for, get_metric
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-PROBLEMS_DIR = PROJECT_ROOT / "problems"
+PROBLEMS_DIR = Path(os.environ.get("GENML_PROBLEMS", PROJECT_ROOT / "problems"))
 DATASETS_DIR = PROJECT_ROOT / "datasets"
 KAGGLEHUB_CACHE = Path.home() / ".cache" / "kagglehub" / "competitions"
 
