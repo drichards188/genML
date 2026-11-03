@@ -124,7 +124,7 @@ def apply_model_selection_guidance(
     base_tuning_list: List[str],
 ) -> Tuple[OrderedDict, Optional[List[str]], Dict[str, Any]]:
     """Reorder and filter the model dictionary based on AI guidance."""
-    if not guidance or guidance.get("status") in {None, "failed"}:
+    if not guidance or guidance.get("status") in {None, "failed", "skipped"}:
         return OrderedDict(models), None, {"applied": False, "reason": "no_guidance"}
 
     excluded = set(guidance.get("excluded_models", []))
@@ -202,6 +202,12 @@ def get_available_model_summaries(problem_type: str) -> Dict[str, Dict[str, Any]
 
 def run_model_selection_advisor() -> str:
     """Execute the model selection advisor and persist its guidance."""
+    if not config.AI_ADVISORS_CONFIG.get("enabled", False):
+        logger.info("AI advisors disabled; skipping model selection advisor")
+        skipped = {"status": "skipped", "reason": "AI advisors disabled"}
+        save_model_selection_guidance(skipped)
+        return json.dumps(skipped, indent=2)
+
     try:
         logger.info("Running AI model selection advisor...")
 

@@ -67,8 +67,10 @@ PARALLEL_TRAINING_CONFIG: Dict[str, Any] = {
 }
 
 # AI Advisors Configuration (OpenAI-powered intelligent analysis)
+# Disabled by default: the src/genML/ai_advisors package is not present in this
+# repository. Re-enable once that package (OpenAIClient and the advisors) is added.
 AI_ADVISORS_CONFIG: Dict[str, Any] = {
-    "enabled": True,
+    "enabled": False,
     "feature_ideation": {
         "enabled": True,
         "sample_size": 100,
