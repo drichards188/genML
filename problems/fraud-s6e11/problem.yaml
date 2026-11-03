@@ -1,0 +1,15 @@
+name: fraud-s6e11
+source:
+  type: kaggle
+  competition: playground-series-s6e11
+description: 'Predicting Credit Card Fraud (Kaggle metric: Roc Auc Score)'
+target: is_fraud
+id_column: id
+task: binary
+metric: roc_auc
+# Deadline 2026-11-30, 10 submissions/day. GPU gradient boosting only; RF and
+# linear models rarely win at 700k rows and use most of the time budget.
+models: [XGBoost, CatBoost, LightGBM]
+budget:
+  n_trials: 15
+  timeout_per_model: 900

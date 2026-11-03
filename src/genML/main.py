@@ -7,12 +7,13 @@ using CrewAI Flows. The pipeline is designed to work with any dataset that follo
 the standard train.csv/test.csv format.
 
 Usage:
-    python main.py  (from project root)
-
-Prerequisites:
-    - Place train.csv and test.csv dataset files in the project root directory
-    - Install required dependencies: pip install -r requirements.txt
+    python src/genML/main.py                         # legacy: datasets/current/, everything inferred
+    python src/genML/main.py --problem fraud-s6e11   # run a declared problem (problems/<name>/problem.yaml)
+    python src/genML/main.py --problem NAME --download   # fetch Kaggle data first if missing
+    python src/genML/main.py --list-problems
+    python src/genML/main.py --init-kaggle playground-series-s6e11 --name fraud-s6e11
 """
+import argparse
 import os
 import sys
 import time
@@ -26,6 +27,8 @@ sys.path.insert(0, str(project_root))
 from src.genML.flow import PipelineAbort, create_ml_pipeline_flow
 from src.genML.logging_config import setup_logging
 from src.genML.pipeline import config as pipeline_config
+from src.genML.pipeline import context as pipeline_context
+from src.genML.pipeline.problem import list_problems, load_problem, locate_data_dir
 
 
 def check_data_files():
@@ -115,8 +118,55 @@ def detect_dataset_name():
     return 'unknown'
 
 
-def main():
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run the genML pipeline")
+    parser.add_argument("--problem", help="Problem name (problems/<name>/problem.yaml) or path to a spec")
+    parser.add_argument("--download", action="store_true", help="Download Kaggle data if it is missing")
+    parser.add_argument("--list-problems", action="store_true", help="List declared problems and exit")
+    parser.add_argument("--init-kaggle", metavar="COMPETITION",
+                        help="Create a problem spec for a Kaggle competition and exit")
+    parser.add_argument("--name", help="Problem name for --init-kaggle (default: the competition slug)")
+    return parser.parse_args(argv)
+
+
+def _prepare_problem(args) -> str | None:
+    """Register the requested problem spec; returns its name, or None for legacy mode."""
+    pipeline_context.reset()
+    if not args.problem:
+        return None
+    spec = load_problem(args.problem)
+    data_dir = locate_data_dir(spec, download=args.download)
+    spec.source = {**spec.source, "path": str(data_dir)}
+    pipeline_context.set_requested_spec(spec)
+    print(f"✅ Problem '{spec.name}' using data from {data_dir}")
+    return spec.name
+
+
+def main(argv=None):
     """Main function to run the ML Pipeline Flow"""
+    args = _parse_args(argv)
+    os.chdir(project_root)
+
+    if args.list_problems:
+        names = list_problems()
+        print("Declared problems:" if names else "No problems declared under problems/")
+        for name in names:
+            spec = load_problem(name)
+            print(f"  {name}: {spec.description or ''} [{spec.task or '?'} / {spec.metric or '?'}]")
+        return 0
+
+    if args.init_kaggle:
+        from src.genML.pipeline.kaggle import init_problem_from_kaggle
+
+        path, resolved = init_problem_from_kaggle(args.init_kaggle, name=args.name)
+        print(f"✅ Wrote {path}")
+        print(f"   target={resolved.target} id={resolved.id_column} task={resolved.task} "
+              f"metric={resolved.metric} output={resolved.output}")
+        if resolved.inferred:
+            print("   Inferred (review these):")
+            for key, reason in resolved.inferred.items():
+                print(f"     {key}: {reason}")
+        return 0
     print("=" * 60)
     print("🤖 CREWAI ML PIPELINE FLOW")
     print("=" * 60)
@@ -127,15 +177,18 @@ def main():
     print("4. 📈 Generate predictions and create submission file")
     print("=" * 60)
 
-    # Change to project root for file operations
-    os.chdir(project_root)
+    try:
+        problem_name = _prepare_problem(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"❌ {exc}")
+        return 1
 
-    # Check if data files exist
-    if not check_data_files():
+    # Legacy mode: check data files exist
+    if problem_name is None and not check_data_files():
         return 1
 
     # Detect dataset name and initialize logging
-    dataset_name = detect_dataset_name()
+    dataset_name = problem_name or detect_dataset_name()
     log_filepath = setup_logging(dataset_name=dataset_name)
     logger = logging.getLogger(__name__)
 

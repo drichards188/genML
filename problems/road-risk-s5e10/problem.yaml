@@ -1,0 +1,14 @@
+name: road-risk-s5e10
+source:
+  type: kaggle
+  competition: playground-series-s5e10
+description: 'Predicting Road Accident Risk (Kaggle metric: Mean Squared Error)'
+target: accident_risk
+id_column: id
+task: regression
+metric: rmse
+# Column roles carried over from the hints that used to be hardcoded in
+# pipeline/feature_engineering.py for this competition
+columns:
+  numerical: [num_lanes, curvature, speed_limit, num_reported_accidents]
+  categorical: [holiday]

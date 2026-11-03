@@ -8,28 +8,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.genML.pipeline import config
+from src.genML.pipeline import config, context
+from src.genML.pipeline.problem import (
+    find_sample_submission,
+    legacy_spec,
+    locate_data_dir,
+    resolve_problem,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _discover_dataset_paths() -> tuple[Path | None, Path | None]:
-    """Locate train/test CSV files in supported locations."""
-    search_paths = [
-        Path("datasets/current"),
-        Path("datasets"),
-        Path("."),
-    ]
-
-    for base_path in search_paths:
-        train_path = base_path / "train.csv"
-        test_path = base_path / "test.csv"
-
-        if train_path.exists() and test_path.exists():
-            logger.info("Using dataset from: %s", base_path)
-            return train_path, test_path
-
-    return None, None
 
 
 def load_dataset() -> str:
@@ -37,9 +24,9 @@ def load_dataset() -> str:
     Load train/test data, persist them as pickle files for downstream stages,
     and emit a JSON summary.
 
-    Supports two modes:
-    1. Ingestion mode: Uses INGESTION_CONFIG for flexible data loading from databases, APIs, etc.
-    2. Legacy mode: Discovers train.csv/test.csv files (backward compatible)
+    The data comes from the requested problem spec (see pipeline/problem.py).
+    Without a spec, train.csv/test.csv are discovered in datasets/current/,
+    datasets/ or the working directory and every problem field is inferred.
 
     Returns:
         JSON string with dataset summary or error payload.
@@ -49,9 +36,7 @@ def load_dataset() -> str:
         logger.info("Using ingestion pipeline mode")
         return _load_via_ingestion_pipeline()
 
-    # Fall back to legacy CSV discovery mode
-    logger.info("Using legacy CSV discovery mode")
-    return _load_via_legacy_csv()
+    return _load_via_problem_spec()
 
 
 def _load_via_ingestion_pipeline() -> str:
@@ -79,57 +64,64 @@ def _load_via_ingestion_pipeline() -> str:
         )
 
 
-def _load_via_legacy_csv() -> str:
-    """Load data using legacy CSV discovery (backward compatible)."""
-    try:
-        train_path, test_path = _discover_dataset_paths()
+def _load_via_problem_spec() -> str:
+    """Load data for the requested problem spec (or legacy CSV discovery).
 
-        if not train_path or not test_path:
+    Resolves the problem spec against the data, records every inferred field,
+    and saves train/test pickles plus ``resolved_spec.json`` for later stages.
+    """
+    try:
+        spec = context.get_requested_spec() or legacy_spec()
+        try:
+            data_dir = locate_data_dir(spec)
+        except FileNotFoundError as exc:
             return json.dumps(
                 {
-                    "error": (
-                        "train.csv and test.csv files not found. "
-                        "Please place dataset files in datasets/current/ or project root directory."
-                    ),
+                    "error": str(exc),
                     "status": "failed",
-                    "pipeline_mode": "legacy_csv",
+                    "pipeline_mode": "problem_spec" if context.get_requested_spec() else "legacy_csv",
                 }
             )
 
-        train_df = pd.read_csv(train_path)
-        test_df = pd.read_csv(test_path)
+        logger.info("Using dataset from: %s", data_dir)
+        train_df = pd.read_csv(data_dir / "train.csv")
+        test_df = pd.read_csv(data_dir / "test.csv")
+        sample_path = find_sample_submission(data_dir)
+        sample_df = pd.read_csv(sample_path) if sample_path else None
 
-        train_cols = set(train_df.columns)
-        test_cols = set(test_df.columns)
-        train_only_cols = train_cols - test_cols
-
-        id_patterns = {"id", "ID", "Id", "index", "Index"}
-        potential_targets = [col for col in train_only_cols if col not in id_patterns]
-        target_col = potential_targets[0] if potential_targets else None
+        problem = resolve_problem(spec, train_df, test_df, sample_df, data_dir=data_dir)
+        context.set_active_problem(problem)
+        target_col = problem.target
 
         target_rate = None
-        if target_col and target_col in train_df.columns:
-            target_series = train_df[target_col]
-            try:
-                if target_series.dtype in ["object", "category"] or target_series.nunique() <= 20:
-                    target_rate = target_series.value_counts(normalize=True).to_dict()
-                else:
-                    target_rate = {
-                        "mean": float(target_series.mean()),
-                        "std": float(target_series.std()),
-                        "min": float(target_series.min()),
-                        "max": float(target_series.max()),
-                    }
-            except Exception:
-                target_rate = None
+        target_series = train_df[target_col]
+        try:
+            if problem.is_classification:
+                target_rate = {str(k): float(v) for k, v in target_series.value_counts(normalize=True).items()}
+            else:
+                target_rate = {
+                    "mean": float(target_series.mean()),
+                    "std": float(target_series.std()),
+                    "min": float(target_series.min()),
+                    "max": float(target_series.max()),
+                }
+        except Exception:
+            target_rate = None
 
         summary = {
             "status": "success",
+            "problem": problem.name,
+            "data_dir": str(data_dir),
             "train_shape": train_df.shape,
             "test_shape": test_df.shape,
             "train_columns": list(train_df.columns),
             "test_columns": list(test_df.columns),
             "target_column": target_col,
+            "id_column": problem.id_column,
+            "task": problem.task,
+            "metric": problem.metric,
+            "submission_output": problem.output,
+            "inferred": problem.inferred,
             "missing_values": {
                 "train": train_df.isnull().sum().to_dict(),
                 "test": test_df.isnull().sum().to_dict(),
@@ -143,16 +135,16 @@ def _load_via_legacy_csv() -> str:
         test_df.to_pickle(config.DATA_DIR / "test_data.pkl")
 
         with open(config.REPORTS_DIR / "data_exploration_report.json", "w") as f:
-            json.dump(summary, f, indent=2)
+            json.dump(summary, f, indent=2, default=str)
 
-        return json.dumps(summary, indent=2)
+        return json.dumps(summary, indent=2, default=str)
 
     except Exception as exc:
-        logger.exception("Error loading data in legacy CSV mode")
+        logger.exception("Error loading data")
         return json.dumps(
             {
                 "error": f"Error loading data: {exc}",
                 "status": "failed",
-                "pipeline_mode": "legacy_csv",
+                "pipeline_mode": "problem_spec",
             }
         )

@@ -37,7 +37,7 @@ from src.genML.pipeline.optional_dependencies import (
 logger = logging.getLogger(__name__)
 
 
-def optimize_random_forest(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
+def optimize_random_forest(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
     """Optuna objective function for Random Forest hyperparameter optimization."""
     logger.info("[RF Trial %s] Starting Random Forest optimization trial", trial.number)
     logger.info("[RF Trial %s] Input shapes: X=%s, y=%s", trial.number, X.shape, y.shape)
@@ -67,11 +67,11 @@ def optimize_random_forest(trial: optuna.trial.Trial, X, y, problem_type: str, c
     if problem_type == "regression":
         RandomForestRegressorClass = get_random_forest_regressor()
         model = RandomForestRegressorClass(**params)
-        scoring = "neg_mean_squared_error"
+        default_scoring = "neg_mean_squared_error"
     else:
         RandomForestClassifierClass = get_random_forest_classifier()
         model = RandomForestClassifierClass(**params)
-        scoring = "accuracy"
+        default_scoring = "accuracy"
 
     cv_n_jobs = config.MEMORY_CONFIG["cv_n_jobs_limit"] if not is_cuml_available() else 1
 
@@ -80,7 +80,7 @@ def optimize_random_forest(trial: optuna.trial.Trial, X, y, problem_type: str, c
         if memory_gb is not None:
             logger.info("[RF Trial %s] GPU memory before CV: %.2fGB", trial.number, memory_gb)
 
-    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=cv_n_jobs)
+    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring or default_scoring, n_jobs=cv_n_jobs)
     mean_score = scores.mean()
 
     del model
@@ -102,7 +102,7 @@ def optimize_random_forest(trial: optuna.trial.Trial, X, y, problem_type: str, c
     return mean_score
 
 
-def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
+def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
     """Optuna objective function for XGBoost hyperparameter optimization."""
     logger.info("[XGB Trial %s] Starting XGBoost optimization trial", trial.number)
 
@@ -121,11 +121,11 @@ def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
 
     if problem_type == "regression":
         params["objective"] = "reg:squarederror"
-        scoring = "neg_mean_squared_error"
+        default_scoring = "neg_mean_squared_error"
         ModelClass = xgb.XGBRegressor
     else:
-        params["objective"] = "binary:logistic"
-        scoring = "accuracy"
+        params["objective"] = "multi:softprob" if len(np.unique(y)) > 2 else "binary:logistic"
+        default_scoring = "accuracy"
         ModelClass = xgb.XGBClassifier
 
     if is_xgboost_gpu_available() and not config.GPU_CONFIG["force_cpu"]:
@@ -141,7 +141,7 @@ def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
 
     model = ModelClass(**params)
 
-    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
+    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring or default_scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
     mean_score = scores.mean()
 
     del model
@@ -151,13 +151,13 @@ def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
     return mean_score
 
 
-def optimize_linear_model(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
+def optimize_linear_model(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
     """Optuna objective function for linear/logistic regression."""
     alpha = trial.suggest_float("ridge_alpha", 1e-4, 10.0, log=True)
 
     if problem_type == "regression":
         model = Ridge(alpha=alpha, random_state=42)
-        scoring = "neg_mean_squared_error"
+        default_scoring = "neg_mean_squared_error"
     else:
         LinearModel = get_linear_model_classifier()
         # cuML LogisticRegression doesn't support random_state parameter
@@ -170,16 +170,16 @@ def optimize_linear_model(trial: optuna.trial.Trial, X, y, problem_type: str, cv
             model_params['random_state'] = 42
 
         model = LinearModel(**model_params)
-        scoring = "accuracy"
+        default_scoring = "accuracy"
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    scores = cross_val_score(model, X_scaled, y, cv=cv, scoring=scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
+    scores = cross_val_score(model, X_scaled, y, cv=cv, scoring=scoring or default_scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
     return scores.mean()
 
 
-def optimize_catboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
+def optimize_catboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
     """Optuna objective function for CatBoost models."""
     if not CATBOOST_AVAILABLE:
         raise RuntimeError("CatBoost is not installed")
@@ -217,13 +217,13 @@ def optimize_catboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
 
     if problem_type == "regression":
         ModelClass = cb.CatBoostRegressor
-        scoring = "neg_mean_squared_error"
+        default_scoring = "neg_mean_squared_error"
     else:
         ModelClass = cb.CatBoostClassifier
-        scoring = "accuracy"
+        default_scoring = "accuracy"
 
     model = ModelClass(**params)
-    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
+    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring or default_scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
     mean_score = scores.mean()
 
     del model
@@ -232,7 +232,7 @@ def optimize_catboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
     return mean_score
 
 
-def optimize_tabnet(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
+def optimize_tabnet(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
     """Optuna objective function for TabNet models."""
     if not TABNET_AVAILABLE:
         raise RuntimeError("TabNet is not installed")
@@ -272,11 +272,13 @@ def optimize_tabnet(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
                 return self.model.predict(X_test).flatten()
 
         model = TabNetRegressorWrapper(**params)
-        scoring = "neg_mean_squared_error"
+        default_scoring = "neg_mean_squared_error"
     else:
         from sklearn.base import BaseEstimator
 
-        class TabNetClassifierWrapper(BaseEstimator):
+        from sklearn.base import ClassifierMixin
+
+        class TabNetClassifierWrapper(ClassifierMixin, BaseEstimator):
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
                 self.model = None
@@ -285,6 +287,7 @@ def optimize_tabnet(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
                 self.model = TabNetClassifier(**self.kwargs)
                 X_train = X.astype(np.float32)
                 y_train = y.astype(np.int64)
+                self.classes_ = np.unique(y_train)
                 self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
                 return self
 
@@ -292,11 +295,14 @@ def optimize_tabnet(trial: optuna.trial.Trial, X, y, problem_type: str, cv):
                 X_test = X.astype(np.float32)
                 return self.model.predict(X_test)
 
+            def predict_proba(self, X):
+                return self.model.predict_proba(X.astype(np.float32))
+
         model = TabNetClassifierWrapper(**params)
-        scoring = "accuracy"
+        default_scoring = "accuracy"
 
     try:
-        scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+        scores = cross_val_score(model, X, y, cv=cv, scoring=scoring or default_scoring, n_jobs=1)
         mean_score = scores.mean()
     except Exception as exc:
         logger.warning("TabNet optimization failed: %s", exc)

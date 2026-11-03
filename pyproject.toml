@@ -40,3 +40,9 @@ type = "flow"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/genML"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: end-to-end runs on real problem data (deselect with -m 'not slow')",
+]

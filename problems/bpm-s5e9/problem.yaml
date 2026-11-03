@@ -1,0 +1,10 @@
+name: bpm-s5e9
+source:
+  type: kaggle
+  competition: playground-series-s5e9
+description: 'Predicting the Beats-per-Minute of Songs (Kaggle metric: Mean Squared
+  Error)'
+target: BeatsPerMinute
+id_column: id
+task: regression
+metric: rmse

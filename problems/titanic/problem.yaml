@@ -1,0 +1,10 @@
+name: titanic
+source:
+  type: kaggle
+  competition: titanic
+description: 'Titanic - Machine Learning from Disaster (Kaggle metric: Categorization
+  Accuracy)'
+target: Survived
+id_column: PassengerId
+task: binary
+metric: accuracy

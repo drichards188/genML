@@ -13,9 +13,21 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-from src.genML.pipeline import config
+from src.genML.pipeline import config, context
+from src.genML.pipeline.targets import prepare_target
 
 logger = logging.getLogger(__name__)
+
+
+def _deep_merge(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge ``overrides`` into a copy of ``base``."""
+    merged = dict(base)
+    for key, value in (overrides or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _normalize_ai_feature_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -350,13 +362,7 @@ def engineer_features() -> str:
             "max_features": 200,
             "enable_feature_selection": True,
             "feature_importance_threshold": 0.001,
-            "manual_type_hints": {
-                "num_lanes": "numerical",
-                "curvature": "numerical",
-                "speed_limit": "numerical",
-                "holiday": "categorical",
-                "num_reported_accidents": "numerical",
-            },
+            "manual_type_hints": {},
             "interaction_pairs": [],
             "numerical_config": {
                 "enable_scaling": True,
@@ -384,6 +390,18 @@ def engineer_features() -> str:
             },
         }
 
+        problem = context.ensure_problem(train_df, test_df)
+        target_col = problem.target
+
+        # Column roles declared in the spec; drop columns and the ID are excluded
+        type_hints = dict(problem.column_types)
+        for column in problem.drop_columns:
+            type_hints[column] = "id"
+        if problem.id_column and problem.id_column in train_df.columns:
+            type_hints[problem.id_column] = "id"
+        config_dict["manual_type_hints"] = type_hints
+        config_dict = _deep_merge(config_dict, problem.feature_engineering)
+
         feature_engine = AutoFeatureEngine(config_dict)
         analysis_results = feature_engine.analyze_data(train_df)
 
@@ -391,20 +409,7 @@ def engineer_features() -> str:
         if config.PROGRESS_TRACKER:
             config.PROGRESS_TRACKER.track_stage_progress(2, 20, "Analyzing data types and patterns")
 
-        train_cols = set(train_df.columns)
-        test_cols = set(test_df.columns)
-        train_only_cols = train_cols - test_cols
-        id_patterns = {"id", "ID", "Id", "index", "Index"}
-        potential_targets = [col for col in train_only_cols if col not in id_patterns]
-        target_col = potential_targets[0] if potential_targets else None
-
-        if target_col is None and analysis_results.get("target_candidates"):
-            target_col = analysis_results["target_candidates"][0]
-
-        if target_col:
-            print(f"Detected target column: {target_col}")
-        else:
-            print("Warning: Could not detect target column")
+        print(f"Target column: {target_col} ({problem.task}, metric {problem.metric})")
 
         # Track progress: Fitting feature engine
         if config.PROGRESS_TRACKER:
@@ -539,67 +544,17 @@ def engineer_features() -> str:
             dtype=np.float32, copy=False
         )
 
-        if target_col and target_col in train_df.columns:
-            train_target = train_df[target_col].values
-        else:
-            train_target = train_df.iloc[:, -1].values
-
-        target_min = np.min(train_target)
-        target_max = np.max(train_target)
-        apply_logit_transform = False
-
-        target_series = pd.Series(train_target)
-        unique_values = pd.unique(target_series)
-        unique_count = len(unique_values)
-        unique_ratio = unique_count / max(len(target_series), 1)
-
-        is_bool_like = pd.api.types.is_bool_dtype(target_series)
-        is_categorical_like = pd.api.types.is_categorical_dtype(target_series) or target_series.dtype == object
-
-        unique_numeric = pd.to_numeric(pd.Series(unique_values), errors="coerce")
-        numeric_mask = ~unique_numeric.isna()
-        integer_like_numeric = (
-            numeric_mask.any()
-            and np.allclose(unique_numeric[numeric_mask], np.round(unique_numeric[numeric_mask]))
+        train_target, transform_info = prepare_target(
+            train_df[target_col],
+            task=problem.task,
+            metric_transform=problem.metric_obj.target_transform,
+            positive_class=problem.positive_class,
         )
-
-        is_integer_like = pd.api.types.is_integer_dtype(target_series) or integer_like_numeric
-
-        likely_classification = bool(
-            is_bool_like
-            or is_categorical_like
-            or unique_count <= 20
-            or (unique_ratio <= 0.05 and is_integer_like)
-        )
-
-        if target_min >= 0 and target_max <= 1 and target_max > target_min and not likely_classification:
-            apply_logit_transform = True
-            print(f"Detected bounded target in [{target_min:.3f}, {target_max:.3f}]")
-            print("Applying logit transformation: logit(y) = log(y / (1-y))")
-
-            epsilon = 1e-7
-            train_target_clipped = np.clip(train_target, epsilon, 1 - epsilon)
-            train_target_transformed = np.log(train_target_clipped / (1 - train_target_clipped))
-
-            transform_info = {
-                "applied": True,
-                "type": "logit",
-                "original_min": float(target_min),
-                "original_max": float(target_max),
-                "epsilon": epsilon,
-            }
-            joblib.dump(transform_info, config.FEATURES_DIR / "target_transform.pkl")
-            train_target = train_target_transformed
-        else:
-            transform_info = {
-                "applied": False,
-                "reason": "classification_like_target" if likely_classification else "unbounded_target",
-            }
-            joblib.dump(transform_info, config.FEATURES_DIR / "target_transform.pkl")
-            if likely_classification:
-                print("Target transformation: None (classification target detected)")
-            else:
-                print("Target transformation: None (unbounded target)")
+        joblib.dump(transform_info, config.FEATURES_DIR / "target_transform.pkl")
+        if transform_info.get("classes") is not None:
+            problem.classes = transform_info["classes"]
+            context.set_active_problem(problem)
+        print(f"Target preparation: {transform_info.get('type') or 'none'}")
 
         # Track progress: Saving features
         if config.PROGRESS_TRACKER:

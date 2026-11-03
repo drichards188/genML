@@ -170,8 +170,8 @@ class DataTypeAnalyzer:
                 analysis['confidence'] = 0.9
                 analysis['patterns'].append('continuous_numeric')
         else:
-            # Non-numeric data
-            if analysis['unique_percentage'] < self.cardinality_threshold:
+            # Non-numeric data: short labels are categorical whatever their cardinality
+            if analysis['unique_percentage'] < self.cardinality_threshold or not self._could_be_free_text(non_null_series):
                 analysis['detected_type'] = 'categorical'
                 analysis['confidence'] = 0.8
                 analysis['patterns'].append('low_cardinality_categorical')
@@ -309,11 +309,33 @@ class DataTypeAnalyzer:
 
         return result
 
+    @staticmethod
+    def _could_be_free_text(series: pd.Series, sample_size: int = 5000) -> bool:
+        """AutoGluon's text gate (``check_if_nlp_feature``).
+
+        A string column can only be free text if it is not extremely repetitive
+        (unique ratio > 0.01) and its distinct values average at least 3 words.
+        """
+        values = series.dropna().astype(str)
+        if len(values) == 0:
+            return False
+        if len(values) > sample_size:
+            values = values.sample(sample_size, random_state=0)
+        unique_values = values.unique()
+        if len(unique_values) / len(values) <= 0.01:
+            return False
+        avg_words = pd.Series(unique_values).str.split().str.len().mean()
+        return bool(avg_words >= 3)
+
     def _check_text_patterns(self, series: pd.Series, col_name: str) -> Dict[str, Any]:
         """Check if series contains text data."""
         result = {'is_text': False, 'confidence': 0.0, 'patterns': []}
 
         if series.dtype != 'object':
+            return result
+
+        # Short labels ("Online Retail", "Bachelor's") are categories, not text
+        if not self._could_be_free_text(series):
             return result
 
         # Check uniqueness
@@ -430,6 +452,11 @@ class DataTypeAnalyzer:
 
             current_type = analysis['column_types'][col]['detected_type']
             if current_type == forced_type:
+                # Still record that the type was declared rather than inferred
+                column_info = analysis['column_types'][col]
+                column_info['confidence'] = 1.0
+                if 'manual_override' not in column_info['patterns']:
+                    column_info['patterns'].append('manual_override')
                 continue
 
             # Remove column from current type lists

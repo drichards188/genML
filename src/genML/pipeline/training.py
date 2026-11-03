@@ -48,7 +48,7 @@ from src.genML.gpu_utils import (
     is_lightgbm_gpu_available,
     get_lightgbm_params,
 )
-from src.genML.pipeline import config
+from src.genML.pipeline import config, context
 from src.genML.pipeline.ai_tuning import (
     build_ai_tuning_override_details,
     extract_override_values,
@@ -190,6 +190,37 @@ def _categorize_models_by_resource(
     return cpu_models, gpu_models
 
 
+def _build_cv(problem, problem_type: str):
+    """Cross-validation splitter from the resolved problem (fixed seed per problem)."""
+    cv_config = dict(problem.cv) if problem is not None else {}
+    n_splits = int(cv_config.get("n_splits", 5))
+    random_state = int(cv_config.get("random_state", 42))
+    shuffle = bool(cv_config.get("shuffle", True))
+    method = cv_config.get("method") or ("kfold" if problem_type == "regression" else "stratified_kfold")
+    if method == "stratified_kfold":
+        return StratifiedKFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
+    if method == "kfold":
+        return KFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
+    raise ValueError(f"Unsupported cv.method '{method}' (use 'stratified_kfold' or 'kfold')")
+
+
+def _filter_models(models: Dict[str, Any], requested) -> Dict[str, Any]:
+    """Keep only the models a problem spec asks for, in the spec's order."""
+    if not requested:
+        return models
+    lookup = {name.lower(): name for name in models}
+    selected = OrderedDict()
+    for name in requested:
+        key = lookup.get(str(name).lower())
+        if key is None:
+            logger.warning("Model '%s' from the problem spec is not available; skipping", name)
+            continue
+        selected[key] = models[key]
+    if not selected:
+        raise ValueError(f"None of the requested models {requested} are available: {list(models)}")
+    return selected
+
+
 def _train_single_model(
     name: str,
     model_factory: Callable,
@@ -282,15 +313,15 @@ def _train_single_model(
         # Select appropriate optimization function
         if name == 'Random Forest':
             logger.info(f"[Training] Random Forest - Entering hyperparameter optimization")
-            objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv)
+            objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
         elif name == 'XGBoost':
-            objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv)
+            objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
         elif name == 'CatBoost':
-            objective = lambda trial: optimize_catboost(trial, X_train, y_train, problem_type, cv)
+            objective = lambda trial: optimize_catboost(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
         elif name == 'TabNet':
-            objective = lambda trial: optimize_tabnet(trial, X_train, y_train, problem_type, cv)
+            objective = lambda trial: optimize_tabnet(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
         elif name == 'Logistic Regression' or name == 'Linear Regression':
-            objective = lambda trial: optimize_linear_model(trial, X_train, y_train, problem_type, cv)
+            objective = lambda trial: optimize_linear_model(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
         else:
             objective = None
 
@@ -484,9 +515,20 @@ def train_model_pipeline() -> str:
         )
 
         # Automatically detect problem type
-        logger.info("Detecting problem type...")
-        problem_type = detect_problem_type()
-        logger.info(f"Problem type detected: {problem_type}")
+        problem = context.current_problem()
+        if problem is not None:
+            problem_type = problem.problem_type
+            task = problem.task
+            logger.info(f"Problem '{problem.name}': {task}, metric {problem.metric}")
+        else:
+            logger.info("No resolved problem; detecting problem type...")
+            problem_type = detect_problem_type()
+            task = (
+                "regression" if problem_type == "regression"
+                else ("binary" if len(np.unique(y_train)) <= 2 else "multiclass")
+            )
+            logger.info(f"Problem type detected: {problem_type} ({task})")
+        is_multiclass = task == "multiclass"
 
         # Get GPU configuration for logging
         gpu_config = get_gpu_config()
@@ -568,7 +610,11 @@ def train_model_pipeline() -> str:
 
         def make_xgb_classifier_factory():
             def factory(overrides=None):
-                params = {'random_state': 42, 'objective': 'binary:logistic', 'eval_metric': 'logloss'}
+                params = {'random_state': 42}
+                if is_multiclass:
+                    params.update({'objective': 'multi:softprob', 'eval_metric': 'mlogloss'})
+                else:
+                    params.update({'objective': 'binary:logistic', 'eval_metric': 'logloss'})
                 params.update(get_xgboost_params())
                 if overrides:
                     params.update(overrides)
@@ -596,11 +642,14 @@ def train_model_pipeline() -> str:
                     })
                 else:
                     # Use GPU-compatible metrics when on GPU (AUC not supported on GPU)
-                    eval_metric = 'Logloss' if is_gpu else 'AUC'
-                    params.update({
-                        'loss_function': 'Logloss',
-                        'eval_metric': eval_metric
-                    })
+                    if is_multiclass:
+                        params.update({'loss_function': 'MultiClass', 'eval_metric': 'MultiClass'})
+                    else:
+                        eval_metric = 'Logloss' if is_gpu else 'AUC'
+                        params.update({
+                            'loss_function': 'Logloss',
+                            'eval_metric': eval_metric
+                        })
 
                 if is_gpu:
                     params.update({'task_type': 'GPU', 'devices': '0'})
@@ -666,7 +715,9 @@ def train_model_pipeline() -> str:
 
                     return TabNetRegressorWrapper(**params)
                 else:
-                    class TabNetClassifierWrapper(BaseEstimator):
+                    from sklearn.base import ClassifierMixin
+
+                    class TabNetClassifierWrapper(ClassifierMixin, BaseEstimator):
                         def __init__(self, **kwargs):
                             self.kwargs = kwargs
                             self.model = None
@@ -675,12 +726,16 @@ def train_model_pipeline() -> str:
                             self.model = TabNetClassifier(**self.kwargs)
                             X_train = X.astype(np.float32)
                             y_train = y.astype(np.int64)
+                            self.classes_ = np.unique(y_train)
                             self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
                             return self
 
                         def predict(self, X):
                             X_test = X.astype(np.float32)
                             return self.model.predict(X_test)
+
+                        def predict_proba(self, X):
+                            return self.model.predict_proba(X.astype(np.float32))
 
                     return TabNetClassifierWrapper(**params)
 
@@ -737,11 +792,6 @@ def train_model_pipeline() -> str:
                 models['CatBoost'] = make_catboost_factory(cb.CatBoostRegressor)
             if TABNET_AVAILABLE:
                 models['TabNet'] = make_tabnet_factory(TabNetRegressor)  # Neural network for tabular data (GPU if available)
-            # Use regular KFold for regression (no need to preserve class distribution)
-            cv = KFold(n_splits=5, shuffle=True, random_state=42)
-            # Use regression scoring metric
-            scoring_metric = 'neg_mean_squared_error'
-            best_score = float('-inf')  # Higher (less negative) is better for MSE
         else:  # classification
             # cuML uses different parameter names than sklearn
             # cuML: seed, sklearn: random_state
@@ -774,7 +824,7 @@ def train_model_pipeline() -> str:
                     'n_estimators': 200,
                     'learning_rate': 0.05,
                     'n_jobs': lightgbm_n_jobs_default,
-                    'objective': 'binary',
+                    'objective': 'multiclass' if is_multiclass else 'binary',
                     'verbosity': -1,
                 }
                 if n_samples <= 1500:
@@ -808,11 +858,32 @@ def train_model_pipeline() -> str:
                 models['CatBoost'] = make_catboost_factory(cb.CatBoostClassifier)
             if TABNET_AVAILABLE:
                 models['TabNet'] = make_tabnet_factory(TabNetClassifier)  # Neural network for tabular data (GPU if available)
-            # Use StratifiedKFold to preserve class distribution in each fold
-            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-            # Use classification scoring metric
-            scoring_metric = 'accuracy'
-            best_score = 0  # Higher is better for accuracy
+
+        # Metric, CV and budget come from the resolved problem spec
+        cv = _build_cv(problem, problem_type)
+        if problem is not None:
+            scoring_metric = problem.scoring
+            metric_name = problem.metric
+        else:
+            scoring_metric = 'neg_mean_squared_error' if problem_type == 'regression' else 'accuracy'
+            metric_name = 'mse' if problem_type == 'regression' else 'accuracy'
+        print(f"Optimizing for: {metric_name} (CV scores are higher-is-better)")
+        best_score = float('-inf')
+
+        models = _filter_models(models, problem.models if problem is not None else None)
+        models_to_tune = list(config.TUNING_CONFIG['models_to_tune'])
+        tuning_enabled = config.TUNING_CONFIG['enabled']
+        budget = problem.budget if problem is not None else {}
+        if 'n_trials' in budget:
+            global_tuning_trials = int(budget['n_trials'])
+            per_model_tuning_limits = {}
+        if 'timeout_per_model' in budget:
+            global_tuning_timeout = int(budget['timeout_per_model'])
+            per_model_tuning_limits = {}
+        if budget.get('tuning') is False:
+            tuning_enabled = False
+        if budget:
+            print(f"Budget from problem spec: {budget}")
 
         model_selection_summary = {'applied': False}
         guidance_payload = load_model_selection_guidance()
@@ -823,7 +894,7 @@ def train_model_pipeline() -> str:
         )
         models = ordered_models
         if tuned_models_list is not None:
-            config.TUNING_CONFIG['models_to_tune'] = tuned_models_list
+            models_to_tune = tuned_models_list
         if selection_summary.get('applied'):
             model_selection_summary = selection_summary
             if selection_summary.get('recommended_order'):
@@ -907,8 +978,8 @@ def train_model_pipeline() -> str:
                         problem_type=problem_type,
                         cv=cv,
                         scoring_metric=scoring_metric,
-                        tuning_enabled=config.TUNING_CONFIG['enabled'],
-                        models_to_tune=config.TUNING_CONFIG['models_to_tune'],
+                        tuning_enabled=tuning_enabled,
+                        models_to_tune=models_to_tune,
                         ai_model_overrides=ai_model_overrides,
                         per_model_tuning_limits=per_model_tuning_limits,
                         global_tuning_trials=global_tuning_trials,
@@ -958,8 +1029,8 @@ def train_model_pipeline() -> str:
                         problem_type=problem_type,
                         cv=cv,
                         scoring_metric=scoring_metric,
-                        tuning_enabled=config.TUNING_CONFIG['enabled'],
-                        models_to_tune=config.TUNING_CONFIG['models_to_tune'],
+                        tuning_enabled=tuning_enabled,
+                        models_to_tune=models_to_tune,
                         ai_model_overrides=ai_model_overrides,
                         per_model_tuning_limits=per_model_tuning_limits,
                         global_tuning_trials=global_tuning_trials,
@@ -1002,8 +1073,8 @@ def train_model_pipeline() -> str:
                         problem_type=problem_type,
                         cv=cv,
                         scoring_metric=scoring_metric,
-                        tuning_enabled=config.TUNING_CONFIG['enabled'],
-                        models_to_tune=config.TUNING_CONFIG['models_to_tune'],
+                        tuning_enabled=tuning_enabled,
+                        models_to_tune=models_to_tune,
                         ai_model_overrides=ai_model_overrides,
                         per_model_tuning_limits=per_model_tuning_limits,
                         global_tuning_trials=global_tuning_trials,
@@ -1153,7 +1224,8 @@ def train_model_pipeline() -> str:
                     # Check if ensemble beats best individual model
                     if ensemble_mean_score > best_score:
                         print(f"✅ Stacking Ensemble improves over best individual model!")
-                        print(f"   Improvement: {((ensemble_mean_score - best_score) / abs(best_score) * 100):.2f}%")
+                        if best_score not in (0, float('-inf')):
+                            print(f"   Improvement: {((ensemble_mean_score - best_score) / abs(best_score) * 100):.2f}%")
                         best_score = ensemble_mean_score
                         best_model_name = 'Stacking Ensemble'
                         best_model_factory = None
@@ -1161,7 +1233,8 @@ def train_model_pipeline() -> str:
                         best_model_object = ensemble
                     else:
                         print(f"Individual model {best_model_name} still wins")
-                        print(f"   Difference: {((best_score - ensemble_mean_score) / abs(best_score) * 100):.2f}%")
+                        if best_score != 0:
+                            print(f"   Difference: {((best_score - ensemble_mean_score) / abs(best_score) * 100):.2f}%")
                         # Release ensemble estimators aggressively when not selected
                         del ensemble
 
@@ -1340,7 +1413,8 @@ def train_model_pipeline() -> str:
         model_results = {
             "status": "success",
             "problem_type": problem_type,
-            "scoring_metric": scoring_metric,
+            "scoring_metric": metric_name,
+            "task": task,
             "best_model": best_model_name,
             "best_score": float(best_score),
             "all_results": results,
