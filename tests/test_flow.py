@@ -1,5 +1,5 @@
 """
-Tests for CrewAI Flow orchestration.
+Tests for pipeline orchestration (flow.py).
 
 Tests the MLPipelineFlow class and its stage methods that orchestrate
 the complete machine learning pipeline.
@@ -139,7 +139,14 @@ class TestMLPipelineFlow:
 
         # Verify that stages have proper decorators
         # This is more of a structural test
-        assert getattr(flow.load_data_task, '__is_start_method__', False)
+        assert flow.STAGES == (
+            'load_data_task',
+            'feature_engineering_task',
+            'model_selection_task',
+            'model_training_task',
+            'prediction_task',
+        )
+        assert all(callable(getattr(flow, stage)) for stage in flow.STAGES)
 
     def test_successful_data_loading_returns_success_status(self, sample_train_df, sample_test_df, temp_dataset_dir, monkeypatch):
         """Test that successful data loading returns success status"""

@@ -5,6 +5,7 @@ pytest>=7.4.0
 pytest-cov>=4.1.0
 pytest-mock>=3.11.0
 pytest-timeout>=2.1.0
+httpx>=0.24.0  # FastAPI TestClient for API tests
 
 # Code formatting and linting
 black>=23.0.0

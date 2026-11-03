@@ -68,9 +68,15 @@ class ProgressTracker:
         }
 
         # Set up progress directory
-        # Resolve once so background writers (resource monitor thread) keep writing
-        # to the same place even if the working directory changes later
-        self.progress_dir = Path("outputs/progress").resolve()
+        # Live progress goes to <outputs>/progress/ (watched by the dashboard). With
+        # an active run, <outputs> is the run's outputs root. Resolved once so
+        # background writers keep writing to the same place if cwd changes.
+        from src.genML.pipeline import config as pipeline_config
+
+        active_run = pipeline_config.ACTIVE_RUN
+        outputs_root = active_run.root if active_run is not None else Path("outputs")
+        self.run_dir = active_run.run_dir if active_run is not None else None
+        self.progress_dir = (Path(outputs_root) / "progress").resolve()
         self.progress_dir.mkdir(parents=True, exist_ok=True)
 
         self.progress_file = self.progress_dir / "current_run.json"
@@ -333,6 +339,9 @@ class ProgressTracker:
                 data = json.load(src)
             with open(archive_file, 'w') as dst:
                 json.dump(data, dst, indent=2)
+            if self.run_dir is not None:
+                with open(Path(self.run_dir) / "progress.json", 'w') as dst:
+                    json.dump(data, dst, indent=2)
             logger.info(f"Run archived to {archive_file}")
         except Exception as e:
             logger.error(f"Failed to archive run: {e}")

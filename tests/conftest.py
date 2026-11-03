@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 
 from src.genML.pipeline import config as pipeline_config
+from src.genML.pipeline import context as pipeline_context
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +37,12 @@ def isolate_outputs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pipeline_config, "AI_TUNING_OVERRIDE_PATH", outputs_dir / "reports" / "ai_tuning_overrides.json"
     )
+    monkeypatch.setattr(pipeline_config, "ACTIVE_RUN", None)
+    monkeypatch.setattr(pipeline_config, "PROGRESS_TRACKER", None)
+    monkeypatch.setattr("src.genML.run_context.OUTPUTS_ROOT", outputs_dir)
+    pipeline_context.reset()
     yield tmp_path
+    pipeline_context.reset()
 
 
 @pytest.fixture

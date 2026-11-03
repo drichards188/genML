@@ -31,37 +31,7 @@ def load_dataset() -> str:
     Returns:
         JSON string with dataset summary or error payload.
     """
-    # Check if ingestion pipeline is configured
-    if config.INGESTION_CONFIG is not None:
-        logger.info("Using ingestion pipeline mode")
-        return _load_via_ingestion_pipeline()
-
     return _load_via_problem_spec()
-
-
-def _load_via_ingestion_pipeline() -> str:
-    """Load data using the flexible ingestion pipeline."""
-    try:
-        from .ingestion import run_ingestion_pipeline
-
-        result_json = run_ingestion_pipeline(config.INGESTION_CONFIG)
-
-        # Parse result to save report
-        result = json.loads(result_json)
-        with open(config.REPORTS_DIR / "data_exploration_report.json", "w") as f:
-            json.dump(result, f, indent=2)
-
-        return result_json
-
-    except Exception as exc:
-        logger.exception("Error in ingestion pipeline")
-        return json.dumps(
-            {
-                "error": f"Ingestion pipeline failed: {exc}",
-                "status": "failed",
-                "pipeline_mode": "ingestion",
-            }
-        )
 
 
 def _load_via_problem_spec() -> str:

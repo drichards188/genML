@@ -8,6 +8,7 @@ of the ML pipeline execution.
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -19,6 +20,54 @@ from fastapi.staticfiles import StaticFiles
 from .websocket_manager import WebSocketManager
 
 logger = logging.getLogger(__name__)
+
+OUTPUTS_DIR = Path("outputs")
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _safe(name: Optional[str], label: str) -> Optional[str]:
+    """Reject path-traversal in problem / run identifiers."""
+    if name is None:
+        return None
+    if not _SAFE_NAME.match(name) or name in (".", ".."):
+        raise HTTPException(status_code=400, detail=f"Invalid {label}")
+    return name
+
+
+def _read_json(path: Path):
+    with open(path, "r") as handle:
+        return json.load(handle)
+
+
+def _latest_run_dir() -> Optional[Path]:
+    summaries = sorted(OUTPUTS_DIR.glob("*/*/run.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return summaries[0].parent if summaries else None
+
+
+def _run_dir(problem: Optional[str], run_id: Optional[str], progress_file: Path) -> Optional[Path]:
+    """Folder of the requested run; defaults to the live run, then the newest run."""
+    problem, run_id = _safe(problem, "problem"), _safe(run_id, "run_id")
+    if problem and run_id:
+        candidate = OUTPUTS_DIR / problem / run_id
+        if not candidate.is_dir():
+            raise HTTPException(status_code=404, detail=f"Run {problem}/{run_id} not found")
+        return candidate
+    if progress_file.exists():
+        try:
+            live = _read_json(progress_file)
+            candidate = OUTPUTS_DIR / str(live.get("dataset_name")) / str(live.get("run_id"))
+            if candidate.is_dir():
+                return candidate
+        except Exception:
+            pass
+    return _latest_run_dir()
+
+
+def _reports_dir(problem: Optional[str], run_id: Optional[str], progress_file: Path) -> Path:
+    run_dir = _run_dir(problem, run_id, progress_file)
+    if run_dir is not None and (run_dir / "reports").is_dir():
+        return run_dir / "reports"
+    return OUTPUTS_DIR / "reports"  # legacy flat layout
 
 
 def create_app() -> FastAPI:
@@ -90,6 +139,44 @@ def create_app() -> FastAPI:
             logger.error(f"Failed to read progress file: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/api/problems")
+    async def get_problems():
+        """Problems that have run folders, with run counts and the latest run."""
+        problems = []
+        for problem_dir in sorted(p for p in OUTPUTS_DIR.iterdir() if p.is_dir()) if OUTPUTS_DIR.exists() else []:
+            summaries = sorted(problem_dir.glob("*/run.json"), reverse=True)
+            if not summaries:
+                continue
+            latest = _read_json(summaries[0])
+            problems.append({
+                "problem": problem_dir.name,
+                "runs": len(summaries),
+                "latest_run": latest.get("run_id"),
+                "latest_status": latest.get("status"),
+                "metric": latest.get("metric"),
+            })
+        return problems
+
+    @app.get("/api/problems/{problem}/runs")
+    async def get_problem_runs(problem: str):
+        """Run summaries (run.json) for one problem, newest first."""
+        problem_dir = OUTPUTS_DIR / _safe(problem, "problem")
+        runs = []
+        for summary_file in sorted(problem_dir.glob("*/run.json"), reverse=True):
+            try:
+                runs.append(_read_json(summary_file))
+            except Exception as exc:
+                logger.warning(f"Failed to read {summary_file}: {exc}")
+        return runs
+
+    @app.get("/api/problems/{problem}/runs/{run_id}")
+    async def get_problem_run(problem: str, run_id: str):
+        """Summary of one run."""
+        summary_file = OUTPUTS_DIR / _safe(problem, "problem") / _safe(run_id, "run_id") / "run.json"
+        if not summary_file.exists():
+            raise HTTPException(status_code=404, detail=f"Run {problem}/{run_id} not found")
+        return _read_json(summary_file)
+
     @app.get("/api/runs")
     async def get_runs():
         """Get list of all pipeline runs."""
@@ -145,10 +232,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/reports")
-    async def list_reports():
-        """List available report files."""
+    async def list_reports(problem: Optional[str] = None, run_id: Optional[str] = None):
+        """List report files of a run (default: the live or newest run)."""
         try:
-            reports_dir = Path("outputs/reports")
+            reports_dir = _reports_dir(problem, run_id, progress_file)
             if not reports_dir.exists():
                 return []
 
@@ -161,26 +248,29 @@ def create_app() -> FastAPI:
                 })
 
             return reports
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Failed to list reports: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/reports/{report_name}")
-    async def get_report(report_name: str):
+    async def get_report(report_name: str, problem: Optional[str] = None, run_id: Optional[str] = None):
         """Get a specific report file."""
         try:
             # Add .json extension if not provided
             if not report_name.endswith('.json'):
                 report_name += '.json'
 
-            report_file = Path(f"outputs/reports/{report_name}")
+            reports_dir = _reports_dir(problem, run_id, progress_file)
+            report_file = reports_dir / report_name
+
+            # Security check: ensure file is within reports directory
+            if not report_file.resolve().is_relative_to(reports_dir.resolve()):
+                raise HTTPException(status_code=403, detail="Access denied")
 
             if not report_file.exists():
                 raise HTTPException(status_code=404, detail=f"Report {report_name} not found")
-
-            # Security check: ensure file is within reports directory
-            if not report_file.resolve().is_relative_to(Path("outputs/reports").resolve()):
-                raise HTTPException(status_code=403, detail="Access denied")
 
             with open(report_file, 'r') as f:
                 return json.load(f)
@@ -195,10 +285,10 @@ def create_app() -> FastAPI:
     async def get_log(run_id: str):
         """Get log file for a specific run."""
         try:
-            logs_dir = Path("outputs/logs")
-
-            # Find log file matching the run_id
-            log_files = list(logs_dir.glob(f"*{run_id}*.log"))
+            _safe(run_id, "run_id")
+            # Per-run log first, then the legacy outputs/logs folder
+            log_files = list(OUTPUTS_DIR.glob(f"*/{run_id}/pipeline.log"))
+            log_files += list((OUTPUTS_DIR / "logs").glob(f"*{run_id}*.log"))
 
             if not log_files:
                 raise HTTPException(status_code=404, detail=f"Log for run {run_id} not found")
@@ -223,10 +313,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/models")
-    async def get_models_comparison():
-        """Get model comparison data from the latest training report."""
+    async def get_models_comparison(problem: Optional[str] = None, run_id: Optional[str] = None):
+        """Model comparison data from a run's training report (default: live or newest run)."""
         try:
-            report_file = Path("outputs/reports/model_training_report.json")
+            report_file = _reports_dir(problem, run_id, progress_file) / "model_training_report.json"
 
             if not report_file.exists():
                 raise HTTPException(status_code=404, detail="Model training report not found")
@@ -240,6 +330,7 @@ def create_app() -> FastAPI:
                 "best_model": data.get("best_model"),
                 "best_score": data.get("best_score"),
                 "scoring_metric": data.get("scoring_metric"),
+                "task": data.get("task"),
                 "all_results": data.get("all_results", {}),
                 "gpu_used": data.get("gpu_acceleration", {}).get("gpu_used_for_best_model", False)
             }

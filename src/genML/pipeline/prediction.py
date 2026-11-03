@@ -54,13 +54,18 @@ def generate_predictions() -> str:
             print(f"⚠️  Submission check: {warning}")
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        submissions_dir = SUBMISSIONS_DIR.resolve()
-        submissions_dir.mkdir(parents=True, exist_ok=True)
-        main_file = submissions_dir / "submission.csv"
-        timestamped_file = submissions_dir / f"submission_{problem.name}_{timestamp}.csv"
+        run = config.ACTIVE_RUN
+        if run is not None:
+            # Per-run submission plus a "latest" copy next to the problem's runs
+            main_file = run.submission_file
+            timestamped_file = run.problem_dir / "submission_latest.csv"
+        else:
+            submissions_dir = SUBMISSIONS_DIR.resolve()
+            main_file = submissions_dir / "submission.csv"
+            timestamped_file = submissions_dir / f"submission_{problem.name}_{timestamp}.csv"
+        main_file.parent.mkdir(parents=True, exist_ok=True)
         submission_df.to_csv(main_file, index=False)
         submission_df.to_csv(timestamped_file, index=False)
-        submission_df.to_csv(config.PREDICTIONS_DIR / f'submission_{timestamp}.csv', index=False)
 
         submission_results = {
             "status": "success",

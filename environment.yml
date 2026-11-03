@@ -29,5 +29,4 @@ dependencies:
   # Pip packages (not available in conda)
   - pip
   - pip:
-      - crewai[tools]>=0.193.2,<1.0.0
       - optuna>=3.0.0
