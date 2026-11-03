@@ -41,7 +41,7 @@ This will:
 - Install Python 3.10-3.12
 - Install RAPIDS cuML with CUDA dependencies
 - Install all ML libraries (pandas, scikit-learn, xgboost, etc.)
-- Install CrewAI and Optuna via pip
+- Install Optuna via pip
 
 ### 3. Activate the Environment
 
@@ -59,7 +59,7 @@ python -c "import cuml; print(f'cuML version: {cuml.__version__}')"
 python -c "import cuml; from cuml.common.device_selection import using_device_type; print(f'GPU available: {using_device_type(\"gpu\")}')"
 
 # Check other packages
-python -c "import crewai, pandas, xgboost, optuna; print('All packages loaded successfully')"
+python -c "import pandas, xgboost, lightgbm, catboost, optuna; print('All packages loaded successfully')"
 ```
 
 ## Common Issues
