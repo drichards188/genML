@@ -24,6 +24,26 @@ class SubmissionValidationError(ValueError):
     pass
 
 
+class PrecomputedPredictions:
+    """Adapter so stored test predictions can be used like a fitted model.
+
+    Holds a class-probability matrix (classification) or model-scale values
+    (regression), e.g. fold-averaged or ensembled predictions from the OOF stage.
+    """
+
+    def __init__(self, predictions: np.ndarray, task: str):
+        self.predictions = np.asarray(predictions)
+        self.task = task
+
+    def predict(self, X=None):
+        if self.task == "regression":
+            return self.predictions
+        return np.argmax(self.predictions, axis=1)
+
+    def predict_proba(self, X=None):
+        return self.predictions
+
+
 def _class_column_order(target_columns: List[str], classes: List[Any]) -> List[int]:
     """Map per-class submission columns to class indices by name."""
     by_name = {str(c): i for i, c in enumerate(classes)}

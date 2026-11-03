@@ -322,8 +322,8 @@ class CategoricalProcessor(BaseProcessor):
         # Handle missing values and convert to string
         data_filled = data.fillna('MISSING').astype(str)
 
-        # Handle unseen categories
-        data_cleaned = data_filled.apply(lambda x: x if x in self.label_encoder.classes_ else 'UNKNOWN')
+        # Handle unseen categories (vectorized; per-row apply is slow on large data)
+        data_cleaned = data_filled.where(data_filled.isin(self.label_encoder.classes_), 'UNKNOWN')
 
         # Label encoding
         try:
@@ -349,7 +349,7 @@ class CategoricalProcessor(BaseProcessor):
 
         # Rarity indicator
         if self.enable_rarity:
-            is_rare = data_filled.map(lambda x: self.value_counts.get(x, 0) < self.min_frequency)
+            is_rare = data_filled.map(self.value_counts).fillna(0) < self.min_frequency
             result[f"{base_name}_is_rare"] = is_rare.astype(int)
 
         # Missing indicator

@@ -49,6 +49,9 @@ from src.genML.gpu_utils import (
     get_lightgbm_params,
 )
 from src.genML.pipeline import config, context
+from src.genML.pipeline.ensemble import hill_climb, stack
+from src.genML.pipeline.oof import ExperimentStore, fit_oof, load_or_make_folds, predict_matrix
+from src.genML.pipeline.targets import inverse_regression
 from src.genML.pipeline.ai_tuning import (
     build_ai_tuning_override_details,
     extract_override_values,
@@ -219,6 +222,144 @@ def _filter_models(models: Dict[str, Any], requested) -> Dict[str, Any]:
     if not selected:
         raise ValueError(f"None of the requested models {requested} are available: {list(models)}")
     return selected
+
+
+def _run_oof_stage(problem, task: str, results: Dict[str, Any], models: Dict[str, Callable],
+                   params_for: Callable[[str, Dict[str, Any]], Any],
+                   X_train: np.ndarray, y_train: np.ndarray) -> Dict[str, Any]:
+    """Retrain candidates on fixed folds, store OOF/test predictions, choose final predictions.
+
+    Every model is scored on its out-of-fold predictions with the problem's own
+    metric (on the original target scale for regression). The run's final test
+    predictions come from the best single model or from the ensemble of this
+    run's models, whichever has the better OOF score.
+    """
+    metric = problem.metric_obj
+    X_test = np.load(config.FEATURES_DIR / 'X_test.npy')
+    transform_info = joblib.load(config.FEATURES_DIR / 'target_transform.pkl')
+    n_classes = len(problem.classes) if problem.is_classification else 0
+
+    if task == 'regression':
+        y_eval = inverse_regression(y_train.astype(float), transform_info)
+
+        def native_score(pred):
+            return metric.score(y_eval, inverse_regression(pred, transform_info), task)
+    else:
+        def native_score(pred):
+            return metric.score(y_train, pred, task)
+
+    run = config.ACTIVE_RUN
+    problem_dir = run.problem_dir if run is not None else config.OUTPUTS_DIR
+    run_id = run.run_id if run is not None else datetime.now().strftime('%Y%m%d_%H%M%S')
+    fold_ids, signature = load_or_make_folds(y_train, problem.cv, problem_dir)
+    store = ExperimentStore(problem_dir)
+    store.save_targets(signature, y_train, transform_info)
+    seeds = list(range(42, 42 + int(problem.budget.get('seeds', 1))))
+    tracker = config.PROGRESS_TRACKER
+
+    candidates = sorted(
+        [(name, res) for name, res in results.items() if name in models and res.get('mean_score') is not None],
+        key=lambda item: item[1]['mean_score'], reverse=True,
+    )
+    limit = problem.budget.get('oof_models')
+    if limit:
+        candidates = candidates[:int(limit)]
+
+    print(f"\n{'='*60}")
+    print(f"Out-of-fold stage: {len(candidates)} model(s) x {int(fold_ids.max()) + 1} folds x {len(seeds)} seed(s)")
+    print(f"Folds {signature} shared by every run of '{problem.name}'")
+    print(f"{'='*60}")
+
+    singles = []
+    for name, res in candidates:
+        params = params_for(name, res)
+        if tracker:
+            tracker.track_model_start(f"{name} (OOF)", total_trials=None)
+        try:
+            oof, test_pred = fit_oof(models[name], params, X_train, y_train, X_test, fold_ids,
+                                     task, n_classes, seeds)
+        except Exception as exc:
+            logger.warning(f"[OOF] {name} failed: {exc}")
+            print(f"⚠️  OOF for {name} failed: {exc}")
+            continue
+        score = native_score(oof)
+        experiment = store.save(name, run_id, oof, test_pred, {
+            "model": name, "params": params, "metric": problem.metric, "oof_score": score,
+            "greater_is_better": metric.greater_is_better, "fold_signature": signature,
+            "n_features": int(X_train.shape[1]), "seeds": seeds, "task": task,
+        })
+        results[name]['oof_score'] = score
+        results[name]['experiment_id'] = experiment.experiment_id
+        singles.append({"name": name, "score": score, "oof": oof, "test": test_pred,
+                        "experiment_id": experiment.experiment_id})
+        print(f"   {name}: OOF {problem.metric} = {score:.6f}")
+        if tracker:
+            tracker.track_model_complete(f"{name} (OOF)", mean_score=float(metric.signed(score)),
+                                         std_score=0.0, best_params=params)
+        cleanup_memory(f"After OOF {name}", aggressive=False)
+
+    if not singles:
+        raise RuntimeError("No model produced out-of-fold predictions")
+
+    best_single = max(singles, key=lambda item: metric.signed(item["score"]))
+    final = {"name": best_single["name"], "score": best_single["score"], "test": best_single["test"],
+             "source": "single", "experiment_id": best_single["experiment_id"]}
+    ensemble_info = None
+
+    method = problem.ensemble.get('method', 'stack')
+    if method not in ('stack', 'hill_climb', 'none'):
+        raise ValueError(f"Unknown ensemble.method '{method}' (use stack, hill_climb or none)")
+    if method != 'none' and len(singles) >= 2:
+        members = sorted(singles, key=lambda item: metric.signed(item["score"]), reverse=True)
+        members = members[:int(problem.ensemble.get('top', 10))]
+        oofs, tests = [m["oof"] for m in members], [m["test"] for m in members]
+        if tracker:
+            tracker.track_model_start('Stacking Ensemble', total_trials=None)
+        if method == 'stack':
+            blend_oof, blend_test, ensemble_info = stack(
+                y_train, oofs, tests, fold_ids, task, n_classes,
+                strength=float(problem.ensemble.get('strength', 1.0)))
+        else:
+            blend_oof, blend_test, ensemble_info = hill_climb(
+                oofs, tests, lambda pred: metric.signed(native_score(pred)))
+        ensemble_score = native_score(blend_oof)
+        ensemble_info.update({"members": [m["name"] for m in members], "oof_score": ensemble_score})
+        ensemble_name = f"Ensemble ({method})"
+        experiment = store.save(f"ensemble_{method}", run_id, blend_oof, blend_test, {
+            "model": ensemble_name, "metric": problem.metric, "oof_score": ensemble_score,
+            "greater_is_better": metric.greater_is_better, "fold_signature": signature,
+            "members": [m["experiment_id"] for m in members], "ensemble": ensemble_info, "task": task,
+        })
+        results[ensemble_name] = {
+            'mean_score': float(metric.signed(ensemble_score)), 'std_score': 0.0,
+            'oof_score': ensemble_score, 'members': ensemble_info["members"],
+            'experiment_id': experiment.experiment_id, 'tuned': False,
+        }
+        print(f"   {ensemble_name} of {len(members)}: OOF {problem.metric} = {ensemble_score:.6f}")
+        if tracker:
+            tracker.track_model_complete('Stacking Ensemble', mean_score=float(metric.signed(ensemble_score)),
+                                         std_score=0.0, best_params={'members': ensemble_info["members"]})
+        if metric.signed(ensemble_score) > metric.signed(best_single["score"]):
+            final = {"name": ensemble_name, "score": ensemble_score, "test": blend_test,
+                     "source": "ensemble", "experiment_id": experiment.experiment_id}
+
+    np.save(config.FEATURES_DIR / 'final_test_predictions.npy', final["test"])
+    summary = {
+        "final_name": final["name"],
+        "final_score": final["score"],
+        "final_source": final["source"],
+        "final_experiment_id": final["experiment_id"],
+        "metric": problem.metric,
+        "greater_is_better": metric.greater_is_better,
+        "fold_signature": signature,
+        "seeds": seeds,
+        "single_scores": {m["name"]: m["score"] for m in singles},
+        "ensemble": ensemble_info,
+    }
+    with open(config.REPORTS_DIR / 'final_predictions.json', 'w') as handle:
+        json.dump(summary, handle, indent=2, default=str)
+    print(f"🏆 Final predictions: {final['name']} (OOF {problem.metric} = {final['score']:.6f})")
+    return summary
 
 
 def _train_single_model(
@@ -931,9 +1072,6 @@ def train_model_pipeline() -> str:
         # Systematically evaluate each model using cross-validation with optimized hyperparameters
         results = {}
         best_model_name = None
-        best_model_factory = None
-        best_model_params = None
-        best_model_object = None
         tuned_params = {}  # Store best hyperparameters for each model
 
         # Suppress Optuna's default logging to reduce clutter
@@ -1103,187 +1241,34 @@ def train_model_pipeline() -> str:
                     if config.PROGRESS_TRACKER:
                         config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
 
-        # Find best model from all results
-        best_score = float('-inf') if problem_type == 'regression' else 0
-        for name, model_results in results.items():
-            model_score = model_results.get('mean_score')
-            if model_score is not None and model_score > best_score:
-                best_score = model_score
-                best_model_name = name
-                best_model_factory = models.get(name)
-                best_model_params = model_results.get('best_params') if model_results.get('tuned') else None
-                best_model_object = None
+        if problem is None:
+            train_df = pd.read_pickle(config.DATA_DIR / 'train_data.pkl')
+            test_df = pd.read_pickle(config.DATA_DIR / 'test_data.pkl')
+            problem = context.ensure_problem(train_df, test_df)
 
-        # Create stacking ensemble of top models
-        print(f"\n{'='*60}")
-        print(f"Creating Stacking Ensemble...")
-        print(f"{'='*60}")
+        def params_for(name, model_result):
+            params = dict(model_result.get('best_params') or {}) if model_result.get('tuned') else {}
+            params.update(ai_model_overrides.get(name, {}) or {})
+            return params or None
 
-        # Sort models by score and select top performers for ensemble
-        sorted_models = sorted(results.items(), key=lambda x: x[1]['mean_score'], reverse=True)
-        top_models = [m for m in sorted_models[:min(3, len(sorted_models))]]  # Top 3 models
+        oof_summary = _run_oof_stage(problem, task, results, models, params_for, X_train, y_train)
+        best_model_name = oof_summary["final_name"]
+        best_score = oof_summary["final_score"]
 
-        if len(top_models) >= 2:
-            print(f"Ensemble members (base models): {[m[0] for m in top_models]}")
-
-            # Create ensemble estimators list
-            ensemble_estimators = []
-
-            for model_name, model_results in top_models:
-                factory = models.get(model_name)
-                if not factory:
-                    logger.warning(f"[Ensemble] Missing factory for {model_name}, skipping")
-                    continue
-
-                overrides = model_results.get('best_params') if model_results.get('tuned') else None
-                m = factory(overrides)
-
-                ensemble_estimators.append((model_name.lower().replace(' ', '_'), m))
-
-            if len(ensemble_estimators) < 2:
-                print("Not enough valid models for ensembling after filtering.")
-                cleanup_memory("After ensemble evaluation", aggressive=False)
-            else:
-                # Create stacking ensemble with meta-learner
-                # Stacking learns optimal combination vs fixed weights in voting
-                if problem_type == 'regression':
-                    # Use Ridge as meta-learner for regression
-                    meta_learner = Ridge(alpha=1.0, random_state=42)
-                    ensemble = StackingRegressor(
-                        estimators=ensemble_estimators,
-                        final_estimator=meta_learner,
-                        cv=5,  # Internal CV for generating meta-features
-                        n_jobs=1  # Serial for GPU stability
-                    )
-                    print(f"Meta-learner: Ridge Regression")
-                else:
-                    # Use LogisticRegression as meta-learner for classification
-                    LogisticClass = get_linear_model_classifier()
-                    meta_params: Dict[str, Any] = {'max_iter': 1000}
-                    try:
-                        logistic_sig = inspect.signature(LogisticClass.__init__)
-                        if 'random_state' in logistic_sig.parameters:
-                            meta_params['random_state'] = 42
-                    except (ValueError, TypeError):
-                        pass
-                    meta_learner = LogisticClass(**meta_params)
-                    ensemble = StackingClassifier(
-                        estimators=ensemble_estimators,
-                        final_estimator=meta_learner,
-                        cv=5,  # Internal CV for generating meta-features
-                        n_jobs=1  # Serial for GPU stability
-                    )
-                    print(f"Meta-learner: Logistic Regression")
-
-                # Evaluate stacking ensemble with cross-validation
-                print("Evaluating stacking ensemble...")
-
-                # Track ensemble evaluation in progress tracker
-                if config.PROGRESS_TRACKER:
-                    config.PROGRESS_TRACKER.track_model_start('Stacking Ensemble', total_trials=None)
-
-                try:
-                    ensemble_scores = cross_val_score(ensemble, X_train, y_train, cv=cv, scoring=scoring_metric, n_jobs=1)
-                    ensemble_mean_score = ensemble_scores.mean()
-                except Exception as exc:
-                    logger.warning(f"[Ensemble] Stacking evaluation failed: {exc}")
-                    print(f"⚠️  Stacking ensemble evaluation failed: {exc}")
-
-                    # Track failed ensemble evaluation
-                    if config.PROGRESS_TRACKER:
-                        config.PROGRESS_TRACKER.track_model_complete(
-                            'Stacking Ensemble',
-                            mean_score=0.0,
-                            std_score=0.0,
-                            best_params=None
-                        )
-
-                    cleanup_memory("After failed ensemble evaluation", aggressive=False)
-                else:
-                    print(f"Stacking Ensemble CV Score: {ensemble_mean_score:.6f} (+/- {ensemble_scores.std():.6f})")
-
-                    # Track successful ensemble evaluation
-                    if config.PROGRESS_TRACKER:
-                        config.PROGRESS_TRACKER.track_model_complete(
-                            'Stacking Ensemble',
-                            mean_score=float(ensemble_mean_score),
-                            std_score=float(ensemble_scores.std()),
-                            best_params={'members': [m[0] for m in top_models], 'meta_learner': type(meta_learner).__name__}
-                        )
-
-                    # Add ensemble to results
-                    results['Stacking Ensemble'] = {
-                        'mean_score': float(ensemble_mean_score),
-                        'std_score': float(ensemble_scores.std()),
-                        'individual_scores': ensemble_scores.tolist(),
-                        'members': [m[0] for m in top_models],
-                        'meta_learner': type(meta_learner).__name__,
-                        'tuned': False
-                    }
-
-                    # Check if ensemble beats best individual model
-                    if ensemble_mean_score > best_score:
-                        print(f"✅ Stacking Ensemble improves over best individual model!")
-                        if best_score not in (0, float('-inf')):
-                            print(f"   Improvement: {((ensemble_mean_score - best_score) / abs(best_score) * 100):.2f}%")
-                        best_score = ensemble_mean_score
-                        best_model_name = 'Stacking Ensemble'
-                        best_model_factory = None
-                        best_model_params = None
-                        best_model_object = ensemble
-                    else:
-                        print(f"Individual model {best_model_name} still wins")
-                        if best_score != 0:
-                            print(f"   Difference: {((best_score - ensemble_mean_score) / abs(best_score) * 100):.2f}%")
-                        # Release ensemble estimators aggressively when not selected
-                        del ensemble
-
-                    cleanup_memory("After ensemble evaluation", aggressive=False)
-        else:
-            print("Not enough models for ensembling (need at least 2)")
-
-        # Train the selected model on full training dataset
-        print(f"\n{'='*60}")
-        print(f"🏆 Best Model: {best_model_name}")
-        print(f"   Score: {best_score:.6f}")
-        if best_model_name in tuned_params:
-            print(f"   Tuned Parameters: {tuned_params[best_model_name]}")
-        print(f"{'='*60}\n")
-
-        # Log GPU status for transparency
-        if is_cuml_available():
-            print(f"\u2139\ufe0f  Using GPU acceleration (cuML) for {best_model_name}")
-        elif is_xgboost_gpu_available() and 'XGBoost' in best_model_name:
-            print(f"\u2139\ufe0f  Using GPU acceleration (XGBoost) for {best_model_name}")
-        elif is_lightgbm_gpu_available() and 'LightGBM' in best_model_name:
-            print(f"\u2139\ufe0f  Using GPU acceleration (LightGBM) for {best_model_name}")
-        else:
-            print(f"\u2139\ufe0f  Using CPU for {best_model_name}")
-
-        if best_model_name == 'Stacking Ensemble':
-            best_model = best_model_object
-        else:
-            if best_model_factory is None:
-                raise RuntimeError(f"No factory available to instantiate best model '{best_model_name}'")
-
-            overrides_for_best = ai_model_overrides.get(best_model_name, {})
-            if best_model_params:
-                final_params = best_model_params.copy()
-                if overrides_for_best:
-                    final_params.update(overrides_for_best)
-            else:
-                final_params = overrides_for_best if overrides_for_best else None
-
-            best_model = best_model_factory(final_params)
-
-        # This gives the model access to all available training data
-        log_gpu_memory("Before Final Training")
-        best_model.fit(X_train, y_train)
-        log_gpu_memory("After Final Training")
+        # Optional: refit the best single model on all rows and predict with it
+        best_model = None
+        if problem.budget.get('refit_full') and oof_summary["final_source"] == "single":
+            print(f"Refitting {best_model_name} on all {len(y_train)} rows (budget.refit_full)")
+            best_model = models[best_model_name](params_for(best_model_name, results[best_model_name]))
+            best_model.fit(X_train, y_train)
+            X_test_full = np.load(config.FEATURES_DIR / 'X_test.npy')
+            n_classes = len(problem.classes) if problem.is_classification else 0
+            np.save(config.FEATURES_DIR / 'final_test_predictions.npy',
+                    predict_matrix(best_model, X_test_full, task, n_classes))
 
         # AI Advisor: Error Pattern Analysis
         # Use AI to analyze prediction errors and identify improvement opportunities
-        if config.AI_ADVISORS_CONFIG['enabled'] and config.AI_ADVISORS_CONFIG['error_analysis']['enabled']:
+        if best_model is not None and config.AI_ADVISORS_CONFIG['enabled'] and config.AI_ADVISORS_CONFIG['error_analysis']['enabled']:
             try:
                 print(f"\n{'='*60}")
                 print("🤖 AI Error Pattern Analyzer")
@@ -1385,7 +1370,9 @@ def train_model_pipeline() -> str:
         # Save the trained model for prediction stage
         # Timestamped filename prevents overwrites and enables model versioning
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_filename = f'best_model_{best_model_name.lower().replace(" ", "_")}_{timestamp}.pkl'
+        model_filename = (
+            f'best_model_{best_model_name.lower().replace(" ", "_")}_{timestamp}.pkl' if best_model is not None else None
+        )
 
         if ai_override_updates:
             save_ai_tuning_overrides(
@@ -1398,14 +1385,16 @@ def train_model_pipeline() -> str:
                 }
             )
 
-        joblib.dump(best_model, config.MODELS_DIR / model_filename)
+        if best_model is not None:
+            joblib.dump(best_model, config.MODELS_DIR / model_filename)
 
         # Save detailed cross-validation results for analysis
         # Provides transparency into model selection process
         cv_results_df = pd.DataFrame({
             'Model': list(results.keys()),
             'Mean_Score': [results[name]['mean_score'] for name in results.keys()],
-            'Std_Score': [results[name]['std_score'] for name in results.keys()]
+            'Std_Score': [results[name]['std_score'] for name in results.keys()],
+            'OOF_Score': [results[name].get('oof_score') for name in results.keys()],
         })
         cv_results_df.to_csv(config.MODELS_DIR / 'cross_validation_results.csv', index=False)
 
@@ -1417,10 +1406,13 @@ def train_model_pipeline() -> str:
             "task": task,
             "best_model": best_model_name,
             "best_score": float(best_score),
+            "greater_is_better": oof_summary["greater_is_better"],
+            "score_source": "out-of-fold",
+            "final_predictions": oof_summary,
             "all_results": results,
             "model_filename": model_filename,
             "timestamp": timestamp,
-            "model_saved": str(config.MODELS_DIR / model_filename),
+            "model_saved": str(config.MODELS_DIR / model_filename) if model_filename else None,
             "ai_model_selection_guidance": guidance_payload,
             "ai_model_selection_summary": model_selection_summary,
             "ai_tuning_overrides_loaded": ai_override_details,
@@ -1437,7 +1429,7 @@ def train_model_pipeline() -> str:
 
         # Save model training report
         with open(config.REPORTS_DIR / 'model_training_report.json', 'w') as f:
-            json.dump(model_results, f, indent=2)
+            json.dump(model_results, f, indent=2, default=str)
 
         config.TUNING_CONFIG['models_to_tune'] = original_models_to_tune
         return json.dumps(model_results, indent=2)

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from sklearn import metrics as _skm
 from sklearn.metrics import make_scorer
 
 Scorer = Union[str, Callable]
@@ -60,6 +61,20 @@ class Metric:
     # Optional target transform that makes the CV score match the metric
     target_transform: Optional[str] = None
     top_k: Optional[int] = None
+    greater_is_better: bool = True
+
+    def score(self, y_true, pred, task: str) -> float:
+        """Score predictions on the metric's own scale.
+
+        ``pred`` is a class-probability matrix for classification (shape
+        n x n_classes) and raw values on the original target scale for
+        regression. ``y_true`` holds encoded class indices or original values.
+        """
+        return float(_SCORERS[self.name](np.asarray(y_true), np.asarray(pred), task))
+
+    def signed(self, value: float) -> float:
+        """Convert a native score to "higher is better" for comparisons."""
+        return value if self.greater_is_better else -value
 
     def scoring_for(self, task: str) -> Scorer:
         """Scorer for cross_val_score / Optuna (an sklearn name or scorer object)."""
@@ -125,6 +140,7 @@ _register(Metric(
     description="Cross-entropy of predicted probabilities",
     kaggle_names=("log loss", "logloss", "multiclass loss", "multi class log loss",
                   "binary cross entropy", "logarithmic loss"),
+    greater_is_better=False,
 ))
 _register(Metric(
     name="map_at_3",
@@ -144,6 +160,7 @@ _register(Metric(
     # Kaggle reports several RMSE competitions as "Mean Squared Error"; the
     # ranking of models is identical for MSE and RMSE
     kaggle_names=("root mean squared error", "rmse", "mean squared error", "mse"),
+    greater_is_better=False,
 ))
 _register(Metric(
     name="rmsle",
@@ -155,6 +172,7 @@ _register(Metric(
     kaggle_names=("root mean squared logarithmic error", "rmsle",
                   "mean squared log error", "root mean squared log error"),
     target_transform="log1p",
+    greater_is_better=False,
 ))
 _register(Metric(
     name="mae",
@@ -163,6 +181,7 @@ _register(Metric(
     scoring={"regression": "neg_mean_absolute_error"},
     description="Mean absolute error",
     kaggle_names=("mean absolute error", "mae"),
+    greater_is_better=False,
 ))
 _register(Metric(
     name="r2",
@@ -172,6 +191,32 @@ _register(Metric(
     description="Coefficient of determination",
     kaggle_names=("r2 score", "r2", "coefficient of determination"),
 ))
+
+
+def _labels(pred: np.ndarray) -> np.ndarray:
+    return np.argmax(pred, axis=1)
+
+
+def _positive(pred: np.ndarray) -> np.ndarray:
+    return pred[:, 1] if pred.ndim == 2 else pred
+
+
+_SCORERS: Dict[str, Callable] = {
+    "accuracy": lambda y, p, t: _skm.accuracy_score(y, _labels(p)),
+    "balanced_accuracy": lambda y, p, t: _skm.balanced_accuracy_score(y, _labels(p)),
+    "f1": lambda y, p, t: _skm.f1_score(y, _labels(p), average="binary" if t == "binary" else "macro"),
+    "mcc": lambda y, p, t: _skm.matthews_corrcoef(y, _labels(p)),
+    "roc_auc": lambda y, p, t: (
+        _skm.roc_auc_score(y, _positive(p)) if t == "binary"
+        else _skm.roc_auc_score(y, p, multi_class="ovr")
+    ),
+    "log_loss": lambda y, p, t: _skm.log_loss(y, np.clip(p, 1e-15, 1 - 1e-15), labels=np.arange(p.shape[1])),
+    "map_at_3": lambda y, p, t: _map_at_k(y, p, k=3),
+    "rmse": lambda y, p, t: float(np.sqrt(_skm.mean_squared_error(y, p))),
+    "rmsle": lambda y, p, t: float(np.sqrt(_skm.mean_squared_error(np.log1p(y), np.log1p(np.clip(p, 0, None))))),
+    "mae": lambda y, p, t: _skm.mean_absolute_error(y, p),
+    "r2": lambda y, p, t: _skm.r2_score(y, p),
+}
 
 
 def get_metric(name: str) -> Metric:

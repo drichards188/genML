@@ -13,7 +13,7 @@ import pandas as pd
 
 from src.genML.pipeline import config, context
 from src.genML.pipeline.problem import find_sample_submission
-from src.genML.pipeline.submission import build_submission, validate_submission
+from src.genML.pipeline.submission import PrecomputedPredictions, build_submission, validate_submission
 
 SUBMISSIONS_DIR = Path("outputs/submissions")
 
@@ -30,14 +30,7 @@ def generate_predictions() -> str:
         JSON string with prediction results and submission file info
     """
     try:
-        X_test = np.load(config.FEATURES_DIR / 'X_test.npy')
-
-        model_files = list(config.MODELS_DIR.glob('best_model_*.pkl'))
-        if not model_files:
-            raise FileNotFoundError("No trained model found in models directory")
-        latest_model = max(model_files, key=os.path.getctime)
-        best_model = joblib.load(latest_model)
-
+        X_test = None
         test_df = pd.read_pickle(config.DATA_DIR / 'test_data.pkl')
         transform_info = joblib.load(config.FEATURES_DIR / 'target_transform.pkl')
 
@@ -45,6 +38,20 @@ def generate_predictions() -> str:
         if problem is None:
             train_df = pd.read_pickle(config.DATA_DIR / 'train_data.pkl')
             problem = context.ensure_problem(train_df, test_df)
+
+        # Prefer the OOF stage's final predictions (fold-averaged or ensembled);
+        # fall back to a saved model
+        final_predictions = config.FEATURES_DIR / 'final_test_predictions.npy'
+        if final_predictions.exists():
+            best_model = PrecomputedPredictions(np.load(final_predictions), problem.task)
+            latest_model = final_predictions
+        else:
+            model_files = list(config.MODELS_DIR.glob('best_model_*.pkl'))
+            if not model_files:
+                raise FileNotFoundError("No trained model or final predictions found")
+            latest_model = max(model_files, key=os.path.getctime)
+            best_model = joblib.load(latest_model)
+            X_test = np.load(config.FEATURES_DIR / 'X_test.npy')
 
         submission_df, stats = build_submission(problem, best_model, X_test, test_df, transform_info)
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -44,7 +44,7 @@ COLUMN_ROLES = ("categorical", "numerical", "text", "datetime", "drop")
 SPEC_FIELDS = (
     "name", "description", "source", "target", "id_column", "task", "metric",
     "positive_class", "cv", "submission", "columns", "models", "budget",
-    "feature_engineering",
+    "feature_engineering", "ensemble",
 )
 
 
@@ -66,6 +66,8 @@ class ProblemSpec:
     models: Optional[List[str]] = None
     budget: Dict[str, Any] = field(default_factory=dict)
     feature_engineering: Dict[str, Any] = field(default_factory=dict)
+    # Blending of this run's models: {method: stack|hill_climb|none, top: N}
+    ensemble: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ProblemSpec":
@@ -120,6 +122,7 @@ class ResolvedProblem:
     source: Dict[str, Any]
     inferred: Dict[str, str] = field(default_factory=dict)
     classes: Optional[List[Any]] = None
+    ensemble: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def metric_obj(self) -> Metric:
@@ -143,7 +146,8 @@ class ResolvedProblem:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ResolvedProblem":
-        return cls(**data)
+        known = {f.name for f in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in known})
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +372,7 @@ def resolve_problem(
         feature_engineering=dict(spec.feature_engineering),
         source=dict(spec.source),
         inferred=inferred,
+        ensemble={"method": "stack", "top": 10, **spec.ensemble},
     )
 
 

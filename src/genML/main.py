@@ -11,6 +11,9 @@ Usage:
     python src/genML/main.py --list-runs fraud-s6e11      # compare runs of a problem
     python src/genML/main.py --show-run fraud-s6e11 RUN_ID
     python src/genML/main.py --init-kaggle playground-series-s6e11 --name fraud-s6e11
+    python src/genML/main.py --ensemble fraud-s6e11 [--method stack|hill_climb] [--top 10]
+    python src/genML/main.py --submit fraud-s6e11 [--run RUN_ID] [--message "..."]
+    python src/genML/main.py --submissions fraud-s6e11   # CV vs leaderboard for submitted runs
 
 Each run writes to outputs/<problem>/<run_id>/ (data, features, models,
 reports, submission.csv, pipeline.log, run.json) and appends a row to
@@ -55,6 +58,15 @@ def _parse_args(argv=None):
     parser.add_argument("--init-kaggle", metavar="COMPETITION",
                         help="Create a problem spec for a Kaggle competition and exit")
     parser.add_argument("--name", help="Problem name for --init-kaggle (default: the competition slug)")
+    parser.add_argument("--ensemble", metavar="PROBLEM",
+                        help="Blend the best stored experiments across runs into a new run")
+    parser.add_argument("--method", default="stack", choices=["stack", "hill_climb"], help="Blend method")
+    parser.add_argument("--top", type=int, default=10, help="Experiments to blend (best by OOF score)")
+    parser.add_argument("--submit", metavar="PROBLEM", help="Submit a run to Kaggle (newest completed by default)")
+    parser.add_argument("--run", metavar="RUN_ID", help="Run to submit with --submit")
+    parser.add_argument("--message", default="", help="Kaggle submission description for --submit")
+    parser.add_argument("--submissions", metavar="PROBLEM",
+                        help="Refresh and print CV vs leaderboard scores of submitted runs")
     return parser.parse_args(argv)
 
 
@@ -90,6 +102,34 @@ def main(argv=None):
 
     if args.show_run:
         print(json.dumps(load_run(*args.show_run), indent=2))
+        return 0
+
+    if args.ensemble:
+        from src.genML.pipeline.store_ensemble import ensemble_from_store
+
+        summary = ensemble_from_store(args.ensemble, method=args.method, top=args.top, notes=args.notes)
+        print(f"Ensemble run {summary['run_id']}: {summary['status']}  OOF {summary.get('metric')} = "
+              f"{summary.get('cv_score')}  (vs best single: {summary.get('improvement_over_best_single'):+.6f})")
+        print(f"   Submission: {summary.get('submission')}")
+        return 0 if summary["status"] == "completed" else 1
+
+    if args.submit:
+        from src.genML.submissions import submit_run
+
+        row = submit_run(args.submit, run_id=args.run, message=args.message)
+        print(f"✅ Submitted run {row['run_id']} (CV {row['metric']} {row['cv_score']}): {row['kaggle_response']}")
+        print(f"   Check the score later with: --submissions {args.submit}")
+        return 0
+
+    if args.submissions:
+        from src.genML.submissions import refresh_scores
+
+        rows = refresh_scores(args.submissions)
+        if not rows:
+            print(f"No submissions logged for '{args.submissions}'")
+        for row in rows:
+            print(f"{row['submitted_at']}  {row['run_id']:22s} CV {row['cv_score']:>10s}  "
+                  f"public {row.get('public_score') or '-':>9s}  {row.get('status') or ''}  {row['best_model']}")
         return 0
 
     if args.init_kaggle:

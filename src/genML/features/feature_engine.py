@@ -540,6 +540,13 @@ class AutoFeatureEngine:
     def _perform_feature_selection(self, train_df: pd.DataFrame, target_col: str):
         """Perform feature selection using the advanced feature selector."""
         try:
+            # Selection only needs a representative sample; on large Playground
+            # datasets (500k+ rows) fitting selectors on every row dominates runtime
+            max_rows = int(self.config.get('selection_max_rows', 100_000))
+            if len(train_df) > max_rows:
+                train_df = train_df.sample(n=max_rows, random_state=42)
+                logger.info(f"Feature selection on a {max_rows}-row sample")
+
             # Generate features first
             feature_columns = list(self.processors.keys())
             feature_subset = train_df[feature_columns].copy()

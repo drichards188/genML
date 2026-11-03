@@ -109,6 +109,43 @@ def init_problem_from_kaggle(competition: str, name: Optional[str] = None, downl
     return path, resolved
 
 
+def _kaggle_api():
+    """Authenticated client from the official ``kaggle`` package (needed to submit)."""
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError("Submitting needs the kaggle package: pip install kaggle (Python 3.11+)") from exc
+    _auth_header()  # clear error if no credentials
+    api = KaggleApi()
+    api.authenticate()
+    return api
+
+
+def submit_file(competition: str, file_path: Path, message: str) -> str:
+    """Upload a submission file; returns Kaggle's response message."""
+    response = _kaggle_api().competition_submit(file_name=str(file_path), message=message,
+                                                competition=competition, quiet=True)
+    return str(getattr(response, "message", "") or response)
+
+
+def list_submissions(competition: str) -> list[Dict[str, Any]]:
+    """Your submissions to a competition, newest first."""
+    rows = []
+    for item in _kaggle_api().competition_submissions(competition) or []:
+        if item is None:
+            continue
+        rows.append({
+            "ref": str(item.ref),
+            "date": str(item.date),
+            "description": item.description or "",
+            "status": str(item.status).split(".")[-1],
+            "public_score": item.public_score or None,
+            "private_score": item.private_score or None,
+            "file_name": item.file_name,
+        })
+    return rows
+
+
 def download_competition(competition: str) -> Path:
     """Download competition files with kagglehub and return the folder."""
     try:

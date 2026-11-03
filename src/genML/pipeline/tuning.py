@@ -129,12 +129,12 @@ def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv, sco
         ModelClass = xgb.XGBClassifier
 
     if is_xgboost_gpu_available() and not config.GPU_CONFIG["force_cpu"]:
-        params["tree_method"] = "gpu_hist"
-        params["predictor"] = "gpu_predictor"
+        # XGBoost >= 2.0 selects the GPU with device="cuda"; "gpu_hist" was removed in 3.x
+        params["tree_method"] = "hist"
+        params["device"] = "cuda"
         device = "GPU"
     else:
         params["tree_method"] = "hist"
-        params["predictor"] = "cpu_predictor"
         device = "CPU"
 
     logger.info("[XGB Trial %s] Using %s acceleration", trial.number, device)

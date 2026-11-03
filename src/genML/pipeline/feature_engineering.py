@@ -19,6 +19,35 @@ from src.genML.pipeline.targets import prepare_target
 logger = logging.getLogger(__name__)
 
 
+def _add_encodings(problem, train_df, test_df, train_features, test_features, analysis_results, options):
+    """Append fold-safe target/count/pair encodings (see features/encoding.py)."""
+    from src.genML.features.encoding import build_encodings
+    from src.genML.pipeline.oof import load_or_make_folds
+
+    y_model, _ = prepare_target(
+        train_df[problem.target], task=problem.task,
+        metric_transform=problem.metric_obj.target_transform, positive_class=problem.positive_class,
+    )
+    run = config.ACTIVE_RUN
+    problem_dir = run.problem_dir if run is not None else config.OUTPUTS_DIR
+    fold_ids, _ = load_or_make_folds(y_model, problem.cv, problem_dir)
+
+    excluded = {problem.target, problem.id_column, *problem.drop_columns}
+    declared_cats = [c for c, role in problem.column_types.items() if role == "categorical"]
+    categorical = [c for c in list(dict.fromkeys(declared_cats + analysis_results.get("categorical_columns", [])))
+                   if c not in excluded]
+    numeric = [c for c in analysis_results.get("numerical_columns", []) if c not in excluded]
+    n_classes = int(train_df[problem.target].nunique()) if problem.task == "multiclass" else 0
+
+    enc_train, enc_test, report = build_encodings(
+        train_df, test_df, y_model, fold_ids, problem.task, n_classes, categorical, numeric, options
+    )
+    enc_train = enc_train.set_axis(train_features.index)
+    enc_test = enc_test.set_axis(test_features.index)
+    return (pd.concat([train_features, enc_train], axis=1),
+            pd.concat([test_features, enc_test], axis=1), report)
+
+
 def _deep_merge(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     """Recursively merge ``overrides`` into a copy of ``base``."""
     merged = dict(base)
@@ -400,7 +429,9 @@ def engineer_features() -> str:
         if problem.id_column and problem.id_column in train_df.columns:
             type_hints[problem.id_column] = "id"
         config_dict["manual_type_hints"] = type_hints
-        config_dict = _deep_merge(config_dict, problem.feature_engineering)
+        fe_overrides = dict(problem.feature_engineering)
+        encoding_options = fe_overrides.pop("encodings", None)
+        config_dict = _deep_merge(config_dict, fe_overrides)
 
         feature_engine = AutoFeatureEngine(config_dict)
         analysis_results = feature_engine.analyze_data(train_df)
@@ -529,6 +560,14 @@ def engineer_features() -> str:
                 "created_features": [],
             }
 
+        encoding_report = None
+        if encoding_options:
+            train_features, test_features, encoding_report = _add_encodings(
+                problem, train_df, test_df, train_features, test_features, analysis_results, encoding_options
+            )
+            feature_columns = list(train_features.columns)
+            print(f"Added {encoding_report['n_features']} leak-safe encoding features")
+
         combined_features = pd.concat(
             [
                 train_features.assign(_is_train=1),
@@ -583,6 +622,7 @@ def engineer_features() -> str:
             "total_features_generated": len(feature_columns),
             "detected_domains": analysis_results.get("domain_analysis", {}).get("detected_domains", []),
             "target_column": target_col,
+            "encodings": encoding_report,
             "ai_feature_summary": ai_feature_summary,
             "ai_generated_features": [feat["name"] for feat in ai_feature_summary.get("created_features", [])],
             "feature_stats": {

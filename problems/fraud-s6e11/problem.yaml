@@ -13,3 +13,17 @@ models: [XGBoost, CatBoost, LightGBM]
 budget:
   n_trials: 15
   timeout_per_model: 900
+# Leak-safe encodings (features/encoding.py): out-of-fold target encoding and
+# count encoding of categoricals, low-cardinality numerics and their pairs
+feature_engineering:
+  encodings:
+    target_encode: auto
+    count_encode: auto
+    pairs: auto
+    numeric_as_categorical: auto
+    max_unique: 50
+    max_pairs: 28
+# Blend the run's models with a logistic stacker on out-of-fold log-odds
+ensemble:
+  method: stack
+  top: 10
