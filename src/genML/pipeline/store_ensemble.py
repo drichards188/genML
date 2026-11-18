@@ -45,7 +45,11 @@ def ensemble_from_store(problem_name: str, method: str = "stack", top: int = 10,
 
     problem_dir = root / problem_name
     store = ExperimentStore(problem_dir)
-    experiments = [e for e in store.list(signature) if not str(e.meta.get("model", "")).startswith("Ensemble")]
+    from src.genML.experiments import excluded_runs
+
+    excluded = excluded_runs(problem_name)
+    experiments = [e for e in store.list(signature) if not str(e.meta.get("model", "")).startswith("Ensemble")
+                   and e.meta.get("run_id") not in excluded]
     if len(experiments) < 2:
         raise ValueError(f"Need at least 2 stored experiments with folds {signature}; found {len(experiments)}")
 
@@ -81,7 +85,12 @@ def ensemble_from_store(problem_name: str, method: str = "stack", top: int = 10,
     run_kwargs = {"run_id": run_id} if run_id else {}
     run = RunContext(problem_name, notes=notes or f"ensemble ({method}) of {len(ranked)} stored experiments",
                      outputs_root=root, **run_kwargs).activate()
-    shutil.copy(source_dir / "data" / "test_data.pkl", config.DATA_DIR / "test_data.pkl")
+    from src.genML.pipeline.dataset import TEST_IDS_FILE, stage_table_files
+
+    # The submission needs only the test ids: the full table, or the ids a pruned source run kept
+    test_files = stage_table_files(source_dir / "data", "test") or [source_dir / "data" / TEST_IDS_FILE]
+    for path in test_files:
+        shutil.copy(path, config.DATA_DIR / path.name)
     shutil.copy(source_dir / "reports" / "resolved_spec.json", config.REPORTS_DIR / "resolved_spec.json")
     joblib.dump(transform_info, config.FEATURES_DIR / "target_transform.pkl")
     np.save(config.FEATURES_DIR / "final_test_predictions.npy", blend_test)

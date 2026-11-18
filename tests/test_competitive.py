@@ -7,10 +7,10 @@ import pandas as pd
 import pytest
 from sklearn.metrics import roc_auc_score
 
-from src.genML.features.encoding import build_encodings, target_encode
+from src.genML.features.encoding import build_encodings, nested_target_encode, target_encode
 from src.genML.flow import run_pipeline
 from src.genML.pipeline.ensemble import hill_climb, stack
-from src.genML.pipeline.oof import ExperimentStore, make_folds
+from src.genML.pipeline.oof import ExperimentStore, FoldFeatures, fit_oof, make_folds
 from src.genML.pipeline.problem import ProblemSpec
 from src.genML.run_context import list_runs
 
@@ -83,6 +83,66 @@ def test_multiclass_target_encoding_has_one_column_per_class():
     tr, te = target_encode(keys, keys.head(5), y, folds, "multiclass", 3, smoothing=5.0)
     assert tr.shape == (600, 3) and te.shape == (5, 3)
     assert np.allclose(tr.sum(axis=1), 1.0)
+
+
+def test_nested_target_encoding_ignores_the_outer_folds_labels():
+    """Fold k's block must not change when fold k's labels change (the cross-fold leak)."""
+    rng = np.random.default_rng(5)
+    y = rng.integers(0, 2, size=1500)
+    keys = pd.Series(rng.choice(list("ABCDEFGH"), size=1500))
+    test_keys = pd.Series(list("ABCDEFGHZ"))
+    folds = make_folds(y, {"method": "stratified_kfold", "n_splits": 5, "random_state": 0})
+    blocks = nested_target_encode(keys, test_keys, y, folds, "binary", 0, smoothing=5.0)
+    assert len(blocks) == 5
+    for outer, (train_block, test_block) in enumerate(blocks):
+        flipped = y.copy()
+        flipped[folds == outer] = 1 - flipped[folds == outer]
+        again_train, again_test = nested_target_encode(keys, test_keys, flipped, folds, "binary", 0,
+                                                       smoothing=5.0)[outer]
+        np.testing.assert_allclose(train_block, again_train)
+        np.testing.assert_allclose(test_block, again_test)
+        assert train_block.shape == (1500, 1) and test_block.shape == (9, 1)
+
+
+def test_single_matrix_target_encoding_does_leak_across_folds():
+    """Documents why nesting exists: the single OOF matrix depends on other folds' labels."""
+    rng = np.random.default_rng(5)
+    y = rng.integers(0, 2, size=1500)
+    keys = pd.Series(rng.choice(list("ABCDEFGH"), size=1500))
+    folds = make_folds(y, {"method": "stratified_kfold", "n_splits": 5, "random_state": 0})
+    single, _ = target_encode(keys, keys.head(3), y, folds, "binary", 0, smoothing=5.0)
+    flipped = y.copy()
+    flipped[folds == 0] = 1 - flipped[folds == 0]
+    again, _ = target_encode(keys, keys.head(3), flipped, folds, "binary", 0, smoothing=5.0)
+    outside = folds != 0
+    assert not np.allclose(single[outside], again[outside])
+
+
+def test_fit_oof_uses_each_folds_block(tmp_path):
+    """A column that is pure label noise in X but replaced per fold must reach the models."""
+    rng = np.random.default_rng(6)
+    n = 600
+    y = rng.integers(0, 2, size=n)
+    folds = make_folds(y, {"method": "stratified_kfold", "n_splits": 3, "random_state": 0})
+    X = np.column_stack([rng.normal(size=n), np.zeros(n)]).astype(np.float32)
+    X_test = np.zeros((10, 2), dtype=np.float32)
+    signal = (y + rng.normal(scale=0.3, size=n)).astype(np.float32).reshape(-1, 1)
+    blocks = [signal for _ in range(3)]
+    fold_features = FoldFeatures.save(tmp_path, [1], ["sig"], blocks, [np.ones((10, 1))] * 3)
+    loaded = FoldFeatures.load(tmp_path)
+    assert loaded.columns == ["sig"] and list(loaded.indices) == [1]
+
+    from sklearn.linear_model import LogisticRegression
+
+    def factory(params=None):
+        return LogisticRegression()
+
+    plain, _ = fit_oof(factory, None, X, y, X_test, folds, "binary", 2)
+    nested, test_pred = fit_oof(factory, None, X, y, X_test, folds, "binary", 2, fold_features=loaded)
+    assert roc_auc_score(y, plain[:, 1]) < 0.6
+    assert roc_auc_score(y, nested[:, 1]) > 0.9
+    assert test_pred.shape == (10, 2)
+    assert fold_features.indices.tolist() == [1]
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +227,25 @@ def test_spec_encodings_reach_the_feature_matrix(tmp_path):
                          "feature_engineering_report.json").read_text())
     assert report["encodings"]["target_encoded"] == ["shop"]
     assert {"shop_te", "shop_count"} <= set(report["features_used"])
+    assert report["nested_target_encoding"] is True
+    run_dir = tmp_path / "out" / "toy" / summary["run_id"]
+    blocks = json.loads((run_dir / "features" / "fold_blocks.json").read_text())
+    assert blocks["columns"] == ["shop_te"] and blocks["n_folds"] == 5
+    assert report["features_used"][blocks["indices"][0]] == "shop_te"
+    experiments = ExperimentStore(tmp_path / "out" / "toy").list()
+    assert all(e.meta.get("nested_encoding") for e in experiments if e.meta.get("model") == "XGBoost")
+
+
+def test_raw_base_keeps_original_columns_plus_encodings(tmp_path):
+    data = _write_problem(tmp_path / "data")
+    spec = _spec(data, models=["XGBoost"], ensemble={"method": "none"},
+                 feature_engineering={"base": "raw", "encodings": {"target_encode": ["shop"]}})
+    summary = run_pipeline(spec=spec, setup_log=False, outputs_root=tmp_path / "out")
+    assert summary["status"] == "completed", summary.get("error")
+    report = json.loads((tmp_path / "out" / "toy" / summary["run_id"] / "reports" /
+                         "feature_engineering_report.json").read_text())
+    assert report["features_used"] == ["x1", "x2", "shop", "shop_te"]
+    assert report["feature_engineering_method"] == "raw"
 
 
 # --------------------------------------------------------------------------- #
@@ -207,3 +286,67 @@ def test_tuned_xgboost_runs(tmp_path):
     report = json.loads((tmp_path / "out" / "toy" / summary["run_id"] / "reports" /
                          "model_training_report.json").read_text())
     assert report["all_results"]["XGBoost"]["tuned"] is True
+
+
+def test_gbdt_tuning_early_stops_and_fixes_tree_count(tmp_path):
+    """XGBoost and LightGBM tune on the shared folds; the early-stopped tree count is kept."""
+    data = _write_problem(tmp_path / "data")
+    spec = _spec(data, models=["XGBoost", "LightGBM"], ensemble={"method": "none"},
+                 budget={"n_trials": 2, "timeout_per_model": 120, "tuning_folds": 2},
+                 feature_engineering={"base": "raw", "encodings": {"target_encode": ["shop"]}})
+    summary = run_pipeline(spec=spec, setup_log=False, outputs_root=tmp_path / "out")
+    assert summary["status"] == "completed", summary.get("error")
+    report = json.loads((tmp_path / "out" / "toy" / summary["run_id"] / "reports" /
+                         "model_training_report.json").read_text())
+    for name in ("XGBoost", "LightGBM"):
+        result = report["all_results"][name]
+        assert result["tuned"] is True
+        assert 1 <= result["best_params"]["n_estimators"] < 6000
+    assert report["all_results"]["LightGBM"]["best_params"]["subsample_freq"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics: paired comparison and seed noise
+# --------------------------------------------------------------------------- #
+
+def test_paired_compare_and_verdict():
+    from src.genML.pipeline.diagnostics import paired_compare, verdict
+
+    rng = np.random.default_rng(7)
+    y = rng.integers(0, 2, size=3000)
+    folds = make_folds(y, {"method": "stratified_kfold", "n_splits": 5, "random_state": 0})
+    weak = y + rng.normal(scale=1.5, size=3000)
+    strong = y + rng.normal(scale=0.5, size=3000)
+
+    def score(rows, pred):
+        return roc_auc_score(y[rows], pred[rows])
+
+    better = paired_compare(score, weak, strong, folds, n_boot=50)
+    assert better["diff"] > 0 and better["folds_won"] == 5
+    assert verdict(better)["accept"] is True
+    same = paired_compare(score, weak, weak, folds, n_boot=20)
+    assert same["diff"] == 0 and verdict(same)["accept"] is False
+    # Large seed noise raises the bar enough to reject a real but small gain
+    assert verdict(better, sigma_seed=1.0)["accept"] is False
+
+
+def test_noise_test_and_compare_on_a_run(tmp_path):
+    from src.genML.pipeline.diagnostics import compare_experiments, seed_noise_test
+
+    data = _write_problem(tmp_path / "data")
+    root = tmp_path / "out"
+    spec = _spec(data, models=["XGBoost", "Logistic Regression"],
+                 feature_engineering={"base": "raw", "encodings": {"target_encode": ["shop"]}})
+    summary = run_pipeline(spec=spec, setup_log=False, outputs_root=root)
+    assert summary["status"] == "completed", summary.get("error")
+    run_id = summary["run_id"]
+
+    report = seed_noise_test("toy", run_id, "XGBoost", n_seeds=3, outputs_root=root, n_boot=20)
+    assert len(report["seeds"]) == 3 and len(report["scores"]) == 3
+    assert report["sigma_seed"] >= 0 and report["threshold"] >= 0
+    assert (root / "toy" / run_id / "reports" / "noise_test.json").exists()
+
+    result = compare_experiments("toy", f"{run_id}__logistic_regression", f"{run_id}__xgboost",
+                                 outputs_root=root, n_boot=20)
+    assert result["seed_noise_measured"] is True
+    assert result["n_folds"] == 5 and "accept" in result

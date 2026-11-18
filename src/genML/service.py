@@ -270,10 +270,14 @@ def cancel_run(job_id: int, outputs_root: Optional[Path] = None) -> Dict[str, An
 
 
 def list_runs(problem: str, limit: int = 10, outputs_root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    from src.genML.experiments import excluded_runs
+
     runs = _list_runs(_check_name(problem, "problem"), outputs_root=_root(outputs_root))[:limit]
+    excluded = excluded_runs(problem)
     return [{"run_id": r["run_id"], "status": r.get("status"), "metric": r.get("metric"),
              "cv_score": _score(r.get("cv_score")), "best_model": r.get("best_model"),
-             "notes": r.get("notes"), "finished_at": r.get("finished_at")} for r in runs]
+             "notes": r.get("notes"), "finished_at": r.get("finished_at"),
+             "excluded": excluded.get(r["run_id"])} for r in runs]
 
 
 def compare_runs(problem: str, run_ids: Optional[List[str]] = None, limit: int = 10,
@@ -325,7 +329,7 @@ def get_run_report(problem: str, run_id: str, section: str = "summary",
         features = _read_json(reports / "feature_engineering_report.json")
         names = features.get("features_used") or []
         return {"n_features": len(names), "features": names[:200], "truncated": len(names) > 200,
-                "encodings": features.get("encodings"), "detected_domains": features.get("detected_domains"),
+                "encodings": features.get("encodings"),
                 "target_transformation": features.get("target_transformation")}
     if section == "spec":
         return _read_json(reports / "resolved_spec.json")
@@ -346,7 +350,9 @@ def get_feature_diagnostics(problem: str, run_id: str, max_rows: int = 100_000,
     """
     run_dir = _run_dir(problem, run_id, outputs_root)
     resolved = _read_json(run_dir / "reports" / "resolved_spec.json")
-    train = pd.read_pickle(run_dir / "data" / "train_data.pkl")
+    from src.genML.pipeline.dataset import load_stage_table
+
+    train = load_stage_table("train", run_dir / "data")
     if len(train) > max_rows:
         train = train.sample(max_rows, random_state=0)
     target, task = resolved["target"], resolved["task"]

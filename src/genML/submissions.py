@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from src.genML.pipeline.problem import load_problem
 from src.genML import run_context
-from src.genML.run_context import list_runs, load_run
+from src.genML.run_context import load_run
 
 LOG_FIELDS = ("submitted_at", "run_id", "metric", "cv_score", "best_model", "message", "file",
               "status", "public_score", "private_score", "kaggle_ref")
@@ -54,14 +54,15 @@ def _competition(problem_name: str) -> str:
 
 def submit_run(problem_name: str, run_id: Optional[str] = None, message: str = "",
                outputs_root: Optional[Path] = None) -> Dict[str, Any]:
-    """Submit a run's submission.csv to Kaggle (default: the newest completed run)."""
+    """Submit a run's submission.csv to Kaggle (default: the best completed run that is not excluded)."""
+    from src.genML.experiments import current_best
     from src.genML.pipeline.kaggle import submit_file
 
     if run_id is None:
-        completed = [r for r in list_runs(problem_name, outputs_root) if r.get("status") == "completed"]
-        if not completed:
-            raise FileNotFoundError(f"No completed runs for '{problem_name}'")
-        run_id = completed[0]["run_id"]
+        best = current_best(problem_name, outputs_root)
+        if best is None:
+            raise FileNotFoundError(f"No completed, not excluded run for '{problem_name}'")
+        run_id = best["run_id"]
     run = load_run(problem_name, run_id, outputs_root)
     if run.get("status") != "completed" or not run.get("submission"):
         raise ValueError(f"Run {run_id} has no submission to send")
