@@ -1,0 +1,29 @@
+name: porto-seguro
+source:
+  type: kaggle
+  competition: porto-seguro-safe-driver-prediction
+description: 'Porto Seguro Safe Driver Prediction (2017, real insurance data): will a driver file a claim
+  next year. Scored by normalized Gini (2 x AUC - 1).'
+target: target
+id_column: id
+task: binary
+metric: normalized_gini
+# One table, independent policies: stratified 5-fold (the default for binary).
+# Columns ending in _cat are integer-coded categoricals; -1 marks a missing value.
+columns:
+  categorical: [ps_ind_02_cat, ps_ind_04_cat, ps_ind_05_cat, ps_car_01_cat, ps_car_02_cat, ps_car_03_cat,
+                ps_car_04_cat, ps_car_05_cat, ps_car_06_cat, ps_car_07_cat, ps_car_08_cat, ps_car_09_cat,
+                ps_car_10_cat, ps_car_11_cat]
+models: [XGBoost, LightGBM, CatBoost]
+budget:
+  n_trials: 15
+  timeout_per_model: 900
+  tuning_folds: 2
+feature_engineering:
+  base: raw
+  encodings:
+    target_encode: auto
+    count_encode: auto
+ensemble:
+  method: stack
+  top: 10

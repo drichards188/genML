@@ -14,6 +14,9 @@ dependencies = [
     "joblib>=1.3.0",
     "pyyaml>=6.0.0",
     "optuna>=3.0.0",
+    "polars>=1.20.0",   # multi-table problems (pipeline/tables.py)
+    "pyarrow>=14.0.0",  # Parquet caches
+    "psutil>=5.9.0",    # resource monitor on every run
 ]
 
 [project.optional-dependencies]
@@ -30,6 +33,15 @@ kaggle = [
 ]
 mcp = [
     "mcp>=2.0; python_version >= '3.11'",
+]
+nn = [
+    "torch>=2.4",       # RealMLP and TabM (pytabkit), TabPFN; GPU build from the PyTorch index if needed
+    "pytabkit>=1.8",
+    "tabpfn>=9.0",      # weights download only after accepting Prior Labs' license (TABPFN_TOKEN)
+]
+llm = [
+    # Schema checks of second-opinion answers (src/genML/llm); the claude and codex CLIs need no package
+    "jsonschema>=4.0",
 ]
 
 [project.scripts]

@@ -47,6 +47,49 @@ def _make_map_at_3():
 _CUSTOM_SCORERS["map_at_3"] = _make_map_at_3
 
 
+def _normalized_gini(y_true, p) -> float:
+    """Normalized Gini = 2 * AUC - 1 (ranks predictions exactly like ROC AUC)."""
+    return float(2 * _skm.roc_auc_score(y_true, p) - 1)
+
+
+def _amex_metric(y_true, p) -> float:
+    """American Express default-prediction metric: mean of a weighted normalized Gini and
+    the share of defaults caught in the top 4% of predictions.
+
+    Negatives count 20 times (Amex subsampled them at 5%). Follows the competition's
+    reference implementation.
+    """
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(p, dtype=float)
+    order = np.argsort(p)[::-1]
+    y_sorted = y[order]
+    weight = np.where(y_sorted == 0, 20.0, 1.0)
+    cutoff = int(0.04 * weight.sum())
+    top_four = y_sorted[np.cumsum(weight) <= cutoff].sum() / y.sum()
+
+    def weighted_gini(labels: np.ndarray) -> float:
+        w = np.where(labels == 0, 20.0, 1.0)
+        random = np.cumsum(w / w.sum())
+        lorentz = np.cumsum(labels * w) / (labels * w).sum()
+        return float(((lorentz - random) * w).sum())
+
+    gini = weighted_gini(y_sorted) / weighted_gini(y[np.argsort(y)[::-1]])
+    return float(0.5 * (gini + top_four))
+
+
+def _probability_scorer(function):
+    def build():
+        try:
+            return make_scorer(function, response_method="predict_proba")
+        except TypeError:  # sklearn < 1.4
+            return make_scorer(function, needs_proba=True)
+    return build
+
+
+_CUSTOM_SCORERS["normalized_gini"] = _probability_scorer(_normalized_gini)
+_CUSTOM_SCORERS["amex"] = _probability_scorer(_amex_metric)
+
+
 @dataclass(frozen=True)
 class Metric:
     """How a problem is evaluated and what its submission must contain."""
@@ -133,6 +176,23 @@ _register(Metric(
                   "roc auc", "area under the roc curve"),
 ))
 _register(Metric(
+    name="normalized_gini",
+    tasks=("binary",),
+    output="probability",
+    scoring={"binary": "normalized_gini"},
+    description="Normalized Gini (2 x AUC - 1); needs probabilities",
+    kaggle_names=("normalized gini index", "normalized gini", "gini"),
+))
+_register(Metric(
+    name="amex",
+    tasks=("binary",),
+    output="probability",
+    scoring={"binary": "amex"},
+    description="Amex default metric: mean of a weighted normalized Gini and the default rate captured in "
+                "the top 4% (negatives weighted 20x)",
+    kaggle_names=("amex custom gini and x% percentage capture",),
+))
+_register(Metric(
     name="log_loss",
     tasks=("binary", "multiclass"),
     output="class_probabilities",
@@ -212,6 +272,8 @@ _SCORERS: Dict[str, Callable] = {
     ),
     "log_loss": lambda y, p, t: _skm.log_loss(y, np.clip(p, 1e-15, 1 - 1e-15), labels=np.arange(p.shape[1])),
     "map_at_3": lambda y, p, t: _map_at_k(y, p, k=3),
+    "normalized_gini": lambda y, p, t: _normalized_gini(y, _positive(p)),
+    "amex": lambda y, p, t: _amex_metric(y, _positive(p)),
     "rmse": lambda y, p, t: float(np.sqrt(_skm.mean_squared_error(y, p))),
     "rmsle": lambda y, p, t: float(np.sqrt(_skm.mean_squared_error(np.log1p(y), np.log1p(np.clip(p, 0, None))))),
     "mae": lambda y, p, t: _skm.mean_absolute_error(y, p),

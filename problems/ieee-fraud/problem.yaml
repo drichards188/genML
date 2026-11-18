@@ -1,0 +1,42 @@
+name: ieee-fraud
+source:
+  type: kaggle
+  competition: ieee-fraud-detection
+description: 'IEEE-CIS Fraud Detection (2019, real e-commerce transactions from Vesta): is a transaction
+  fraudulent. Transactions plus device/identity data; the test months follow the training months.'
+target: isFraud
+id_column: TransactionID
+task: binary
+metric: roc_auc
+tables:
+  transaction: {train: train_transaction.csv, test: test_transaction.csv}
+  identity: {train: train_identity.csv, test: test_identity.csv, parent: transaction, key: TransactionID,
+             relation: one}
+# Test is later in time than train, so folds are contiguous time blocks (the last block is a
+# forward-in-time check). TransactionDT is a time offset in seconds: used for folds and for
+# past-only statistics, not as a feature.
+cv: {method: time_blocks, time_column: TransactionDT, n_splits: 6}
+columns:
+  drop: [TransactionDT]
+models: [XGBoost, LightGBM, CatBoost]
+budget:
+  n_trials: 10
+  timeout_per_model: 1800
+  tuning_folds: 2
+  max_trees: 4000
+feature_engineering:
+  base: raw
+  time_column: TransactionDT
+  # General fraud practice only (no ideas from this competition's published solutions):
+  # round-amount signal and card velocity, past-only (each transaction sees earlier ones)
+  derived:
+    cents: "TransactionAmt - floor(TransactionAmt)"
+  group_stats:
+    - {by: card1, cols: [TransactionAmt], stats: [count, mean, std, deviation]}
+  drift_filter: {threshold: 0.85, sample: 50000}
+  encodings:
+    target_encode: auto
+    count_encode: auto
+ensemble:
+  method: stack
+  top: 10

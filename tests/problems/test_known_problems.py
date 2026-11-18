@@ -29,12 +29,15 @@ from src.genML.pipeline.problem import (
     locate_data_dir,
     resolve_problem,
 )
+from src.genML.pipeline.tables import main_files, main_table
 
 PROBLEMS = list_problems()
 
 EXPECTED_OUTPUT = {
     "accuracy": "label",
     "roc_auc": "probability",
+    "normalized_gini": "probability",
+    "amex": "probability",
     "rmse": "value",
     "rmsle": "value",
     "log_loss": "class_probabilities",
@@ -47,6 +50,26 @@ def _data_dir_or_skip(spec: ProblemSpec):
         return locate_data_dir(spec)
     except FileNotFoundError as exc:
         pytest.skip(f"data for {spec.name} not available locally: {exc}")
+
+
+def _read_main(spec: ProblemSpec, data_dir, train_rows: int, test_rows: int):
+    """First rows of the train and test files that hold the target and ID.
+
+    Single-table problems read train.csv / test.csv. Multi-table problems read their
+    main table's files with its ``columns`` / ``drop`` settings, as the table loader
+    does; child tables are rolled up per key and never hold the target or ID.
+    """
+    if spec.tables:
+        names, table = main_files(spec.tables), spec.tables[main_table(spec.tables)]
+    else:
+        names, table = ("train.csv", "test.csv"), {}
+    frames = []
+    for name, nrows in zip(names, (train_rows, test_rows)):
+        frame = pd.read_csv(data_dir / name, nrows=nrows)
+        if table.get("columns"):
+            frame = frame[[c for c in table["columns"] if c in frame.columns]]
+        frames.append(frame.drop(columns=[c for c in table.get("drop") or [] if c in frame.columns]))
+    return frames
 
 
 @pytest.fixture(autouse=True)
@@ -72,8 +95,7 @@ def test_spec_is_valid(name):
 def test_inference_matches_spec(name):
     spec = load_problem(name)
     data_dir = _data_dir_or_skip(spec)
-    train = pd.read_csv(data_dir / "train.csv", nrows=50_000)
-    test = pd.read_csv(data_dir / "test.csv", nrows=2_000)
+    train, test = _read_main(spec, data_dir, train_rows=50_000, test_rows=2_000)
     sample_path = find_sample_submission(data_dir)
     sample = pd.read_csv(sample_path, nrows=2_000) if sample_path else None
 
@@ -133,6 +155,8 @@ def test_pipeline_smoke(name, tmp_path):
     )
 
     spec = load_problem(name)
+    if spec.tables:
+        pytest.skip(f"{name} spans several tables; the smoke subsample only writes train.csv/test.csv")
     data_dir = _data_dir_or_skip(spec)
     small_dir, sample = _subsample(data_dir, spec, tmp_path)
     spec.source = {**spec.source, "path": str(small_dir)}

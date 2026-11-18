@@ -1,0 +1,45 @@
+name: home-credit
+source:
+  type: kaggle
+  competition: home-credit-default-risk
+description: 'Home Credit Default Risk (2018, real credit data): will an applicant repay. Seven tables:
+  the application plus credit bureau, previous loans and their payment histories.'
+target: TARGET
+id_column: SK_ID_CURR
+task: binary
+metric: roc_auc
+# Applicants are independent: stratified 5-fold. Each history table is rolled up per applicant
+# (pipeline/tables.py); chains are rolled up bottom-first.
+tables:
+  application: {train: application_train.csv, test: application_test.csv}
+  bureau: {file: bureau.csv, parent: application, key: SK_ID_CURR, order_by: DAYS_CREDIT}
+  bureau_balance: {file: bureau_balance.csv, parent: bureau, key: SK_ID_BUREAU, order_by: MONTHS_BALANCE,
+                   aggregate: {numeric: [mean, max, last]}}
+  previous: {file: previous_application.csv, parent: application, key: SK_ID_CURR, order_by: DAYS_DECISION,
+             aggregate: {numeric: [mean, max, min], categorical: [nunique, last]}}
+  installments: {file: installments_payments.csv, parent: previous, key: SK_ID_PREV, order_by: DAYS_INSTALMENT,
+                 aggregate: {numeric: [mean, max, sum]}}
+  pos_cash: {file: POS_CASH_balance.csv, parent: previous, key: SK_ID_PREV, order_by: MONTHS_BALANCE,
+             aggregate: {numeric: [mean, max, last]}}
+  credit_card: {file: credit_card_balance.csv, parent: previous, key: SK_ID_PREV, order_by: MONTHS_BALANCE,
+                aggregate: {numeric: [mean, max, last]}}
+models: [XGBoost, LightGBM, CatBoost]
+budget:
+  n_trials: 10
+  timeout_per_model: 1500
+  tuning_folds: 2
+feature_engineering:
+  base: raw
+  # Ratios a credit analyst would look at
+  derived:
+    credit_income: "AMT_CREDIT / AMT_INCOME_TOTAL"
+    annuity_income: "AMT_ANNUITY / AMT_INCOME_TOTAL"
+    annuity_credit: "AMT_ANNUITY / AMT_CREDIT"
+    goods_credit: "AMT_GOODS_PRICE / AMT_CREDIT"
+    employed_share_of_age: "DAYS_EMPLOYED / DAYS_BIRTH"
+  encodings:
+    target_encode: auto
+    count_encode: auto
+ensemble:
+  method: stack
+  top: 10

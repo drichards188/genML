@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -45,8 +46,9 @@ COLUMN_ROLES = ("categorical", "numerical", "text", "datetime", "drop")
 SPEC_FIELDS = (
     "name", "description", "source", "target", "id_column", "task", "metric",
     "positive_class", "cv", "submission", "columns", "models", "budget",
-    "feature_engineering", "ensemble",
+    "feature_engineering", "ensemble", "tables",
 )
+CV_METHODS = ("kfold", "stratified_kfold", "group_kfold", "stratified_group_kfold", "time_blocks")
 
 
 @dataclass
@@ -69,6 +71,8 @@ class ProblemSpec:
     feature_engineering: Dict[str, Any] = field(default_factory=dict)
     # Blending of this run's models: {method: stack|hill_climb|none, top: N}
     ensemble: Dict[str, Any] = field(default_factory=dict)
+    # Data spread over several files (see pipeline/tables.py); empty = train.csv / test.csv
+    tables: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ProblemSpec":
@@ -96,6 +100,19 @@ class ProblemSpec:
             raise ValueError(f"source.type must be 'csv' or 'kaggle', got '{source_type}'")
         if source_type == "kaggle" and not self.source.get("competition"):
             raise ValueError("source.type 'kaggle' needs source.competition")
+        if self.tables:
+            from src.genML.pipeline.tables import check_tables
+
+            errors = check_tables(self.tables)
+            if errors:
+                raise ValueError("; ".join(errors))
+        method = (self.cv or {}).get("method")
+        if method is not None and method not in CV_METHODS:
+            raise ValueError(f"cv.method must be one of {CV_METHODS}, got '{method}'")
+        if method in ("group_kfold", "stratified_group_kfold") and not self.cv.get("group"):
+            raise ValueError(f"cv.method '{method}' needs cv.group (the column whose values stay together)")
+        if method == "time_blocks" and not self.cv.get("time_column"):
+            raise ValueError("cv.method 'time_blocks' needs cv.time_column")
 
     def to_dict(self) -> Dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value not in (None, {}, [], "")}
@@ -124,6 +141,7 @@ class ResolvedProblem:
     inferred: Dict[str, str] = field(default_factory=dict)
     classes: Optional[List[Any]] = None
     ensemble: Dict[str, Any] = field(default_factory=dict)
+    tables: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def metric_obj(self) -> Metric:
@@ -203,8 +221,31 @@ def save_problem(spec: ProblemSpec, path: Optional[Path] = None) -> Path:
 LEGACY_SEARCH_PATHS = (Path("datasets/current"), Path("datasets"), Path("."))
 
 
-def _has_train_test(directory: Path) -> bool:
+def _has_train_test(directory: Path, spec: Optional["ProblemSpec"] = None) -> bool:
+    if spec is not None and spec.tables:
+        from src.genML.pipeline.tables import main_files
+
+        return all((directory / name).exists() for name in main_files(spec.tables))
     return (directory / "train.csv").exists() and (directory / "test.csv").exists()
+
+
+def sample_value_kind(values: pd.Series) -> str:
+    """What a sample submission's value column holds: 'binary', 'probability', 'categorical' or
+    'continuous'. Only a hint for the metric when the spec declares none."""
+    values = values.dropna()
+    if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values):
+        return "categorical"                      # strings or other non-numbers are class labels
+    numeric = values.astype(float)
+    unique_values = set(numeric.unique())
+    if unique_values.issubset({0.0, 1.0}):
+        return "binary"
+    is_integer_like = bool(np.allclose(numeric, np.round(numeric)))
+    # Non-integers inside [0, 1] (placeholders such as 0.5 or a base rate) are probabilities
+    if not is_integer_like and numeric.min() >= 0.0 and numeric.max() <= 1.0:
+        return "probability"
+    if is_integer_like and len(unique_values) < 20:
+        return "categorical"                      # a handful of integers are class labels
+    return "continuous"
 
 
 def locate_data_dir(spec: ProblemSpec, download: bool = False) -> Path:
@@ -220,18 +261,18 @@ def locate_data_dir(spec: ProblemSpec, download: bool = False) -> Path:
         path = Path(explicit)
         if not path.is_absolute():
             path = (PROJECT_ROOT / path) if (PROJECT_ROOT / path).exists() else Path.cwd() / path
-        if not _has_train_test(path):
-            raise FileNotFoundError(f"source.path {path} has no train.csv/test.csv")
+        if not _has_train_test(path, spec):
+            raise FileNotFoundError(f"source.path {path} has no train/test files")
         return path
 
     named = DATASETS_DIR / spec.name
-    if _has_train_test(named):
+    if _has_train_test(named, spec):
         return named
 
     if source.get("type") == "kaggle":
         competition = source["competition"]
         cached = KAGGLEHUB_CACHE / competition
-        if _has_train_test(cached):
+        if _has_train_test(cached, spec):
             return cached
         if download:
             from src.genML.pipeline.kaggle import download_competition
@@ -310,9 +351,7 @@ def resolve_problem(
     # Sample submission shape (used for metric fallback and output columns)
     sample_value_type = None
     if sample_df is not None and len(sample_df.columns) >= 2:
-        from src.genML.submission_formatter import SubmissionFormatter
-
-        sample_value_type = SubmissionFormatter()._determine_value_type(sample_df[sample_df.columns[1]])
+        sample_value_type = sample_value_kind(sample_df[sample_df.columns[1]])
 
     # Metric
     metric_name = spec.metric
@@ -374,6 +413,7 @@ def resolve_problem(
         source=dict(spec.source),
         inferred=inferred,
         ensemble={"method": "stack", "top": 10, **spec.ensemble},
+        tables=dict(spec.tables),
     )
 
 

@@ -31,12 +31,15 @@ def generate_predictions() -> str:
     """
     try:
         X_test = None
-        test_df = pd.read_pickle(config.DATA_DIR / 'test_data.pkl')
-        transform_info = joblib.load(config.FEATURES_DIR / 'target_transform.pkl')
+        from src.genML.pipeline.dataset import load_stage_table
 
         problem = context.current_problem()
+        # Submissions need only the test ids, which a pruned source run (cross-run ensembles) still has
+        test_df = load_stage_table("test", ids_only_ok=problem is not None)
+        transform_info = joblib.load(config.FEATURES_DIR / 'target_transform.pkl')
+
         if problem is None:
-            train_df = pd.read_pickle(config.DATA_DIR / 'train_data.pkl')
+            train_df = load_stage_table("train")
             problem = context.ensure_problem(train_df, test_df)
 
         # Prefer the OOF stage's final predictions (fold-averaged or ensembled);
