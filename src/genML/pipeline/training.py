@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict, Callable, Tuple, List
-import inspect
+from typing import Any, Dict, Callable, Optional, Tuple, List
 
 import warnings
 from sklearn.exceptions import ConvergenceWarning
@@ -30,14 +28,14 @@ import optuna
 import pandas as pd
 import xgboost as xgb
 from optuna.samplers import TPESampler
-from sklearn.ensemble import StackingClassifier, StackingRegressor, VotingClassifier, VotingRegressor
 from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 
 from src.genML.gpu_utils import (
     get_gpu_config,
     get_linear_model_classifier,
-    get_linear_model_regressor,
     get_random_forest_classifier,
     get_random_forest_regressor,
     get_xgboost_params,
@@ -50,19 +48,10 @@ from src.genML.gpu_utils import (
 )
 from src.genML.pipeline import config, context
 from src.genML.pipeline.ensemble import hill_climb, stack
-from src.genML.pipeline.oof import ExperimentStore, fit_oof, load_or_make_folds, predict_matrix
+from src.genML.pipeline.inference import infer_task_type
+from src.genML.pipeline.oof import (ExperimentStore, FoldFeatures, _with_seed, fit_oof, predict_matrix, run_folds,
+                                    tuning_fold_indices)
 from src.genML.pipeline.targets import inverse_regression
-from src.genML.pipeline.ai_tuning import (
-    build_ai_tuning_override_details,
-    extract_override_values,
-    load_ai_tuning_overrides,
-    save_ai_tuning_overrides,
-)
-from src.genML.pipeline.model_advisor import (
-    apply_model_selection_guidance,
-    detect_problem_type,
-    load_model_selection_guidance
-)
 from src.genML.pipeline.optional_dependencies import (
     CATBOOST_AVAILABLE,
     LIGHTGBM_AVAILABLE,
@@ -74,16 +63,41 @@ from src.genML.pipeline.optional_dependencies import (
     torch,
 )
 from src.genML.pipeline.tuning import (
-    optimize_catboost,
+    GBDT_KINDS,
+    TREE_COUNT_PARAM,
+    fold_cv_score,
+    model_search_space,
+    optimize_gbdt,
     optimize_linear_model,
     optimize_random_forest,
     optimize_tabnet,
-    optimize_xgboost,
+    suggest_gbdt_params,
 )
 from src.genML.pipeline.utils import cleanup_memory
+from src.genML.pipeline.neural import NEURAL_MODELS
 
 
 logger = logging.getLogger(__name__)
+
+
+def run_seed(budget: Optional[Dict[str, Any]]) -> int:
+    """First seed of a run: 42 plus ``budget.seed`` (0 by default). Only trusted code sets budget.seed
+    (repeated baseline runs for the noise measurement); experiments cannot."""
+    return 42 + int((budget or {}).get("seed", 0))
+
+
+def detect_problem_type() -> str:
+    """'regression' or 'classification', from the stored training target (y_train.npy)."""
+    try:
+        y_train = np.load(config.FEATURES_DIR / "y_train.npy")
+        task, reason = infer_task_type(y_train)
+        problem_type = "regression" if task == "regression" else "classification"
+        logger.info("Problem type detected: %s (%s; %s)", problem_type, task, reason)
+        return problem_type
+    except Exception as exc:
+        print(f"Error in problem type detection: {exc}")
+        print("Defaulting to classification")
+        return "classification"
 
 
 def _compute_adaptive_tuning_limits(
@@ -164,7 +178,7 @@ def _categorize_models_by_resource(
     gpu_models = {}
 
     # Models that use GPU acceleration
-    gpu_model_names = {'XGBoost', 'CatBoost', 'LightGBM', 'TabNet'}
+    gpu_model_names = {'XGBoost', 'CatBoost', 'LightGBM', 'TabNet', *NEURAL_MODELS}
 
     for name, factory in models.items():
         if name in gpu_model_names:
@@ -175,6 +189,8 @@ def _categorize_models_by_resource(
                 gpu_models[name] = factory
             elif name == 'LightGBM' and is_lightgbm_gpu_available():
                 gpu_models[name] = factory
+            elif name in NEURAL_MODELS:
+                gpu_models[name] = factory  # one at a time: they share the GPU (or all CPU cores)
             elif name == 'TabNet' and TABNET_AVAILABLE:
                 # TabNet can use GPU if torch has CUDA
                 try:
@@ -204,7 +220,9 @@ def _build_cv(problem, problem_type: str):
         return StratifiedKFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
     if method == "kfold":
         return KFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
-    raise ValueError(f"Unsupported cv.method '{method}' (use 'stratified_kfold' or 'kfold')")
+    if method in ("group_kfold", "stratified_group_kfold", "time_blocks"):
+        return None  # replaced by the run's own folds once they are loaded (PredefinedSplit)
+    raise ValueError(f"Unsupported cv.method '{method}'")
 
 
 def _filter_models(models: Dict[str, Any], requested) -> Dict[str, Any]:
@@ -251,11 +269,13 @@ def _run_oof_stage(problem, task: str, results: Dict[str, Any], models: Dict[str
     run = config.ACTIVE_RUN
     problem_dir = run.problem_dir if run is not None else config.OUTPUTS_DIR
     run_id = run.run_id if run is not None else datetime.now().strftime('%Y%m%d_%H%M%S')
-    fold_ids, signature = load_or_make_folds(y_train, problem.cv, problem_dir)
+    fold_ids, signature = run_folds(y_train, problem.cv, problem_dir, config.FEATURES_DIR)
     store = ExperimentStore(problem_dir)
     store.save_targets(signature, y_train, transform_info)
-    seeds = list(range(42, 42 + int(problem.budget.get('seeds', 1))))
+    first_seed = run_seed(problem.budget)
+    seeds = list(range(first_seed, first_seed + int(problem.budget.get('seeds', 1))))
     tracker = config.PROGRESS_TRACKER
+    fold_features = FoldFeatures.load(config.FEATURES_DIR)
 
     candidates = sorted(
         [(name, res) for name, res in results.items() if name in models and res.get('mean_score') is not None],
@@ -277,7 +297,7 @@ def _run_oof_stage(problem, task: str, results: Dict[str, Any], models: Dict[str
             tracker.track_model_start(f"{name} (OOF)", total_trials=None)
         try:
             oof, test_pred = fit_oof(models[name], params, X_train, y_train, X_test, fold_ids,
-                                     task, n_classes, seeds)
+                                     task, n_classes, seeds, fold_features=fold_features)
         except Exception as exc:
             logger.warning(f"[OOF] {name} failed: {exc}")
             print(f"⚠️  OOF for {name} failed: {exc}")
@@ -287,6 +307,7 @@ def _run_oof_stage(problem, task: str, results: Dict[str, Any], models: Dict[str
             "model": name, "params": params, "metric": problem.metric, "oof_score": score,
             "greater_is_better": metric.greater_is_better, "fold_signature": signature,
             "n_features": int(X_train.shape[1]), "seeds": seeds, "task": task,
+            "nested_encoding": fold_features is not None,
         })
         results[name]['oof_score'] = score
         results[name]['experiment_id'] = experiment.experiment_id
@@ -356,6 +377,18 @@ def _run_oof_stage(problem, task: str, results: Dict[str, Any], models: Dict[str
         "single_scores": {m["name"]: m["score"] for m in singles},
         "ensemble": ensemble_info,
     }
+    if (problem.cv or {}).get("method") == "time_blocks":
+        # The last block is predicted only by models trained on earlier periods: an honest
+        # forward-in-time score to read next to the k-fold OOF score
+        last = int(fold_ids.max())
+        rows = np.where(fold_ids == last)[0]
+        oof_final = store.get(final["experiment_id"]).oof
+        if task == 'regression':
+            holdout = metric.score(y_eval[rows], inverse_regression(oof_final[rows], transform_info), task)
+        else:
+            holdout = metric.score(y_train[rows], oof_final[rows], task)
+        summary["forward_holdout"] = {"fold": last, "rows": int(len(rows)), "score": float(holdout)}
+        print(f"   Forward holdout (latest block, {len(rows)} rows): {problem.metric} = {holdout:.6f}")
     with open(config.REPORTS_DIR / 'final_predictions.json', 'w') as handle:
         json.dump(summary, handle, indent=2, default=str)
     print(f"🏆 Final predictions: {final['name']} (OOF {problem.metric} = {final['score']:.6f})")
@@ -372,16 +405,23 @@ def _train_single_model(
     scoring_metric: str,
     tuning_enabled: bool,
     models_to_tune: List[str],
-    ai_model_overrides: Dict[str, Dict],
     per_model_tuning_limits: Dict[str, Dict[str, Any]],
     global_tuning_trials: int,
     global_tuning_timeout: int,
     base_optuna_n_trials: int,
     base_optuna_timeout: int,
-    is_cpu_pool: bool
+    is_cpu_pool: bool,
+    fold_ids: np.ndarray = None,
+    fold_features: FoldFeatures = None,
+    tuning_folds: List[int] = None,
+    gbdt_budget: Dict[str, Any] = None,
+    seed: int = 42,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Train a single model with hyperparameter tuning.
+
+    ``seed`` (42 plus ``budget.seed``) drives the Optuna sampler and the models built while tuning, so
+    repeated runs of the same settings with different seeds measure run-to-run noise.
 
     This function is designed to be called in parallel for CPU models
     or sequentially for GPU models.
@@ -389,6 +429,12 @@ def _train_single_model(
     Returns:
         Tuple of (model_name, results_dict)
     """
+    if seed != 42:
+        base_factory = model_factory
+
+        def model_factory(overrides=None):
+            return _with_seed(base_factory, overrides, seed)
+
     print(f"\n{'='*60}")
     print(f"Training {name}...")
     print(f"{'='*60}")
@@ -399,7 +445,6 @@ def _train_single_model(
     if config.PROGRESS_TRACKER:
         config.PROGRESS_TRACKER.track_model_start(name)
 
-    model_override_values = ai_model_overrides.get(name, {})
     used_params = None
     model_mean_score = None
     model_std_score = 0.0
@@ -409,6 +454,18 @@ def _train_single_model(
     # Helper function for default evaluation
     def evaluate_with_default_params(overrides=None):
         import warnings
+        if fold_ids is not None:
+            # Shared folds with each fold's nested encodings (no cross-fold leakage)
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
+                # Neural and foundation models are screened on the tuning folds only: the OOF
+                # stage refits every fold anyway, and each fit costs minutes
+                screen_folds = (tuning_folds if name in NEURAL_MODELS and tuning_folds
+                                else range(int(fold_ids.max()) + 1))
+                _, fold_scores, _ = fold_cv_score(
+                    model_factory, overrides, X_train, y_train, fold_ids,
+                    screen_folds, scoring_metric, fold_features)
+            return np.asarray(fold_scores)
         estimator = model_factory(overrides)
         try:
             with warnings.catch_warnings():
@@ -447,7 +504,7 @@ def _train_single_model(
         # Create Optuna study for hyperparameter optimization
         study = optuna.create_study(
             direction='maximize',
-            sampler=TPESampler(seed=42)
+            sampler=TPESampler(seed=seed)
         )
         logger.info(f"[Training] {name} - Optuna study created")
 
@@ -455,10 +512,17 @@ def _train_single_model(
         if name == 'Random Forest':
             logger.info(f"[Training] Random Forest - Entering hyperparameter optimization")
             objective = lambda trial: optimize_random_forest(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
-        elif name == 'XGBoost':
-            objective = lambda trial: optimize_xgboost(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
-        elif name == 'CatBoost':
-            objective = lambda trial: optimize_catboost(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
+        elif name in GBDT_KINDS and fold_ids is not None:
+            gbdt_kind = GBDT_KINDS[name]
+            print(f"   Tuning folds: {list(tuning_folds)} (early stopping picks the tree count)")
+            gbdt_search_space = model_search_space(name, gbdt_budget)
+            gbdt_max_trees = (gbdt_budget or {}).get('max_trees')
+            if (gbdt_budget or {}).get('search_space', {}).get(name) or gbdt_max_trees:
+                print(f"   Search space from budget: {(gbdt_budget or {}).get('search_space', {}).get(name)}"
+                      f", max trees {gbdt_max_trees or 'default'}")
+            objective = lambda trial: optimize_gbdt(trial, gbdt_kind, model_factory, X_train, y_train,
+                                                    fold_ids, tuning_folds, scoring_metric, fold_features,
+                                                    space=gbdt_search_space, max_trees=gbdt_max_trees)
         elif name == 'TabNet':
             objective = lambda trial: optimize_tabnet(trial, X_train, y_train, problem_type, cv, scoring=scoring_metric)
         elif name == 'Logistic Regression' or name == 'Linear Regression':
@@ -507,17 +571,23 @@ def _train_single_model(
             prefix_map = {
                 'Random Forest': 'rf_',
                 'XGBoost': 'xgb_',
+                'LightGBM': 'lgb_',
                 'CatBoost': 'cb_',
                 'TabNet': 'tabnet_',
                 'Logistic Regression': 'lr_',
                 'Linear Regression': 'linreg_'
             }
             prefix = prefix_map.get(name, '')
-            clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
-
-            applied_overrides = model_override_values
-            if applied_overrides:
-                clean_params.update(applied_overrides)
+            if name in GBDT_KINDS and fold_ids is not None:
+                # Full parameter set (including fixed entries) plus the early-stopped tree count
+                gbdt_kind = GBDT_KINDS[name]
+                clean_params = suggest_gbdt_params(optuna.trial.FixedTrial(best_params), gbdt_kind,
+                                                   model_search_space(name, gbdt_budget))
+                n_trees = study.best_trial.user_attrs.get("n_trees")
+                if n_trees:
+                    clean_params[TREE_COUNT_PARAM[gbdt_kind]] = int(n_trees)
+            else:
+                clean_params = {k.replace(prefix, ''): v for k, v in best_params.items()}
 
             # Use best score from optimization
             best_trial_score = study.best_value
@@ -549,14 +619,13 @@ def _train_single_model(
                 'best_params': clean_params,
                 'n_trials': len(study.trials),
                 'tuned': True,
-                'ai_overrides': applied_overrides
             }
 
             del study
         else:
             # Model doesn't have tuning function, use default
             print(f"   ⚠️  No tuning function available for {name}, using defaults")
-            scores = evaluate_with_default_params(ai_model_overrides.get(name))
+            scores = evaluate_with_default_params()
             model_mean_score = float(scores.mean())
             model_std_score = float(scores.std())
             model_scores_list = scores.tolist()
@@ -573,7 +642,6 @@ def _train_single_model(
                 'std_score': model_std_score,
                 'individual_scores': model_scores_list,
                 'tuned': False,
-                'ai_overrides': model_override_values
             }
             print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
     else:
@@ -583,7 +651,7 @@ def _train_single_model(
         if config.PROGRESS_TRACKER:
             config.PROGRESS_TRACKER.track_model_start(name, total_trials=None)
 
-        scores = evaluate_with_default_params(model_override_values)
+        scores = evaluate_with_default_params()
         model_mean_score = float(scores.mean())
         model_std_score = float(scores.std())
         model_scores_list = scores.tolist()
@@ -600,7 +668,6 @@ def _train_single_model(
             'std_score': model_std_score,
             'individual_scores': model_scores_list,
             'tuned': False,
-            'ai_overrides': model_override_values
         }
         print(f"   Score: {model_mean_score:.6f} (+/- {model_std_score:.6f})")
 
@@ -616,6 +683,341 @@ def _train_single_model(
     logger.info(f"[Training] {name} - Training completed")
 
     return name, results
+
+
+def load_feature_names(features_dir) -> List[str]:
+    """Feature names saved next to X_train.npy (empty if the file is missing)."""
+    from pathlib import Path
+
+    path = Path(features_dir) / "feature_names.txt"
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+def build_model_factories(problem_type: str, task: str, n_samples: int, n_features: int,
+                          feature_names: Optional[List[str]] = None,
+                          model_params: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Callable]:
+    """Model factories for a problem: name -> factory(overrides) returning an unfitted estimator.
+
+    Shared by the training stage and by diagnostics that refit a run's models
+    (``diagnostics.seed_noise_test``). ``feature_names`` lets GLM-LightGBM find the
+    target-encoded columns (it uses their logits). ``model_params`` (``budget.model_params``)
+    fixes parameters of the neural and foundation models (``pipeline/neural.py``)."""
+    is_multiclass = task == "multiclass"
+    lightgbm_n_jobs_default = -1 if n_samples > 1500 else config.MEMORY_CONFIG["max_parallel_jobs"]
+    lightgbm_gpu_ready = (
+        LIGHTGBM_AVAILABLE
+        and is_lightgbm_gpu_available()
+        and not config.GPU_CONFIG.get('force_cpu', False)
+    )
+
+    # Get GPU-aware model classes using smart imports
+    LogisticRegressionClass = get_linear_model_classifier()
+    RandomForestRegressorClass = get_random_forest_regressor()
+    RandomForestClassifierClass = get_random_forest_classifier()
+
+    def make_factory(constructor, base_params=None):
+        """
+        Create a factory that instantiates estimators with optional overrides.
+
+        Using factories keeps heavy estimators out of long-lived scopes so they
+        can be garbage collected promptly, which helps avoid GPU memory leaks.
+        """
+        base_params = base_params or {}
+
+        def factory(overrides=None):
+            params = base_params.copy()
+            if overrides:
+                params.update(overrides)
+            return constructor(**params)
+
+        return factory
+
+    def make_scaled_factory(constructor, base_params=None):
+        """Linear models see standardized columns, as they do when tuned (tuning.optimize_linear_model)."""
+        inner = make_factory(constructor, base_params)
+
+        def factory(overrides=None):
+            return make_pipeline(StandardScaler(), inner(overrides))
+
+        return factory
+
+    def make_xgb_regressor_factory():
+        def factory(overrides=None):
+            params = {'random_state': 42, 'objective': 'reg:squarederror', 'eval_metric': 'rmse'}
+            params.update(get_xgboost_params())
+            if overrides:
+                params.update(overrides)
+            return xgb.XGBRegressor(**params)
+
+        return factory
+
+    def make_xgb_classifier_factory():
+        def factory(overrides=None):
+            params = {'random_state': 42}
+            if is_multiclass:
+                params.update({'objective': 'multi:softprob', 'eval_metric': 'mlogloss'})
+            else:
+                params.update({'objective': 'binary:logistic', 'eval_metric': 'logloss'})
+            params.update(get_xgboost_params())
+            if overrides:
+                params.update(overrides)
+            return xgb.XGBClassifier(**params)
+
+        return factory
+
+    def make_catboost_factory(constructor):
+        def factory(overrides=None):
+            params = {
+                'iterations': 400,
+                'learning_rate': 0.05,
+                'depth': 6,
+                'random_state': 42,
+                'verbose': False,
+                'allow_writing_files': False
+            }
+            is_regressor = constructor == cb.CatBoostRegressor
+            is_gpu = is_catboost_gpu_available() and not config.GPU_CONFIG['force_cpu']
+
+            if is_regressor:
+                params.update({
+                    'loss_function': 'RMSE',
+                    'eval_metric': 'RMSE'
+                })
+            else:
+                # Use GPU-compatible metrics when on GPU (AUC not supported on GPU)
+                if is_multiclass:
+                    params.update({'loss_function': 'MultiClass', 'eval_metric': 'MultiClass'})
+                else:
+                    eval_metric = 'Logloss' if is_gpu else 'AUC'
+                    params.update({
+                        'loss_function': 'Logloss',
+                        'eval_metric': eval_metric
+                    })
+
+            if is_gpu:
+                params.update({'task_type': 'GPU', 'devices': '0'})
+                default_bootstrap = 'Poisson'
+            else:
+                params.update({'task_type': 'CPU', 'thread_count': config.MEMORY_CONFIG['max_parallel_jobs']})
+                default_bootstrap = 'Bernoulli'
+
+            if overrides:
+                params.update(overrides)
+
+            subsample = params.get('subsample')
+            bootstrap_type = params.get('bootstrap_type')
+            if subsample is not None and subsample < 0.999:
+                if not bootstrap_type or str(bootstrap_type).lower() == 'bayesian':
+                    params['bootstrap_type'] = default_bootstrap
+            elif not bootstrap_type:
+                params['bootstrap_type'] = default_bootstrap
+
+            return constructor(**params)
+
+        return factory
+
+    def make_tabnet_factory(constructor):
+        """Factory for TabNet models with sklearn-compatible wrappers."""
+        def factory(overrides=None):
+            from sklearn.base import BaseEstimator, RegressorMixin
+
+            # Default TabNet parameters
+            params = {
+                'n_d': 32,
+                'n_a': 32,
+                'n_steps': 5,
+                'gamma': 1.5,
+                'lambda_sparse': 1e-4,
+                'optimizer_params': {'lr': 2e-3},
+                'scheduler_params': {'step_size': 50, 'gamma': 0.95},
+                'mask_type': 'sparsemax',
+                'seed': 42,
+                'verbose': 0,
+                'device_name': 'cuda' if torch.cuda.is_available() else 'cpu'
+            }
+            if overrides:
+                params.update(overrides)
+
+            # Create sklearn-compatible wrapper
+            if constructor == TabNetRegressor:
+                class TabNetRegressorWrapper(BaseEstimator, RegressorMixin):
+                    def __init__(self, **kwargs):
+                        self.kwargs = kwargs
+                        self.model = None
+
+                    def fit(self, X, y):
+                        self.model = TabNetRegressor(**self.kwargs)
+                        X_train = X.astype(np.float32)
+                        y_train = y.astype(np.float32).reshape(-1, 1)
+                        self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
+                        return self
+
+                    def predict(self, X):
+                        X_test = X.astype(np.float32)
+                        return self.model.predict(X_test).flatten()
+
+                return TabNetRegressorWrapper(**params)
+            else:
+                from sklearn.base import ClassifierMixin
+
+                class TabNetClassifierWrapper(ClassifierMixin, BaseEstimator):
+                    def __init__(self, **kwargs):
+                        self.kwargs = kwargs
+                        self.model = None
+
+                    def fit(self, X, y):
+                        self.model = TabNetClassifier(**self.kwargs)
+                        X_train = X.astype(np.float32)
+                        y_train = y.astype(np.int64)
+                        self.classes_ = np.unique(y_train)
+                        self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
+                        return self
+
+                    def predict(self, X):
+                        X_test = X.astype(np.float32)
+                        return self.model.predict(X_test)
+
+                    def predict_proba(self, X):
+                        return self.model.predict_proba(X.astype(np.float32))
+
+                return TabNetClassifierWrapper(**params)
+
+        return factory
+
+    # Define model ensemble based on problem type
+    # Each model has different strengths and biases
+    # Models automatically use GPU (cuML) if available, otherwise CPU (sklearn)
+    if problem_type == 'regression':
+        models = {
+            'Linear Regression': make_scaled_factory(Ridge, {'random_state': 42}),  # Linear, interpretable
+            'Random Forest': make_factory(
+                RandomForestRegressorClass,
+                {'n_estimators': 100, 'random_state': 42}
+            ),  # Non-linear, robust (GPU if cuML available)
+            'XGBoost': make_xgb_regressor_factory()  # Gradient boosting, high performance (GPU if available)
+        }
+        if LIGHTGBM_AVAILABLE:
+            lightgbm_base_params = {
+                'random_state': 42,
+                'n_estimators': 200,
+                'learning_rate': 0.05,
+                'n_jobs': lightgbm_n_jobs_default,
+                'verbosity': -1,
+            }
+            if n_samples <= 1500:
+                lightgbm_base_params.update(
+                    {
+                        'n_estimators': 120,
+                        'min_child_samples': 5,
+                        'min_gain_to_split': 0.0,
+                        'feature_pre_filter': False,
+                    }
+                )
+                print(
+                    f"ℹ️ Adjusting LightGBM for small dataset (n={n_samples}, features={n_features}) "
+                    "to avoid degenerate splits and excessive CPU usage."
+                )
+            if not lightgbm_gpu_ready:
+                print("ℹ️ LightGBM GPU build not detected; training will run on CPU.")
+            models['LightGBM'] = make_factory(lgb.LGBMRegressor, lightgbm_base_params)
+            if lightgbm_gpu_ready:
+                lgb_gpu_params = get_lightgbm_params()
+
+                def lgb_factory_with_gpu(overrides=None):
+                    params = lightgbm_base_params.copy()
+                    params.update(lgb_gpu_params)
+                    if overrides:
+                        params.update(overrides)
+                    return lgb.LGBMRegressor(**params)
+
+                models['LightGBM'] = lgb_factory_with_gpu
+        if CATBOOST_AVAILABLE:
+            models['CatBoost'] = make_catboost_factory(cb.CatBoostRegressor)
+        if TABNET_AVAILABLE:
+            models['TabNet'] = make_tabnet_factory(TabNetRegressor)  # Neural network for tabular data (GPU if available)
+    else:  # classification
+        # cuML uses different parameter names than sklearn
+        # cuML: seed, sklearn: random_state
+        logistic_base_params: Dict[str, Any] = {'max_iter': 1000}
+
+        # Check if this is cuML (Cython classes don't expose signatures properly)
+        class_module = LogisticRegressionClass.__module__
+        if 'cuml' in class_module:
+            # cuML uses 'seed' instead of 'random_state'
+            # Note: cuML LogisticRegression doesn't support random_state parameter
+            pass  # No seed parameter needed for cuML LogisticRegression
+        else:
+            # sklearn uses 'random_state'
+            logistic_base_params['random_state'] = 42
+
+        models = {
+            'Logistic Regression': make_scaled_factory(
+                LogisticRegressionClass,
+                logistic_base_params
+            ),  # Linear, interpretable
+            'Random Forest': make_factory(
+                RandomForestClassifierClass,
+                {'n_estimators': 100, 'random_state': 42}
+            ),  # Non-linear, robust (GPU if cuML available)
+            'XGBoost': make_xgb_classifier_factory()  # Gradient boosting, high performance (GPU if available)
+        }
+        if LIGHTGBM_AVAILABLE:
+            lightgbm_base_params = {
+                'random_state': 42,
+                'n_estimators': 200,
+                'learning_rate': 0.05,
+                'n_jobs': lightgbm_n_jobs_default,
+                'objective': 'multiclass' if is_multiclass else 'binary',
+                'verbosity': -1,
+            }
+            if n_samples <= 1500:
+                lightgbm_base_params.update(
+                    {
+                        'n_estimators': 120,
+                        'min_child_samples': 5,
+                        'min_gain_to_split': 0.0,
+                        'feature_pre_filter': False,
+                    }
+                )
+                print(
+                    f"ℹ️ Adjusting LightGBM for small dataset (n={n_samples}, features={n_features}) "
+                    "to avoid degenerate splits and excessive CPU usage."
+                )
+            if not lightgbm_gpu_ready:
+                print("ℹ️ LightGBM GPU build not detected; training will run on CPU.")
+            models['LightGBM'] = make_factory(lgb.LGBMClassifier, lightgbm_base_params)
+            if lightgbm_gpu_ready:
+                lgb_gpu_params = get_lightgbm_params()
+
+                def lgb_clf_factory_with_gpu(overrides=None):
+                    params = lightgbm_base_params.copy()
+                    params.update(lgb_gpu_params)
+                    if overrides:
+                        params.update(overrides)
+                    return lgb.LGBMClassifier(**params)
+
+                models['LightGBM'] = lgb_clf_factory_with_gpu
+            if not is_multiclass:
+                from src.genML.pipeline.glm_boost import GLMBoostClassifier, te_column_indices
+
+                glm_te_columns = te_column_indices(feature_names)
+                glm_gpu_params = get_lightgbm_params() if lightgbm_gpu_ready else {}
+
+                def glm_lgb_factory(overrides=None):
+                    params = {**lightgbm_base_params, **glm_gpu_params, **(overrides or {})}
+                    return GLMBoostClassifier(te_columns=glm_te_columns, **params)
+
+                models['GLM-LightGBM'] = glm_lgb_factory
+        if CATBOOST_AVAILABLE:
+            models['CatBoost'] = make_catboost_factory(cb.CatBoostClassifier)
+        if TABNET_AVAILABLE:
+            models['TabNet'] = make_tabnet_factory(TabNetClassifier)  # Neural network for tabular data (GPU if available)
+    from src.genML.pipeline.neural import neural_factories
+
+    models.update(neural_factories(task, model_params))  # RealMLP, TabM, TabPFN when installed
+    return models
 
 
 def train_model_pipeline() -> str:
@@ -648,12 +1050,6 @@ def train_model_pipeline() -> str:
 
         n_samples = int(X_train.shape[0])
         n_features = int(X_train.shape[1]) if X_train.ndim > 1 else 0
-        lightgbm_n_jobs_default = -1 if n_samples > 1500 else config.MEMORY_CONFIG["max_parallel_jobs"]
-        lightgbm_gpu_ready = (
-            LIGHTGBM_AVAILABLE
-            and is_lightgbm_gpu_available()
-            and not config.GPU_CONFIG.get('force_cpu', False)
-        )
 
         # Automatically detect problem type
         problem = context.current_problem()
@@ -669,7 +1065,6 @@ def train_model_pipeline() -> str:
                 else ("binary" if len(np.unique(y_train)) <= 2 else "multiclass")
             )
             logger.info(f"Problem type detected: {problem_type} ({task})")
-        is_multiclass = task == "multiclass"
 
         # Get GPU configuration for logging
         gpu_config = get_gpu_config()
@@ -691,28 +1086,8 @@ def train_model_pipeline() -> str:
         else:
             print("ℹ️ TabNet not installed - install `pytorch-tabnet` to enable that model option.")
 
-        ai_override_details, ai_override_metadata = load_ai_tuning_overrides()
-        ai_model_overrides = extract_override_values(ai_override_details)
-        ai_override_updates: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        if ai_model_overrides:
-            override_summary = []
-            for model_name, params in ai_model_overrides.items():
-                if params:
-                    formatted_params = ', '.join(f"{k}={v}" for k, v in params.items())
-                    override_summary.append(f"{model_name}({formatted_params})")
-            if override_summary:
-                print(f"🤖 Applying AI tuning overrides: {', '.join(override_summary)}")
-        else:
-            ai_override_details = {}
-            ai_override_metadata = {}
-
         original_models_to_tune = list(config.TUNING_CONFIG['models_to_tune'])
 
-        # Get GPU-aware model classes using smart imports
-        LinearRegressionClass = get_linear_model_regressor()
-        LogisticRegressionClass = get_linear_model_classifier()
-        RandomForestRegressorClass = get_random_forest_regressor()
-        RandomForestClassifierClass = get_random_forest_classifier()
 
         tuning_overrides = _compute_adaptive_tuning_limits(X_train.shape)
         global_tuning_trials = tuning_overrides["global"]["n_trials"]
@@ -722,283 +1097,10 @@ def train_model_pipeline() -> str:
         for note in tuning_overrides.get("notes", []):
             print(f"⚙️ {note}")
 
-        def make_factory(constructor, base_params=None):
-            """
-            Create a factory that instantiates estimators with optional overrides.
-
-            Using factories keeps heavy estimators out of long-lived scopes so they
-            can be garbage collected promptly, which helps avoid GPU memory leaks.
-            """
-            base_params = base_params or {}
-
-            def factory(overrides=None):
-                params = base_params.copy()
-                if overrides:
-                    params.update(overrides)
-                return constructor(**params)
-
-            return factory
-
-        def make_xgb_regressor_factory():
-            def factory(overrides=None):
-                params = {'random_state': 42, 'objective': 'reg:squarederror', 'eval_metric': 'rmse'}
-                params.update(get_xgboost_params())
-                if overrides:
-                    params.update(overrides)
-                return xgb.XGBRegressor(**params)
-
-            return factory
-
-        def make_xgb_classifier_factory():
-            def factory(overrides=None):
-                params = {'random_state': 42}
-                if is_multiclass:
-                    params.update({'objective': 'multi:softprob', 'eval_metric': 'mlogloss'})
-                else:
-                    params.update({'objective': 'binary:logistic', 'eval_metric': 'logloss'})
-                params.update(get_xgboost_params())
-                if overrides:
-                    params.update(overrides)
-                return xgb.XGBClassifier(**params)
-
-            return factory
-
-        def make_catboost_factory(constructor):
-            def factory(overrides=None):
-                params = {
-                    'iterations': 400,
-                    'learning_rate': 0.05,
-                    'depth': 6,
-                    'random_state': 42,
-                    'verbose': False,
-                    'allow_writing_files': False
-                }
-                is_regressor = constructor == cb.CatBoostRegressor
-                is_gpu = is_catboost_gpu_available() and not config.GPU_CONFIG['force_cpu']
-
-                if is_regressor:
-                    params.update({
-                        'loss_function': 'RMSE',
-                        'eval_metric': 'RMSE'
-                    })
-                else:
-                    # Use GPU-compatible metrics when on GPU (AUC not supported on GPU)
-                    if is_multiclass:
-                        params.update({'loss_function': 'MultiClass', 'eval_metric': 'MultiClass'})
-                    else:
-                        eval_metric = 'Logloss' if is_gpu else 'AUC'
-                        params.update({
-                            'loss_function': 'Logloss',
-                            'eval_metric': eval_metric
-                        })
-
-                if is_gpu:
-                    params.update({'task_type': 'GPU', 'devices': '0'})
-                    default_bootstrap = 'Poisson'
-                else:
-                    params.update({'task_type': 'CPU', 'thread_count': config.MEMORY_CONFIG['max_parallel_jobs']})
-                    default_bootstrap = 'Bernoulli'
-
-                if overrides:
-                    params.update(overrides)
-
-                subsample = params.get('subsample')
-                bootstrap_type = params.get('bootstrap_type')
-                if subsample is not None and subsample < 0.999:
-                    if not bootstrap_type or str(bootstrap_type).lower() == 'bayesian':
-                        params['bootstrap_type'] = default_bootstrap
-                elif not bootstrap_type:
-                    params['bootstrap_type'] = default_bootstrap
-
-                return constructor(**params)
-
-            return factory
-
-        def make_tabnet_factory(constructor):
-            """Factory for TabNet models with sklearn-compatible wrappers."""
-            def factory(overrides=None):
-                from sklearn.base import BaseEstimator, RegressorMixin
-
-                # Default TabNet parameters
-                params = {
-                    'n_d': 32,
-                    'n_a': 32,
-                    'n_steps': 5,
-                    'gamma': 1.5,
-                    'lambda_sparse': 1e-4,
-                    'optimizer_params': {'lr': 2e-3},
-                    'scheduler_params': {'step_size': 50, 'gamma': 0.95},
-                    'mask_type': 'sparsemax',
-                    'seed': 42,
-                    'verbose': 0,
-                    'device_name': 'cuda' if torch.cuda.is_available() else 'cpu'
-                }
-                if overrides:
-                    params.update(overrides)
-
-                # Create sklearn-compatible wrapper
-                if constructor == TabNetRegressor:
-                    class TabNetRegressorWrapper(BaseEstimator, RegressorMixin):
-                        def __init__(self, **kwargs):
-                            self.kwargs = kwargs
-                            self.model = None
-
-                        def fit(self, X, y):
-                            self.model = TabNetRegressor(**self.kwargs)
-                            X_train = X.astype(np.float32)
-                            y_train = y.astype(np.float32).reshape(-1, 1)
-                            self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
-                            return self
-
-                        def predict(self, X):
-                            X_test = X.astype(np.float32)
-                            return self.model.predict(X_test).flatten()
-
-                    return TabNetRegressorWrapper(**params)
-                else:
-                    from sklearn.base import ClassifierMixin
-
-                    class TabNetClassifierWrapper(ClassifierMixin, BaseEstimator):
-                        def __init__(self, **kwargs):
-                            self.kwargs = kwargs
-                            self.model = None
-
-                        def fit(self, X, y):
-                            self.model = TabNetClassifier(**self.kwargs)
-                            X_train = X.astype(np.float32)
-                            y_train = y.astype(np.int64)
-                            self.classes_ = np.unique(y_train)
-                            self.model.fit(X_train, y_train, max_epochs=50, patience=10, batch_size=1024)
-                            return self
-
-                        def predict(self, X):
-                            X_test = X.astype(np.float32)
-                            return self.model.predict(X_test)
-
-                        def predict_proba(self, X):
-                            return self.model.predict_proba(X.astype(np.float32))
-
-                    return TabNetClassifierWrapper(**params)
-
-            return factory
-
-        # Define model ensemble based on problem type
-        # Each model has different strengths and biases
-        # Models automatically use GPU (cuML) if available, otherwise CPU (sklearn)
-        if problem_type == 'regression':
-            models = {
-                'Linear Regression': make_factory(LinearRegressionClass),  # Linear, interpretable
-                'Random Forest': make_factory(
-                    RandomForestRegressorClass,
-                    {'n_estimators': 100, 'random_state': 42}
-                ),  # Non-linear, robust (GPU if cuML available)
-                'XGBoost': make_xgb_regressor_factory()  # Gradient boosting, high performance (GPU if available)
-            }
-            if LIGHTGBM_AVAILABLE:
-                lightgbm_base_params = {
-                    'random_state': 42,
-                    'n_estimators': 200,
-                    'learning_rate': 0.05,
-                    'n_jobs': lightgbm_n_jobs_default,
-                    'verbosity': -1,
-                }
-                if n_samples <= 1500:
-                    lightgbm_base_params.update(
-                        {
-                            'n_estimators': 120,
-                            'min_child_samples': 5,
-                            'min_gain_to_split': 0.0,
-                            'feature_pre_filter': False,
-                        }
-                    )
-                    print(
-                        f"ℹ️ Adjusting LightGBM for small dataset (n={n_samples}, features={n_features}) "
-                        "to avoid degenerate splits and excessive CPU usage."
-                    )
-                if not lightgbm_gpu_ready:
-                    print("ℹ️ LightGBM GPU build not detected; training will run on CPU.")
-                models['LightGBM'] = make_factory(lgb.LGBMRegressor, lightgbm_base_params)
-                if lightgbm_gpu_ready:
-                    lgb_gpu_params = get_lightgbm_params()
-
-                    def lgb_factory_with_gpu(overrides=None):
-                        params = lightgbm_base_params.copy()
-                        params.update(lgb_gpu_params)
-                        if overrides:
-                            params.update(overrides)
-                        return lgb.LGBMRegressor(**params)
-
-                    models['LightGBM'] = lgb_factory_with_gpu
-            if CATBOOST_AVAILABLE:
-                models['CatBoost'] = make_catboost_factory(cb.CatBoostRegressor)
-            if TABNET_AVAILABLE:
-                models['TabNet'] = make_tabnet_factory(TabNetRegressor)  # Neural network for tabular data (GPU if available)
-        else:  # classification
-            # cuML uses different parameter names than sklearn
-            # cuML: seed, sklearn: random_state
-            logistic_base_params: Dict[str, Any] = {'max_iter': 1000}
-
-            # Check if this is cuML (Cython classes don't expose signatures properly)
-            class_module = LogisticRegressionClass.__module__
-            if 'cuml' in class_module:
-                # cuML uses 'seed' instead of 'random_state'
-                # Note: cuML LogisticRegression doesn't support random_state parameter
-                pass  # No seed parameter needed for cuML LogisticRegression
-            else:
-                # sklearn uses 'random_state'
-                logistic_base_params['random_state'] = 42
-
-            models = {
-                'Logistic Regression': make_factory(
-                    LogisticRegressionClass,
-                    logistic_base_params
-                ),  # Linear, interpretable
-                'Random Forest': make_factory(
-                    RandomForestClassifierClass,
-                    {'n_estimators': 100, 'random_state': 42}
-                ),  # Non-linear, robust (GPU if cuML available)
-                'XGBoost': make_xgb_classifier_factory()  # Gradient boosting, high performance (GPU if available)
-            }
-            if LIGHTGBM_AVAILABLE:
-                lightgbm_base_params = {
-                    'random_state': 42,
-                    'n_estimators': 200,
-                    'learning_rate': 0.05,
-                    'n_jobs': lightgbm_n_jobs_default,
-                    'objective': 'multiclass' if is_multiclass else 'binary',
-                    'verbosity': -1,
-                }
-                if n_samples <= 1500:
-                    lightgbm_base_params.update(
-                        {
-                            'n_estimators': 120,
-                            'min_child_samples': 5,
-                            'min_gain_to_split': 0.0,
-                            'feature_pre_filter': False,
-                        }
-                    )
-                    print(
-                        f"ℹ️ Adjusting LightGBM for small dataset (n={n_samples}, features={n_features}) "
-                        "to avoid degenerate splits and excessive CPU usage."
-                    )
-                if not lightgbm_gpu_ready:
-                    print("ℹ️ LightGBM GPU build not detected; training will run on CPU.")
-                models['LightGBM'] = make_factory(lgb.LGBMClassifier, lightgbm_base_params)
-                if lightgbm_gpu_ready:
-                    lgb_gpu_params = get_lightgbm_params()
-
-                    def lgb_clf_factory_with_gpu(overrides=None):
-                        params = lightgbm_base_params.copy()
-                        params.update(lgb_gpu_params)
-                        if overrides:
-                            params.update(overrides)
-                        return lgb.LGBMClassifier(**params)
-
-                    models['LightGBM'] = lgb_clf_factory_with_gpu
-            if CATBOOST_AVAILABLE:
-                models['CatBoost'] = make_catboost_factory(cb.CatBoostClassifier)
-            if TABNET_AVAILABLE:
-                models['TabNet'] = make_tabnet_factory(TabNetClassifier)  # Neural network for tabular data (GPU if available)
+        models = build_model_factories(problem_type, task, n_samples, n_features,
+                                       feature_names=load_feature_names(config.FEATURES_DIR),
+                                       model_params=((problem.budget or {}).get('model_params')
+                                                     if problem is not None else None))
 
         # Metric, CV and budget come from the resolved problem spec
         cv = _build_cv(problem, problem_type)
@@ -1010,6 +1112,27 @@ def train_model_pipeline() -> str:
             metric_name = 'mse' if problem_type == 'regression' else 'accuracy'
         print(f"Optimizing for: {metric_name} (CV scores are higher-is-better)")
         best_score = float('-inf')
+
+        # Shared folds (same as the OOF stage) and per-fold nested encodings, if any
+        cv_config = dict(problem.cv) if problem is not None else {
+            "method": "kfold" if problem_type == "regression" else "stratified_kfold",
+            "n_splits": 5, "shuffle": True, "random_state": 42}
+        run = config.ACTIVE_RUN
+        problem_dir = run.problem_dir if run is not None else config.OUTPUTS_DIR
+        fold_ids, _ = run_folds(y_train, cv_config, problem_dir, config.FEATURES_DIR)
+        if cv is None:  # grouped / time folds come from the data, so sklearn gets them as-is
+            from sklearn.model_selection import PredefinedSplit
+
+            cv = PredefinedSplit(fold_ids)
+        fold_features = FoldFeatures.load(config.FEATURES_DIR)
+        n_folds = int(fold_ids.max()) + 1
+        budget_for_folds = problem.budget if problem is not None else {}
+        default_tuning_folds = n_folds if n_samples <= 200_000 else min(2, n_folds)
+        # time_blocks tune on the latest periods, other methods on the first folds
+        tuning_folds = tuning_fold_indices(cv_config, n_folds,
+                                           int(budget_for_folds.get('tuning_folds', default_tuning_folds)))
+        if fold_features is not None:
+            print(f"Nested target encoding: {len(fold_features.columns)} columns swapped per fold")
 
         models = _filter_models(models, problem.models if problem is not None else None)
         models_to_tune = list(config.TUNING_CONFIG['models_to_tune'])
@@ -1026,53 +1149,10 @@ def train_model_pipeline() -> str:
         if budget:
             print(f"Budget from problem spec: {budget}")
 
-        model_selection_summary = {'applied': False}
-        guidance_payload = load_model_selection_guidance()
-        ordered_models, tuned_models_list, selection_summary = apply_model_selection_guidance(
-            models,
-            guidance_payload,
-            original_models_to_tune
-        )
-        models = ordered_models
-        if tuned_models_list is not None:
-            models_to_tune = tuned_models_list
-        if selection_summary.get('applied'):
-            model_selection_summary = selection_summary
-            if selection_summary.get('recommended_order'):
-                print(f"🤖 Model advisor recommended order: {selection_summary['recommended_order']}")
-            if selection_summary.get('excluded_models'):
-                print(f"   Skipping models per advisor guidance: {selection_summary['excluded_models']}")
-
-        def evaluate_with_default_params(model_name, factory_fn, overrides=None):
-            """
-            Run cross-validation on the estimator built from the factory.
-            The estimator is created inside this helper so it can be freed immediately.
-            """
-            import warnings
-
-            estimator = factory_fn(overrides)
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings('ignore', message='.*Falling back to prediction using DMatrix.*')
-                    # Use n_jobs=1 for XGBoost GPU (GPU parallelizes internally)
-                    n_jobs_param = 1 if 'XGBoost' in model_name and is_xgboost_gpu_available() else -1
-                    return cross_val_score(
-                        estimator,
-                        X_train,
-                        y_train,
-                        cv=cv,
-                        scoring=scoring_metric,
-                        n_jobs=n_jobs_param
-                    )
-            finally:
-                # Explicitly delete estimator before cleanup to release GPU memory
-                del estimator
-
         # Model evaluation pipeline with Optuna hyperparameter tuning
         # Systematically evaluate each model using cross-validation with optimized hyperparameters
         results = {}
         best_model_name = None
-        tuned_params = {}  # Store best hyperparameters for each model
 
         # Suppress Optuna's default logging to reduce clutter
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1118,13 +1198,17 @@ def train_model_pipeline() -> str:
                         scoring_metric=scoring_metric,
                         tuning_enabled=tuning_enabled,
                         models_to_tune=models_to_tune,
-                        ai_model_overrides=ai_model_overrides,
+                        seed=run_seed(budget),
                         per_model_tuning_limits=per_model_tuning_limits,
                         global_tuning_trials=global_tuning_trials,
                         global_tuning_timeout=global_tuning_timeout,
                         base_optuna_n_trials=config.TUNING_CONFIG['n_trials'],
                         base_optuna_timeout=config.TUNING_CONFIG['timeout'],
-                        is_cpu_pool=True
+                        is_cpu_pool=True,
+                        fold_ids=fold_ids,
+                        fold_features=fold_features,
+                        tuning_folds=tuning_folds,
+                        gbdt_budget=budget,
                     )
                     future_to_model[future] = name
 
@@ -1135,9 +1219,6 @@ def train_model_pipeline() -> str:
                         model_name, model_results = future.result()
                         results[model_name] = model_results
 
-                        # Store tuned params if available
-                        if model_results.get('tuned') and model_results.get('best_params'):
-                            tuned_params[model_name] = model_results['best_params']
 
                         # Update progress
                         models_completed += 1
@@ -1169,19 +1250,20 @@ def train_model_pipeline() -> str:
                         scoring_metric=scoring_metric,
                         tuning_enabled=tuning_enabled,
                         models_to_tune=models_to_tune,
-                        ai_model_overrides=ai_model_overrides,
+                        seed=run_seed(budget),
                         per_model_tuning_limits=per_model_tuning_limits,
                         global_tuning_trials=global_tuning_trials,
                         global_tuning_timeout=global_tuning_timeout,
                         base_optuna_n_trials=config.TUNING_CONFIG['n_trials'],
                         base_optuna_timeout=config.TUNING_CONFIG['timeout'],
-                        is_cpu_pool=True
+                        is_cpu_pool=True,
+                        fold_ids=fold_ids,
+                        fold_features=fold_features,
+                        tuning_folds=tuning_folds,
+                        gbdt_budget=budget,
                     )
                     results[model_name] = model_results
 
-                    # Store tuned params if available
-                    if model_results.get('tuned') and model_results.get('best_params'):
-                        tuned_params[model_name] = model_results['best_params']
 
                     # Update progress
                     models_completed += 1
@@ -1213,19 +1295,20 @@ def train_model_pipeline() -> str:
                         scoring_metric=scoring_metric,
                         tuning_enabled=tuning_enabled,
                         models_to_tune=models_to_tune,
-                        ai_model_overrides=ai_model_overrides,
+                        seed=run_seed(budget),
                         per_model_tuning_limits=per_model_tuning_limits,
                         global_tuning_trials=global_tuning_trials,
                         global_tuning_timeout=global_tuning_timeout,
                         base_optuna_n_trials=config.TUNING_CONFIG['n_trials'],
                         base_optuna_timeout=config.TUNING_CONFIG['timeout'],
-                        is_cpu_pool=False
+                        is_cpu_pool=False,
+                        fold_ids=fold_ids,
+                        fold_features=fold_features,
+                        tuning_folds=tuning_folds,
+                        gbdt_budget=budget,
                     )
                     results[model_name] = model_results
 
-                    # Store tuned params if available
-                    if model_results.get('tuned') and model_results.get('best_params'):
-                        tuned_params[model_name] = model_results['best_params']
 
                     # Update progress
                     models_completed += 1
@@ -1242,13 +1325,13 @@ def train_model_pipeline() -> str:
                         config.PROGRESS_TRACKER.update_model_training_stage(models_completed, total_models)
 
         if problem is None:
-            train_df = pd.read_pickle(config.DATA_DIR / 'train_data.pkl')
-            test_df = pd.read_pickle(config.DATA_DIR / 'test_data.pkl')
+            from src.genML.pipeline.dataset import load_stage_table
+
+            train_df, test_df = load_stage_table("train"), load_stage_table("test")
             problem = context.ensure_problem(train_df, test_df)
 
         def params_for(name, model_result):
             params = dict(model_result.get('best_params') or {}) if model_result.get('tuned') else {}
-            params.update(ai_model_overrides.get(name, {}) or {})
             return params or None
 
         oof_summary = _run_oof_stage(problem, task, results, models, params_for, X_train, y_train)
@@ -1272,17 +1355,6 @@ def train_model_pipeline() -> str:
         model_filename = (
             f'best_model_{best_model_name.lower().replace(" ", "_")}_{timestamp}.pkl' if best_model is not None else None
         )
-
-        if ai_override_updates:
-            save_ai_tuning_overrides(
-                ai_override_details,
-                {
-                    'problem_type': problem_type,
-                    'best_model': best_model_name,
-                    'best_score': float(best_score),
-                    'model_filename': model_filename
-                }
-            )
 
         if best_model is not None:
             joblib.dump(best_model, config.MODELS_DIR / model_filename)
@@ -1312,12 +1384,6 @@ def train_model_pipeline() -> str:
             "model_filename": model_filename,
             "timestamp": timestamp,
             "model_saved": str(config.MODELS_DIR / model_filename) if model_filename else None,
-            "ai_model_selection_guidance": guidance_payload,
-            "ai_model_selection_summary": model_selection_summary,
-            "ai_tuning_overrides_loaded": ai_override_details,
-            "ai_tuning_overrides_metadata": ai_override_metadata,
-            "ai_tuning_overrides_updates": ai_override_updates,
-            "ai_model_overrides_used": ai_model_overrides,
             "gpu_acceleration": {
                 "cuml_available": is_cuml_available(),
                 "xgboost_gpu_available": is_xgboost_gpu_available(),

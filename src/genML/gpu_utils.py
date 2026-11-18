@@ -33,6 +33,21 @@ _GPU_CONFIG = {
 }
 
 
+WSL_NVIDIA_SMI = "/usr/lib/wsl/lib/nvidia-smi"
+
+
+def nvidia_smi() -> str:
+    """Path of nvidia-smi. On WSL it lives in /usr/lib/wsl/lib, which services started by systemd do not
+    have on PATH; without this fallback such a service would quietly train everything on the CPU."""
+    import shutil
+    from pathlib import Path
+
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    return WSL_NVIDIA_SMI if Path(WSL_NVIDIA_SMI).exists() else "nvidia-smi"
+
+
 def detect_cuda() -> Dict[str, Any]:
     """
     Detect CUDA availability and GPU specifications.
@@ -43,7 +58,7 @@ def detect_cuda() -> Dict[str, Any]:
     try:
         # Try nvidia-smi to get GPU information
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name,driver_version,memory.total', '--format=csv,noheader'],
+            [nvidia_smi(), '--query-gpu=name,driver_version,memory.total', '--format=csv,noheader'],
             capture_output=True,
             text=True,
             timeout=5
@@ -259,7 +274,7 @@ def get_gpu_memory_usage() -> Optional[float]:
     """
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+            [nvidia_smi(), '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
             capture_output=True,
             text=True,
             timeout=2
@@ -283,7 +298,7 @@ def get_gpu_memory_info() -> Optional[Dict[str, float]]:
     """
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
+            [nvidia_smi(), '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
             capture_output=True,
             text=True,
             timeout=2

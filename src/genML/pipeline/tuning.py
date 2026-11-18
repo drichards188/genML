@@ -3,32 +3,31 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
-from typing import Any
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from sklearn.linear_model import Ridge
+from sklearn.metrics import get_scorer
 from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 import optuna
-import xgboost as xgb
 
 from src.genML.gpu_utils import (
     get_gpu_memory_usage,
     get_linear_model_classifier,
     get_random_forest_classifier,
     get_random_forest_regressor,
-    get_xgboost_params,
-    is_catboost_gpu_available,
     is_cuml_available,
-    is_xgboost_gpu_available,
 )
 from src.genML.pipeline import config
+from src.genML.pipeline.oof import FoldFeatures, fold_split
 from src.genML.pipeline.optional_dependencies import (
-    CATBOOST_AVAILABLE,
     TABNET_AVAILABLE,
-    cb,
+    lgb,
     torch,
     TabNetClassifier,
     TabNetRegressor,
@@ -102,67 +101,220 @@ def optimize_random_forest(trial: optuna.trial.Trial, X, y, problem_type: str, c
     return mean_score
 
 
-def optimize_xgboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
-    """Optuna objective function for XGBoost hyperparameter optimization."""
-    logger.info("[XGB Trial %s] Starting XGBoost optimization trial", trial.number)
+# --------------------------------------------------------------------------- #
+# Gradient-boosted trees: shared folds, nested encodings, early stopping
+# --------------------------------------------------------------------------- #
 
-    params = get_xgboost_params()
-    params.update(
-        {
-            "n_estimators": trial.suggest_int("xgb_n_estimators", 100, 800),
-            "max_depth": trial.suggest_int("xgb_max_depth", 3, 12),
-            "learning_rate": trial.suggest_float("xgb_learning_rate", 0.01, 0.3, log=True),
-            "subsample": trial.suggest_float("xgb_subsample", 0.5, 1.0),
-            "colsample_bytree": trial.suggest_float("xgb_colsample_bytree", 0.5, 1.0),
-            "reg_alpha": trial.suggest_float("xgb_reg_alpha", 1e-8, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("xgb_reg_lambda", 1e-8, 10.0, log=True),
-        }
-    )
+# Tree-count ceiling during tuning; early stopping picks the real count, and the
+# mean best iteration over tuning folds becomes the model's fixed tree count for
+# the out-of-fold stage (so OOF rows never decide when their own model stops).
+MAX_TREES = 6000
+EARLY_STOPPING_ROUNDS = 200
 
-    if problem_type == "regression":
-        params["objective"] = "reg:squarederror"
-        default_scoring = "neg_mean_squared_error"
-        ModelClass = xgb.XGBRegressor
-    else:
-        params["objective"] = "multi:softprob" if len(np.unique(y)) > 2 else "binary:logistic"
-        default_scoring = "accuracy"
-        ModelClass = xgb.XGBClassifier
+GBDT_KINDS = {"XGBoost": "xgb", "LightGBM": "lgb", "CatBoost": "cb", "GLM-LightGBM": "lgb"}
+TREE_COUNT_PARAM = {"xgb": "n_estimators", "lgb": "n_estimators", "cb": "iterations"}
 
-    if is_xgboost_gpu_available() and not config.GPU_CONFIG["force_cpu"]:
-        # XGBoost >= 2.0 selects the GPU with device="cuda"; "gpu_hist" was removed in 3.x
-        params["tree_method"] = "hist"
-        params["device"] = "cuda"
-        device = "GPU"
-    else:
-        params["tree_method"] = "hist"
-        device = "CPU"
 
-    logger.info("[XGB Trial %s] Using %s acceleration", trial.number, device)
+# Search spaces: param -> (type, low, high, log scale). Ranges reach down to
+# stumps (depth 1, 2 leaves): Playground data is often generated from
+# near-additive rules, where shallow trees trained long win. Diagnostics read
+# these bounds to flag tuned values that sit on an edge (diagnostics.range_edges).
+# A problem can narrow or move any range with budget.search_space (gbdt_space()).
+GBDT_SPACE: Dict[str, Dict[str, Tuple[str, float, float, bool]]] = {
+    "xgb": {
+        "max_depth": ("int", 1, 8, False),
+        "learning_rate": ("float", 0.02, 0.2, True),
+        "min_child_weight": ("float", 1.0, 100.0, True),
+        "subsample": ("float", 0.5, 1.0, False),
+        "colsample_bytree": ("float", 0.3, 1.0, False),
+        "reg_alpha": ("float", 1e-3, 10.0, True),
+        "reg_lambda": ("float", 1e-3, 50.0, True),
+    },
+    "lgb": {
+        "num_leaves": ("int", 2, 64, True),
+        "learning_rate": ("float", 0.02, 0.2, True),
+        "min_child_samples": ("int", 10, 500, True),
+        "subsample": ("float", 0.5, 1.0, False),
+        "colsample_bytree": ("float", 0.3, 1.0, False),
+        "reg_alpha": ("float", 1e-3, 10.0, True),
+        "reg_lambda": ("float", 1e-3, 50.0, True),
+    },
+    "cb": {
+        "depth": ("int", 1, 8, False),
+        "learning_rate": ("float", 0.02, 0.2, True),
+        "l2_leaf_reg": ("float", 1.0, 50.0, True),
+        "subsample": ("float", 0.6, 1.0, False),
+    },
+}
+GBDT_FIXED: Dict[str, Dict[str, Any]] = {"lgb": {"subsample_freq": 1}}
+# Outer limits for budget.search_space overrides: param -> (min, max)
+GBDT_LIMITS: Dict[str, Tuple[float, float]] = {
+    "max_depth": (1, 16), "depth": (1, 12), "num_leaves": (2, 1024),
+    "learning_rate": (1e-3, 1.0), "min_child_weight": (1e-3, 1e4), "min_child_samples": (1, 10_000),
+    "subsample": (0.1, 1.0), "colsample_bytree": (0.1, 1.0),
+    "reg_alpha": (1e-8, 1e3), "reg_lambda": (1e-8, 1e3), "l2_leaf_reg": (1e-3, 1e3),
+}
+MAX_TREES_LIMITS = (100, 30_000)
 
-    model = ModelClass(**params)
 
-    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring or default_scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
-    mean_score = scores.mean()
+def check_search_space(search_space: Any) -> list:
+    """Problems with a ``budget.search_space`` mapping (empty list = valid).
 
-    del model
-    del scores
-    gc.collect()
+    Shape: ``{model name: {param: [low, high]}}`` for XGBoost, LightGBM, CatBoost
+    (and models tuned like them), params from ``GBDT_SPACE``, within ``GBDT_LIMITS``.
+    """
+    if not isinstance(search_space, dict) or not search_space:
+        return ["budget.search_space must be a non-empty mapping of model -> {param: [low, high]}"]
+    errors = []
+    for model, ranges in search_space.items():
+        kind = GBDT_KINDS.get(model)
+        if kind is None:
+            errors.append(f"budget.search_space.{model}: only {', '.join(GBDT_KINDS)} have search spaces")
+            continue
+        if not isinstance(ranges, dict) or not ranges:
+            errors.append(f"budget.search_space.{model} must map params to [low, high]")
+            continue
+        for param, bounds in ranges.items():
+            where = f"budget.search_space.{model}.{param}"
+            if param not in GBDT_SPACE[kind]:
+                errors.append(f"{where} is not tuned for {model} (tuned: {', '.join(GBDT_SPACE[kind])})")
+                continue
+            if (not isinstance(bounds, (list, tuple)) or len(bounds) != 2
+                    or not all(isinstance(b, (int, float)) and not isinstance(b, bool) for b in bounds)):
+                errors.append(f"{where} must be [low, high], got {bounds!r}")
+                continue
+            low, high = bounds
+            if GBDT_SPACE[kind][param][0] == "int" and not all(float(b).is_integer() for b in bounds):
+                errors.append(f"{where} takes whole numbers, got {bounds!r}")
+            if not low < high:
+                errors.append(f"{where}: low must be below high, got {bounds!r}")
+            lo_limit, hi_limit = GBDT_LIMITS[param]
+            if low < lo_limit or high > hi_limit:
+                errors.append(f"{where}={list(bounds)} is outside {lo_limit}..{hi_limit}")
+    return errors
 
-    return mean_score
+
+def gbdt_space(kind: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Tuple[str, float, float, bool]]:
+    """``GBDT_SPACE[kind]`` with ``{param: [low, high]}`` overrides (type and log scale kept)."""
+    if kind not in GBDT_SPACE:
+        raise ValueError(f"Unknown GBDT kind '{kind}'")
+    space = dict(GBDT_SPACE[kind])
+    for param, (low, high) in (overrides or {}).items():
+        kind_of_value, _, _, log = space[param]
+        space[param] = (kind_of_value, low, high, log)
+    return space
+
+
+def model_search_space(model: str, budget: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The effective search space of a GBDT model under a problem budget (None for other models)."""
+    kind = GBDT_KINDS.get(model)
+    if kind is None:
+        return None
+    return gbdt_space(kind, ((budget or {}).get("search_space") or {}).get(model))
+
+
+def suggest_gbdt_params(trial: optuna.trial.Trial, kind: str,
+                        space: Optional[Dict[str, Tuple[str, float, float, bool]]] = None) -> Dict[str, Any]:
+    """Sample one GBDT family's parameters from ``space`` (default ``GBDT_SPACE[kind]``) plus fixed entries."""
+    if kind not in GBDT_SPACE:
+        raise ValueError(f"Unknown GBDT kind '{kind}'")
+    params: Dict[str, Any] = {}
+    for name, (kind_of_value, low, high, log) in (space or GBDT_SPACE[kind]).items():
+        key = f"{kind}_{name}"
+        if kind_of_value == "int":
+            params[name] = trial.suggest_int(key, int(low), int(high), log=log)
+        else:
+            params[name] = trial.suggest_float(key, float(low), float(high), log=log)
+    params.update(GBDT_FIXED.get(kind, {}))
+    return params
+
+
+def _fit_early_stopping(model, kind: str, X_train, y_train, X_valid, y_valid, rounds: int) -> int:
+    """Fit with early stopping on the validation rows; return the number of trees used."""
+    if kind == "xgb":
+        model.set_params(early_stopping_rounds=rounds)
+        model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
+        return int(model.best_iteration) + 1
+    if kind == "lgb":
+        callbacks = [lgb.early_stopping(rounds, verbose=False), lgb.log_evaluation(0)]
+        if "eval_X" in inspect.signature(model.fit).parameters:  # LightGBM >= 4.6 renamed eval_set
+            model.fit(X_train, y_train, eval_X=(X_valid,), eval_y=(y_valid,), callbacks=callbacks)
+        else:
+            model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], callbacks=callbacks)
+        return int(model.best_iteration_ or model.n_estimators)
+    if kind == "cb":
+        model.fit(X_train, y_train, eval_set=(X_valid, y_valid), early_stopping_rounds=rounds,
+                  use_best_model=True, verbose=False)
+        return int(model.get_best_iteration()) + 1
+    raise ValueError(f"Unknown GBDT kind '{kind}'")
+
+
+def fold_cv_score(factory: Callable, params: Optional[Dict[str, Any]], X: np.ndarray, y: np.ndarray,
+                  fold_ids: np.ndarray, folds: Sequence[int], scoring,
+                  fold_features: Optional[FoldFeatures] = None, kind: Optional[str] = None,
+                  early_stopping_rounds: Optional[int] = None) -> Tuple[float, list, Optional[int]]:
+    """Score a model on some of the shared folds (higher is better).
+
+    Uses the problem's fixed folds and, when present, each fold's nested encodings,
+    so tuning sees exactly the features the OOF stage will. With ``kind`` and
+    ``early_stopping_rounds`` the tree count is chosen per fold by early stopping.
+    Returns (mean score, per-fold scores, mean trees used or None).
+    """
+    scorer = get_scorer(scoring)
+    scores, trees = [], []
+    for fold in folds:
+        train_idx, valid_idx, X_train, X_valid, _ = fold_split(X, None, fold_ids, fold, fold_features)
+        model = factory(params)
+        if kind and early_stopping_rounds:
+            trees.append(_fit_early_stopping(model, kind, X_train, y[train_idx], X_valid, y[valid_idx],
+                                             early_stopping_rounds))
+        else:
+            model.fit(X_train, y[train_idx])
+        scores.append(float(scorer(model, X_valid, y[valid_idx])))
+        del model, X_train, X_valid
+        gc.collect()
+    mean_trees = int(round(float(np.mean(trees)))) if trees else None
+    return float(np.mean(scores)), scores, mean_trees
+
+
+def optimize_gbdt(trial: optuna.trial.Trial, kind: str, factory: Callable, X: np.ndarray, y: np.ndarray,
+                  fold_ids: np.ndarray, folds: Sequence[int], scoring,
+                  fold_features: Optional[FoldFeatures] = None,
+                  space: Optional[Dict[str, Tuple[str, float, float, bool]]] = None,
+                  max_trees: Optional[int] = None) -> float:
+    """Optuna objective for XGBoost / LightGBM / CatBoost on the shared folds.
+
+    ``space`` replaces the default search space (``gbdt_space``); ``max_trees`` the
+    tree-count ceiling. The chosen tree count is stored as the trial's ``n_trees``
+    user attribute.
+    """
+    params = suggest_gbdt_params(trial, kind, space)
+    params[TREE_COUNT_PARAM[kind]] = int(max_trees or MAX_TREES)
+    score, fold_scores, n_trees = fold_cv_score(
+        factory, params, X, y, fold_ids, folds, scoring, fold_features,
+        kind=kind, early_stopping_rounds=EARLY_STOPPING_ROUNDS)
+    trial.set_user_attr("n_trees", n_trees)
+    trial.set_user_attr("fold_scores", fold_scores)
+    logger.info("[%s trial %s] score=%.6f trees=%s", kind, trial.number, score, n_trees)
+    return score
 
 
 def optimize_linear_model(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
-    """Optuna objective function for linear/logistic regression."""
-    alpha = trial.suggest_float("ridge_alpha", 1e-4, 10.0, log=True)
+    """Optuna objective function for linear/logistic regression.
 
+    Parameter names carry the model's prefix ('linreg_alpha', 'lr_C') so that, once training strips
+    it, they are the estimator's own arguments. Columns are standardized inside each fit, the same
+    way the model factories do it (``training.build_model_factories``).
+    """
     if problem_type == "regression":
+        alpha = trial.suggest_float("linreg_alpha", 1e-4, 10.0, log=True)
         model = Ridge(alpha=alpha, random_state=42)
         default_scoring = "neg_mean_squared_error"
     else:
         LinearModel = get_linear_model_classifier()
         # cuML LogisticRegression doesn't support random_state parameter
         # sklearn LogisticRegression does support it
-        model_params = {'C': 1.0 / alpha if alpha > 0 else 1.0, 'max_iter': 1000}
+        model_params = {'C': trial.suggest_float("lr_C", 0.1, 1e4, log=True), 'max_iter': 1000}
 
         # Check if this is cuML or sklearn
         if 'cuml' not in LinearModel.__module__:
@@ -172,64 +324,8 @@ def optimize_linear_model(trial: optuna.trial.Trial, X, y, problem_type: str, cv
         model = LinearModel(**model_params)
         default_scoring = "accuracy"
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    scores = cross_val_score(model, X_scaled, y, cv=cv, scoring=scoring or default_scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
+    scores = cross_val_score(make_pipeline(StandardScaler(), model), X, y, cv=cv, scoring=scoring or default_scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
     return scores.mean()
-
-
-def optimize_catboost(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
-    """Optuna objective function for CatBoost models."""
-    if not CATBOOST_AVAILABLE:
-        raise RuntimeError("CatBoost is not installed")
-
-    logger.info("[CatBoost Trial %s] Starting CatBoost optimization trial", trial.number)
-
-    n_samples = X.shape[0] if hasattr(X, "shape") else len(X)
-    max_iterations = 1000
-    if n_samples <= 1000:
-        max_iterations = 400
-    elif n_samples <= 5000:
-        max_iterations = 700
-
-    logger.info("[CatBoost Trial %s] Sample count=%s, iteration cap=%s", trial.number, n_samples, max_iterations)
-
-    params: dict[str, Any] = {
-        "iterations": trial.suggest_int("cb_iterations", 200, max_iterations),
-        "learning_rate": trial.suggest_float("cb_learning_rate", 0.01, 0.3, log=True),
-        "depth": trial.suggest_int("cb_depth", 4, 10),
-        "l2_leaf_reg": trial.suggest_float("cb_l2_leaf_reg", 1.0, 10.0),
-        "subsample": trial.suggest_float("cb_subsample", 0.6, 1.0),
-        "random_seed": 42,
-        "logging_level": "Silent",
-    }
-
-    if is_catboost_gpu_available() and not config.GPU_CONFIG["force_cpu"]:
-        params["task_type"] = "GPU"
-        params["devices"] = "0"
-    else:
-        params["thread_count"] = config.MEMORY_CONFIG["max_parallel_jobs"]
-
-    # Align bootstrap configuration with subsample usage to avoid CatBoost errors.
-    if params["subsample"] < 0.999:
-        params["bootstrap_type"] = "Poisson" if params.get("task_type") == "GPU" else "Bernoulli"
-
-    if problem_type == "regression":
-        ModelClass = cb.CatBoostRegressor
-        default_scoring = "neg_mean_squared_error"
-    else:
-        ModelClass = cb.CatBoostClassifier
-        default_scoring = "accuracy"
-
-    model = ModelClass(**params)
-    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring or default_scoring, n_jobs=config.MEMORY_CONFIG["cv_n_jobs_limit"])
-    mean_score = scores.mean()
-
-    del model
-    gc.collect()
-
-    return mean_score
 
 
 def optimize_tabnet(trial: optuna.trial.Trial, X, y, problem_type: str, cv, scoring=None):
