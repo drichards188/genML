@@ -1,10 +1,12 @@
-crewai>=0.41.0
-crewai-tools>=0.8.0
-pandas>=2.0.0
+pandas>=2.0.0,<3.0.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
 xgboost>=2.0.0
 lightgbm>=4.0.0
+catboost>=1.2.0
 joblib>=1.3.0
 pyyaml>=6.0.0
 optuna>=3.0.0
+polars>=1.20.0  # multi-table problems (pipeline/tables.py)
+pyarrow>=14.0.0
+psutil>=5.9.0  # resource monitor on every run

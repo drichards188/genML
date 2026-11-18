@@ -1,0 +1,16 @@
+# What a pipeline run of autopilot code may do. The job worker (jobs.run_one) enforces it with
+# bubblewrap for every job that has options.code_dir; see policy.run_sandbox_command.
+# This file is a protected path: agents cannot change it.
+
+network: none            # the run reaches no host (TabPFN weights must already be downloaded)
+credentials: hidden      # credential files masked, credential variables removed
+
+write:                   # everything else on the machine is read-only
+  - problem_outputs      # outputs/<problem>/: run folder, OOF store, runs.csv, table caches.
+                         # The judge hashes the folds, the target and the best predictions it relies on.
+  - progress             # outputs/progress/: live progress for the dashboard
+  - worktree             # the cycle's own code folder
+  - tmp                  # a private temp folder for this job (TMPDIR points at it)
+
+read_only:               # read-only even inside a writable folder
+  - autopilot_state      # outputs/<problem>/autopilot/: the judge's pinned hashes, state, journal

@@ -9,7 +9,6 @@ import pandas as pd
 import numpy as np
 from src.genML.features import AutoFeatureEngine
 from src.genML.features.data_analyzer import DataTypeAnalyzer
-from src.genML.features.domain_researcher import DomainResearcher
 from src.genML.features.feature_selector import AdvancedFeatureSelector
 
 
@@ -290,8 +289,8 @@ class TestFullPipeline:
         assert 'total_features_generated' in report
         assert isinstance(report['processors_used'], dict)
 
-    def test_pipeline_domain_detection_integration(self):
-        """Test that domain detection integrates with feature engineering"""
+    def test_pipeline_analysis_then_transform(self):
+        """Analysis followed by the full transform on a finance-like dataset"""
         np.random.seed(42)
 
         # Finance domain dataset
@@ -304,9 +303,8 @@ class TestFullPipeline:
 
         engine = AutoFeatureEngine()
 
-        # Analyze should detect domain
         analysis = engine.analyze_data(df)
-        assert 'domain_analysis' in analysis
+        assert {'price', 'amount', 'balance'} <= set(analysis['numerical_columns'])
 
         # Should complete full pipeline
         X = engine.fit_transform(df, target_col='target')

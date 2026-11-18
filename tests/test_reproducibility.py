@@ -177,26 +177,6 @@ class TestReproducibility:
         # Same input should produce same output
         pd.testing.assert_frame_equal(X_test1, X_test2)
 
-    def test_domain_detection_consistent(self):
-        """Test that domain detection is consistent"""
-        df = pd.DataFrame({
-            'price': np.random.uniform(10, 1000, 50),
-            'amount': np.random.uniform(100, 5000, 50),
-            'balance': np.random.uniform(1000, 10000, 50),
-            'target': np.random.randint(0, 2, 50)
-        })
-
-        engine = AutoFeatureEngine()
-
-        analysis1 = engine.analyze_data(df)
-        analysis2 = engine.analyze_data(df)
-
-        # Domain detection should be consistent
-        if 'domain_analysis' in analysis1 and 'domain_analysis' in analysis2:
-            domains1 = set(analysis1['domain_analysis'].get('detected_domains', []))
-            domains2 = set(analysis2['domain_analysis'].get('detected_domains', []))
-            assert domains1 == domains2
-
     def test_feature_importance_consistent(self):
         """Test that feature importance scores are consistent"""
         np.random.seed(42)

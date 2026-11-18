@@ -105,11 +105,13 @@ class TestModelTrainingIntegration:
         """Test that cross-validation works with generated features"""
         np.random.seed(42)
 
+        feature1 = np.random.randn(200)
         df = pd.DataFrame({
-            'feature1': np.random.randn(200),
+            'feature1': feature1,
             'feature2': np.random.randn(200),
             'feature3': np.random.choice(['A', 'B', 'C'], 200),
-            'target': np.random.randint(0, 2, 200)
+            # Target carries real signal so "better than random" is a meaningful check
+            'target': (feature1 + 0.5 * np.random.randn(200) > 0).astype(int)
         })
 
         # Generate features

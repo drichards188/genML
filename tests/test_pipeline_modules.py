@@ -1,8 +1,7 @@
 """
 Tests for the refactored pipeline modules.
 
-Covers dataset loading, feature engineering helpers, AI tuning utilities,
-model selection guidance, and compatibility re-exports via src.genML.tools.
+Covers dataset loading, problem type detection and how stages fail without their inputs.
 """
 import json
 from pathlib import Path
@@ -11,7 +10,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.genML import tools as legacy_tools
 from src.genML.pipeline import (
     engineer_features,
     generate_predictions,
@@ -19,15 +17,7 @@ from src.genML.pipeline import (
     train_model_pipeline,
 )
 from src.genML.pipeline import config
-from src.genML.pipeline.ai_tuning import (
-    build_ai_tuning_override_details,
-    extract_override_values,
-)
-from src.genML.pipeline.feature_engineering import apply_ai_generated_features
-from src.genML.pipeline.model_advisor import (
-    apply_model_selection_guidance,
-    detect_problem_type,
-)
+from src.genML.pipeline.training import detect_problem_type
 
 
 @pytest.fixture
@@ -47,10 +37,6 @@ def pipeline_paths(tmp_path, monkeypatch):
         path.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(config, attr, path)
 
-    # Keep legacy tools module in sync for compatibility assertions.
-    for attr, path in mapping.items():
-        setattr(legacy_tools, attr, path)
-
     return mapping
 
 
@@ -65,7 +51,7 @@ class TestDatasetModule:
         result = json.loads(load_dataset())
 
         assert result["status"] == "success"
-        assert (pipeline_paths["DATA_DIR"] / "train_data.pkl").exists()
+        assert (pipeline_paths["DATA_DIR"] / "train_data.parquet").exists()
         assert (pipeline_paths["REPORTS_DIR"] / "data_exploration_report.json").exists()
 
     def test_load_dataset_missing_files(self, tmp_path, monkeypatch, pipeline_paths):
@@ -97,98 +83,6 @@ class TestProblemTypeDetection:
         assert detect_problem_type() == "classification"
 
 
-class TestFeatureEngineeringHelpers:
-    """Tests for feature engineering helper utilities."""
-
-    def test_apply_ai_generated_features_ratio(self):
-        train_raw = pd.DataFrame({"a": [10.0, 20.0], "b": [2.0, 4.0]})
-        test_raw = pd.DataFrame({"a": [15.0, 30.0], "b": [3.0, 5.0]})
-        train_features = pd.DataFrame({"baseline": [1.0, 1.0]})
-        test_features = pd.DataFrame({"baseline": [1.0, 1.0]})
-
-        suggestions = {
-            "status": "success",
-            "engineered_features": [
-                {
-                    "name": "ratio_ab",
-                    "operation": "ratio",
-                    "inputs": ["a", "b"],
-                    "parameters": {},
-                    "expected_impact": "medium",
-                    "rationale": "Density ratio",
-                }
-            ],
-        }
-
-        updated_train, updated_test, summary = apply_ai_generated_features(
-            train_raw=train_raw,
-            test_raw=test_raw,
-            train_features=train_features,
-            test_features=test_features,
-            suggestions=suggestions,
-        )
-
-        assert "ratio_ab" in updated_train.columns
-        assert summary["status"] == "applied"
-        np.testing.assert_allclose(updated_train["ratio_ab"].values, np.array([5.0, 5.0]))
-
-
-class TestAiTuningUtilities:
-    """Tests for AI tuning sanitisation and extraction."""
-
-    def test_build_ai_tuning_override_details_clamps_values(self):
-        recommendations = [
-            {
-                "model": "CatBoost",
-                "parameter": "depth",
-                "suggested_value": 25,  # should clamp to max 10
-                "confidence": "high",
-            },
-            {
-                "model": "XGBoost",
-                "parameter": "learning_rate",
-                "suggested_value": 1e-6,  # should clamp to min 0.01
-                "confidence": "low",
-            },
-        ]
-
-        details = build_ai_tuning_override_details(recommendations)
-        overrides = extract_override_values(details)
-
-        assert details["CatBoost"]["depth"]["suggested_value"] == 10
-        assert pytest.approx(details["XGBoost"]["learning_rate"]["suggested_value"], rel=1e-6) == 0.01
-        assert overrides["CatBoost"]["depth"] == 10
-        assert pytest.approx(overrides["XGBoost"]["learning_rate"], rel=1e-6) == 0.01
-
-
-class TestModelSelectionGuidance:
-    """Tests for ordering and filtering models via guidance."""
-
-    def test_apply_model_selection_guidance_orders_models(self):
-        models = {
-            "Random Forest": object(),
-            "CatBoost": object(),
-            "XGBoost": object(),
-            "Linear Regression": object(),
-        }
-        guidance = {
-            "status": "success",
-            "recommended_models": ["CatBoost", "XGBoost"],
-            "excluded_models": ["Linear Regression"],
-            "confidence": "high",
-        }
-
-        ordered, tuning_list, summary = apply_model_selection_guidance(
-            models=models,
-            guidance=guidance,
-            base_tuning_list=["Random Forest", "CatBoost", "XGBoost"],
-        )
-
-        assert list(ordered.keys()) == ["CatBoost", "XGBoost", "Random Forest"]
-        assert tuning_list == ["CatBoost", "XGBoost"]
-        assert summary["applied"] is True
-
-
 class TestPipelineStagesFailures:
     """Ensure pipeline entry points handle missing artefacts gracefully."""
 
@@ -205,19 +99,3 @@ class TestPipelineStagesFailures:
         np.save(pipeline_paths["FEATURES_DIR"] / "X_test.npy", np.random.randn(3, 2))
         result = json.loads(generate_predictions())
         assert result["status"] == "failed"
-
-
-class TestLegacyToolsCompatibility:
-    """Minimal assurance that src.genML.tools continues to expose the new API."""
-
-    def test_tools_reexports_pipeline_functions(self):
-        exposed = {
-            "load_dataset",
-            "engineer_features",
-            "train_model_pipeline",
-            "generate_predictions",
-            "detect_problem_type",
-        }
-
-        for name in exposed:
-            assert hasattr(legacy_tools, name), f"tools.{name} should be available after refactor"

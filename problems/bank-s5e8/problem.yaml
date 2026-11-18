@@ -1,0 +1,9 @@
+name: bank-s5e8
+source:
+  type: kaggle
+  competition: playground-series-s5e8
+description: 'Binary Classification with a Bank Dataset (Kaggle metric: Roc Auc Score)'
+target: y
+id_column: id
+task: binary
+metric: roc_auc

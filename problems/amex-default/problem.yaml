@@ -1,0 +1,27 @@
+name: amex-default
+source:
+  type: kaggle
+  competition: amex-default-prediction
+description: 'American Express Default Prediction (2022, real card data): will a customer default within
+  120 days of their latest statement. Up to 13 monthly statements per customer.'
+target: target
+id_column: customer_ID
+task: binary
+metric: amex
+# One row per customer: labels for train, the sample submission's ids for test. Statements are rolled
+# up per customer in time order (S_2 is the statement date), in key slices to bound memory.
+tables:
+  customers: {train: train_labels.csv, test: sample_submission.csv, drop: [prediction]}
+  statements: {train: train_data.csv, test: test_data.csv, parent: customers, key: customer_ID, order_by: S_2,
+               aggregate: {numeric: [mean, std, min, max, last, trend], categorical: [last, nunique],
+                           partitions: 8}}
+models: [XGBoost, LightGBM, CatBoost]
+budget:
+  n_trials: 8
+  timeout_per_model: 2400
+  tuning_folds: 2
+feature_engineering:
+  base: raw
+ensemble:
+  method: stack
+  top: 10

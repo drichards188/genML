@@ -1,28 +1,34 @@
 """
-CrewAI Flow for Generic Machine Learning Pipeline
+Pipeline orchestration for the genML ML pipeline.
 
-This module defines a generalized ML pipeline that can work with different datasets
-while maintaining the core workflow of data loading, feature engineering, model training,
-and prediction generation. The flow uses CrewAI's orchestration system to ensure
-proper sequencing and error handling between pipeline stages.
+Four stages run in order (data loading, feature engineering, training,
+prediction); each passes its JSON result to the next and a failed
+stage aborts the run with ``PipelineAbort``. ``run_pipeline()`` wraps a run with
+its problem spec, per-run output folder, log file and run summary.
+
+This used to be a CrewAI Flow; CrewAI only sequenced these functions, so it
+was replaced with plain Python.
 """
 import json
+import logging
 from datetime import datetime
-from crewai import Agent, Task, Crew, Process
-from crewai.flow import Flow, listen, start
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 # Import ML pipeline functions - these handle the core data science operations
 from src.genML.pipeline import (
     engineer_features,  # Feature engineering and preprocessing
     generate_predictions,  # Final predictions and submission file creation
     load_dataset,  # Data loading and initial exploration
-    run_model_selection_advisor,  # AI model advisor
     train_model_pipeline,  # Model training and selection
 )
 
 # Import progress tracking
 from src.genML.progress_tracker import ProgressTracker
 from src.genML.resource_monitor import ResourceMonitor
+
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineAbort(Exception):
@@ -37,22 +43,26 @@ def _abort_if_failed(stage_result, stage_name):
         print(f"❌ Aborting pipeline - {message}")
         raise PipelineAbort(message)
 
-class MLPipelineFlow(Flow):
+class MLPipelineFlow:
     """
-    Orchestrates a complete machine learning pipeline using CrewAI Flow system.
+    Runs the pipeline stages in order, passing each stage's result to the next.
 
-    This class defines the sequence of ML operations and handles data flow between stages.
-    Each stage is a method decorated with CrewAI flow decorators that control execution order
-    and data passing. The pipeline is designed to be resilient with proper error handling
-    and status tracking between stages.
+    Stages are plain methods; ``STAGES`` defines the order and ``kickoff()``
+    executes them. Any stage that fails raises ``PipelineAbort``.
     """
 
-    def __init__(self, dataset_name: str = "unknown"):
+    STAGES = (
+        "load_data_task",
+        "feature_engineering_task",
+        "model_training_task",
+        "prediction_task",
+    )
+
+    def __init__(self, dataset_name: str = "unknown", run_id: Optional[str] = None):
         """Initialize the pipeline flow with progress tracking."""
-        super().__init__()
-
         # Initialize progress tracker
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = run_id
         self.progress_tracker = ProgressTracker(run_id=run_id, dataset_name=dataset_name)
         self.resource_monitor = ResourceMonitor(self.progress_tracker)
 
@@ -60,7 +70,6 @@ class MLPipelineFlow(Flow):
         import src.genML.pipeline.config as config
         config.PROGRESS_TRACKER = self.progress_tracker
 
-    @start()
     def load_data_task(self):
         """
         Stage 1: Data Loading and Initial Exploration
@@ -102,7 +111,6 @@ class MLPipelineFlow(Flow):
             self.progress_tracker.set_pipeline_status("failed")
             raise PipelineAbort(f"Data loading failed: {e}") from e
 
-    @listen(load_data_task)
     def feature_engineering_task(self, data_summary):
         """
         Stage 2: Feature Engineering and Preprocessing
@@ -148,49 +156,9 @@ class MLPipelineFlow(Flow):
             self.progress_tracker.set_pipeline_status("failed")
             raise PipelineAbort(f"Feature engineering failed: {e}") from e
 
-    @listen(feature_engineering_task)
-    def model_selection_task(self, feature_results):
-        """
-        Stage 3: AI-assisted model selection guidance.
-
-        Executes the model selection advisor to rank supported models before training.
-        """
-        print("\n🔄 Step 3: Consulting AI model advisor for recommended algorithms...")
-
-        # Track stage start
-        self.progress_tracker.track_stage_start(3, "Model Selection", "Consulting AI model advisor")
-
-        _abort_if_failed(feature_results, "Feature engineering")
-
-        try:
-            result_json = run_model_selection_advisor()
-            advisor_results = json.loads(result_json)
-
-            status = advisor_results.get("status", "unknown")
-            print("=== MODEL SELECTION ADVISOR RESULTS ===")
-            print(json.dumps(advisor_results, indent=2))
-
-            # Track AI insight
-            if status == "success":
-                self.progress_tracker.track_ai_insight("model_selection", advisor_results)
-
-            # Mark stage complete
-            self.progress_tracker.track_stage_complete(3)
-
-            feature_results['model_advisor'] = advisor_results
-            feature_results['model_advisor_status'] = status
-            return feature_results
-        except PipelineAbort:
-            raise
-        except Exception as e:
-            print(f"❌ MODEL ADVISOR FAILED: {e}")
-            feature_results['model_advisor_error'] = str(e)
-            return feature_results
-
-    @listen(model_selection_task)
     def model_training_task(self, feature_results):
         """
-        Stage 4: Model Training and Selection
+        Stage 3: Model Training and Selection
 
         This stage trains multiple ML models using cross-validation and selects the best
         performing one. Model selection is crucial for achieving optimal performance on
@@ -203,13 +171,13 @@ class MLPipelineFlow(Flow):
         Returns:
             dict: Model training results with performance metrics and best model info
         """
-        print("\n🔄 Step 4: Training and selecting the best ML model...")
+        print("\n🔄 Step 3: Training and selecting the best ML model...")
 
         # Track stage start
-        self.progress_tracker.track_stage_start(4, "Model Training", "Training and selecting best model")
+        self.progress_tracker.track_stage_start(3, "Model Training", "Training and selecting best model")
 
         # Ensure previous stage completed successfully
-        _abort_if_failed(feature_results, "Model advisor / feature engineering")
+        _abort_if_failed(feature_results, "Feature engineering")
 
         # Execute model training and selection pipeline
         try:
@@ -220,7 +188,7 @@ class MLPipelineFlow(Flow):
             print(json.dumps(model_results, indent=2))
 
             # Mark stage complete
-            self.progress_tracker.track_stage_complete(4, {
+            self.progress_tracker.track_stage_complete(3, {
                 "best_model": model_results.get("best_model"),
                 "best_score": model_results.get("best_score")
             })
@@ -234,10 +202,9 @@ class MLPipelineFlow(Flow):
             self.progress_tracker.set_pipeline_status("failed")
             raise PipelineAbort(f"Model training failed: {e}") from e
 
-    @listen(model_training_task)
     def prediction_task(self, model_results):
         """
-        Stage 5: Prediction Generation and Submission Creation
+        Stage 4: Prediction Generation and Submission Creation
 
         The final stage of the ML pipeline. It uses the trained model to generate predictions
         on the test dataset and creates a properly formatted submission file. This stage is
@@ -249,10 +216,10 @@ class MLPipelineFlow(Flow):
         Returns:
             dict: Prediction results with submission file info and prediction statistics
         """
-        print("\n🔄 Step 5: Generating predictions and creating submission file...")
+        print("\n🔄 Step 4: Generating predictions and creating submission file...")
 
         # Track stage start
-        self.progress_tracker.track_stage_start(5, "Prediction", "Generating predictions and creating submission")
+        self.progress_tracker.track_stage_start(4, "Prediction", "Generating predictions and creating submission")
 
         # Verify model training completed successfully
         _abort_if_failed(model_results, "Model training")
@@ -268,7 +235,7 @@ class MLPipelineFlow(Flow):
             print("✅ Submission file 'submission.csv' has been created and is ready for upload!")
 
             # Mark stage and pipeline complete
-            self.progress_tracker.track_stage_complete(5, {
+            self.progress_tracker.track_stage_complete(4, {
                 "submission_file": prediction_results.get("submission_file")
             })
             self.progress_tracker.set_pipeline_status("completed")
@@ -290,7 +257,21 @@ class MLPipelineFlow(Flow):
             raise PipelineAbort(f"Prediction generation failed: {e}") from e
 
 
-def create_ml_pipeline_flow(dataset_name: str = "unknown"):
+    def kickoff(self) -> Dict[str, Any]:
+        """Run every stage in order and return the final stage's result."""
+        result = getattr(self, self.STAGES[0])()
+        for stage in self.STAGES[1:]:
+            result = getattr(self, stage)(result)
+        return result
+
+    def plot(self) -> str:
+        """Text diagram of the stage order (replaces CrewAI's flow plot)."""
+        diagram = " -> ".join(self.STAGES)
+        print(diagram)
+        return diagram
+
+
+def create_ml_pipeline_flow(dataset_name: str = "unknown", run_id: Optional[str] = None):
     """
     Factory function to create and return the ML pipeline flow.
 
@@ -303,4 +284,58 @@ def create_ml_pipeline_flow(dataset_name: str = "unknown"):
     Returns:
         MLPipelineFlow: A configured ML pipeline flow ready for execution
     """
-    return MLPipelineFlow(dataset_name=dataset_name)
+    return MLPipelineFlow(dataset_name=dataset_name, run_id=run_id)
+
+
+def run_pipeline(problem: Optional[str] = None, spec=None, download: bool = False,
+                 notes: str = "", setup_log: bool = True, outputs_root=None,
+                 run_id: Optional[str] = None) -> Dict[str, Any]:
+    """Run the full pipeline for one problem in its own output folder.
+
+    Args:
+        problem: Problem name (problems/<name>/problem.yaml) or spec path. With
+            neither ``problem`` nor ``spec``, train/test CSVs are discovered in
+            datasets/current/ and every field is inferred.
+        spec: An already loaded ``ProblemSpec`` (takes precedence over ``problem``).
+        download: Download Kaggle data when it is not present locally.
+        notes: Free text stored with the run (e.g. what changed).
+        setup_log: Tee stdout/stderr into the run's pipeline.log.
+        outputs_root: Root for run folders (default: <project>/outputs).
+        run_id: Use this run id (the job queue assigns ids before runs start).
+
+    Returns:
+        The run summary (also written to outputs/<problem>/<run_id>/run.json).
+    """
+    from src.genML.logging_config import setup_logging
+    from src.genML.pipeline import context
+    from src.genML.pipeline.problem import load_problem, locate_data_dir
+    from src.genML.run_context import RunContext
+
+    context.reset()
+    if spec is None and problem:
+        spec = load_problem(problem)
+    if spec is not None:
+        data_dir = locate_data_dir(spec, download=download)
+        spec.source = {**spec.source, "path": str(data_dir)}
+        context.set_requested_spec(spec)
+        problem_name = spec.name
+    else:
+        problem_name = "current"
+
+    run_kwargs = {"outputs_root": Path(outputs_root)} if outputs_root else {}
+    if run_id:
+        run_kwargs["run_id"] = run_id
+    run = RunContext(problem_name, notes=notes, **run_kwargs).activate()
+    if setup_log:
+        setup_logging(problem_name, log_path=run.log_file)
+    print(f"Run {run.run_id} for '{problem_name}' -> {run.run_dir}")
+
+    flow = MLPipelineFlow(dataset_name=problem_name, run_id=run.run_id)
+    try:
+        result = flow.kickoff()
+    except PipelineAbort as exc:
+        return run.finish("failed", {"error": str(exc)})
+    except Exception as exc:
+        logger.exception("Pipeline run %s crashed", run.run_id)
+        return run.finish("failed", {"error": f"{type(exc).__name__}: {exc}"})
+    return run.finish("completed", result)

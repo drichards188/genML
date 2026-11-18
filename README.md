@@ -1,294 +1,157 @@
-# CrewAI Generic ML Pipeline
+# genML
 
-A generalized machine learning pipeline using CrewAI Flows that can work with any dataset following the standard train.csv/test.csv format. Originally designed for the Kaggle Titanic challenge, it has evolved into a flexible ML automation tool.
+genML solves tabular prediction problems (a training table and a test table, in one file each or spread over several related files) with as little human input as possible. You declare what you know about a problem in a small YAML file. The pipeline infers the rest, builds leak-safe features, tunes gradient-boosting and neural models on the problem's own metric, stores out-of-fold predictions on folds shared by every run, stacks them, and writes the submission the metric needs.
 
-## Overview
+The **autopilot** runs that pipeline in a loop: Claude Code sessions plan and build experiments, a second model reviews each plan, and trusted code measures every result before anything is kept.
 
-This project demonstrates how to use CrewAI's Flow system to orchestrate a complete machine learning pipeline that automatically adapts to different datasets and problem types:
+Kaggle competitions are the test bench, not the goal. A gain only counts if the same method would work on real data from the same domain, so genML never uses other people's predictions, never takes ideas from a problem's published solutions or discussions, and never exploits how a dataset was generated. The full rules are in [CLAUDE.md](CLAUDE.md) (Purpose); every decision and change is logged in [DECISIONS.md](DECISIONS.md).
 
-- **Automated Data Analysis**: Loads and explores any dataset structure
-- **Intelligent Feature Engineering**: Uses `AutoFeatureEngine` to automatically detect data types and generate domain-specific features
-- **Adaptive Model Training**: Automatically detects problem type (regression vs classification) and trains appropriate models
-- **Smart Submission Generation**: Detects submission format from sample files and creates properly formatted outputs
-
-## Project Structure
-
-```
-genML/
-├── README.md                    # This file
-├── CLAUDE.md                    # Development guidance for Claude Code
-├── requirements.txt             # Python dependencies
-├── pyproject.toml              # Package configuration
-├── run_api.py                  # FastAPI server for dashboard backend
-├── src/genML/              # Main source code
-│   ├── main.py                 # Main entry point
-│   ├── flow.py                 # CrewAI Flow orchestration
-│   ├── tools.py                # Backwards-compatible shim (re-exports modern pipeline API)
-│   ├── submission_formatter.py # Adaptive submission formatting
-│   ├── api/                    # Dashboard API backend
-│   ├── pipeline/               # Modular ML pipeline implementation
-│   │   ├── __init__.py         # Public pipeline API (`load_dataset`, `train_model_pipeline`, ...)
-│   │   ├── config.py           # Shared constants, paths, and tuning settings
-│   │   ├── dataset.py          # Dataset discovery / loading utilities
-│   │   ├── feature_engineering.py # Automated feature engineering + AI ideation integration
-│   │   ├── model_advisor.py    # Model guidance + problem type detection
-│   │   ├── training.py         # Optuna tuning, ensemble evaluation, GPU-aware training
-│   │   ├── prediction.py       # Submission + prediction generation
-│   │   └── utils.py            # Memory / GPU cleanup helpers
-│   └── features/               # Automated feature engineering helpers
-│       ├── feature_engine.py   # Main feature engineering orchestrator
-│       ├── data_analyzer.py    # Data type detection
-│       ├── feature_processors.py # Feature transformation modules
-│       ├── feature_selector.py # Intelligent feature selection
-│       └── domain_researcher.py # Domain-specific strategies
-├── dashboard/                  # Real-time monitoring dashboard
-│   ├── src/                   # React + TypeScript source
-│   │   ├── api/               # API client
-│   │   ├── hooks/             # React hooks (WebSocket, data fetching)
-│   │   ├── store/             # State management
-│   │   ├── types/             # TypeScript types
-│   │   └── App.tsx            # Main dashboard component
-│   ├── package.json           # Node.js dependencies
-│   └── vite.config.ts         # Vite configuration
-├── datasets/                   # Organized dataset storage
-│   ├── current/               # Active dataset (recommended location)
-│   ├── titanic/               # Titanic-specific data
-│   └── [other]/               # Additional problem domains
-├── outputs/                   # Generated artifacts
-│   ├── data/                  # Processed datasets
-│   ├── features/              # Feature engineering outputs
-│   ├── models/                # Trained models
-│   ├── predictions/           # Prediction files
-│   └── reports/               # Analysis reports
-└── submission.csv             # Main submission file (after running)
-```
-
-## Installation
-
-1. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   # OR using UV (recommended)
-   uv sync
-   ```
-
-2. **Optional: Install dashboard dependencies**
-   ```bash
-   # For the real-time monitoring dashboard
-   pip install fastapi uvicorn[standard] websockets
-
-   # Frontend dependencies
-   cd dashboard
-   npm install
-   cd ..
-   ```
-
-3. **Prepare your dataset:**
-   - Place `train.csv` and `test.csv` in `datasets/current/` (recommended)
-   - Optionally include `sample_submission.csv` for automatic format detection
-   - The pipeline works with any ML dataset following this structure
-
-## Usage
-
-### Quick Start
+## Quick start
 
 ```bash
-# Run the complete ML pipeline
-python src/genML/main.py
+# Environment (CPU and pip GPU builds; SETUP.md has details and the RAPIDS conda option)
+uv venv .venv --python 3.12
+VIRTUAL_ENV=.venv uv pip install -r requirements.txt -r requirements-dev.txt -r requirements-dashboard.txt
+VIRTUAL_ENV=.venv uv pip install kagglehub kaggle "mcp>=2" jsonschema
+source .venv/bin/activate
 
-# Alternative methods
-crewai run              # Using CrewAI CLI
-uv run kickoff          # Using UV package scripts
+# Kaggle credentials: token from https://www.kaggle.com/settings/api
+export KAGGLE_API_TOKEN=...            # or save it in ~/.kaggle/access_token
+
+# Create a problem from a Kaggle competition, download its data and run a baseline
+python src/genML/main.py --init-kaggle playground-series-s6e11 --name fraud-s6e11
+python src/genML/main.py --problem fraud-s6e11 --download --notes "first look"
+python src/genML/main.py --baseline fraud-s6e11      # one run + a seed test: the judge's noise
+
+# Let the autopilot improve it (needs the claude CLI, bubblewrap and socat; see SETUP.md)
+python src/genML/main.py --autopilot fraud-s6e11 --cycles 10
+python src/genML/main.py --autopilot-status fraud-s6e11
 ```
 
-### What Happens
+Without `--problem`, the legacy mode still works: put `train.csv` and `test.csv` (and optionally `sample_submission.csv`) in `datasets/current/` and run `python src/genML/main.py`; every field is inferred.
 
-The pipeline executes in 4 sequential steps using CrewAI Flow orchestration:
+## Problem specs
 
-1. **Automated Data Analysis** 📊
-   - Loads train.csv and test.csv from multiple possible locations
-   - Analyzes dataset structure, data types, and missing values
-   - Provides comprehensive data summary and statistics
+```yaml
+name: fraud-s6e11
+source: {type: kaggle, competition: playground-series-s6e11}   # or {type: csv, path: datasets/x}
+target: is_fraud
+id_column: id
+task: binary            # binary | multiclass | regression
+metric: roc_auc         # accuracy, balanced_accuracy, f1, mcc, roc_auc, normalized_gini, amex,
+                        # log_loss, map_at_3, rmse, rmsle, mae, r2
+columns:                # optional role overrides: categorical, numerical, text, datetime, drop
+  categorical: [merchant_category]
+models: [XGBoost, LightGBM, CatBoost]
+budget: {n_trials: 15, timeout_per_model: 900, seeds: 1}
+cv: {method: stratified_kfold, n_splits: 5}   # or group_kfold / stratified_group_kfold (cv.group),
+                                              # time_blocks (cv.time_column)
+feature_engineering:
+  base: raw             # original columns plus the encodings below
+  encodings: {target_encode: auto, count_encode: auto, pairs: auto}
+ensemble: {method: stack, top: 10}            # stack | hill_climb | none
+```
 
-2. **Intelligent Feature Engineering** 🔧
-   - **AutoFeatureEngine** automatically detects data types (numerical, categorical, text, datetime)
-   - Generates domain-specific features based on detected patterns
-   - Applies appropriate preprocessing (scaling, encoding, text processing)
-   - Performs intelligent feature selection using statistical and model-based methods
-   - Adapts to any dataset structure automatically
+Anything left out is inferred, and every inference is recorded with its reason in the run's `resolved_spec.json`. Data spread over several files is declared under `tables:` (a main table plus child tables joined one to one or rolled up per key, for example a customer's statements); see `problems/home-credit/problem.yaml`. `problems/` holds eleven specs: Titanic, Playground S5E8 to S6E11, Home Credit, IEEE-CIS Fraud, AmEx Default and Porto Seguro.
 
-3. **Adaptive Model Training** 🤖
-   - **Automatic problem type detection** (regression vs classification)
-   - Trains appropriate models based on problem type:
-     - **Classification**: Logistic Regression, Random Forest, XGBoost Classifier
-     - **Regression**: Linear Regression, Random Forest Regressor, XGBoost Regressor
-   - Uses proper cross-validation (StratifiedKFold for classification, KFold for regression)
-   - Selects best performing model using appropriate metrics
+## How a run works
 
-4. **Smart Submission Generation** 📈
-   - **Adaptive submission formatting** detects format from sample_submission.csv
-   - Supports binary classification, probability outputs, and regression
-   - Generates predictions with confidence scores
-   - Creates properly formatted submission files
-   - Works with any competition platform format
+Each run writes to its own folder, `outputs/<problem>/<run_id>/` (data, features, models, reports, `submission.csv`, `pipeline.log`, `run.json`), and is added to `outputs/<problem>/runs.csv`.
 
-## Output Files
+1. **Load**: read the data (assembling multi-table problems with Polars), resolve the spec, save `resolved_spec.json`.
+2. **Features**: type detection and processing, label-free derived features (arithmetic expressions, composite keys, past-only group statistics, a train/test drift filter) and leak-safe encodings. Target encodings are built per fold, so no fold's labels reach its own model.
+3. **Training**: Optuna tunes each model on the problem's metric with early stopping, then every model is refit on the shared folds; its out-of-fold and test predictions go to `outputs/<problem>/oof/`. A logistic or ridge stacker blends the run's models, and the final predictions are whichever scores best out of fold. Models: XGBoost, LightGBM, CatBoost, GLM-LightGBM, logistic or linear regression, random forest, and (with the `nn` extra) RealMLP, TabM and TabPFN.
+4. **Prediction**: build the submission from the metric's output type and check it against `sample_submission.csv`.
 
-After successful execution, you'll find:
+Scores reported everywhere are out-of-fold scores in the problem's own metric.
 
-**Main Files:**
-- `submission.csv` - Main submission file ready for upload
-- `submission_YYYYMMDD_HHMMSS.csv` - Timestamped backup
+## The autopilot
 
-**Organized Outputs Directory:**
-- `outputs/data/` - Processed datasets (train_data.pkl, test_data.pkl)
-- `outputs/features/` - Feature engineering artifacts (X_train.npy, feature_names.txt)
-- `outputs/models/` - Trained models (best_model_*.pkl, cross_validation_results.csv)
-- `outputs/predictions/` - Detailed predictions and submission files
-- `outputs/reports/` - JSON reports from each pipeline stage
+Each cycle is resumable at every step (`outputs/<problem>/autopilot/state.json`):
 
-## Real-Time Dashboard 📊
+1. **Plan** (or **explore** every third cycle, an idea from its own probes of the data): a Claude Code session reads what was measured so far, screens several ideas with quick probes (one fixed LightGBM on the best run's features, a minute or two each, on rows the judge does not decide on), and picks one experiment, either a settings change or new code.
+2. **Review**: a second opinion from a fresh model that has none of the planning session's context (Claude; Codex can be put first again for a different model family) checks the plan against the rules and the evidence. On concerns the plan gets one revision; a revised plan rejected again fails the cycle.
+3. **Build** (code ideas): a session implements the idea in its own git worktree, with tests.
+4. **Verify**: edits to protected paths (the judge, metric, folds, the autopilot itself, existing tests) are reverted, new tests are required, the fast suite must pass.
+5. **Run**: a normal pipeline run with the cycle's code.
+6. **Judge**: trusted code checks that the folds, target and best predictions are unchanged, then accepts the change only if its gain beats the run-to-run noise (measured by `--baseline`) and wins most folds. It judges on 80% of the rows; the other 20% never decide anything and show, at the end, whether the accumulated gains were real. Time-ordered problems are judged forward in time (only the latest block, whose models saw only the past). Gains far above the noise pause the loop for a person, with a second opinion on whether it is a leak.
+7. **Canary** (accepted code): the same code runs on a copy of the data with the labels shuffled. If it still beats a constant prediction, labels are leaking in somewhere and the change is rejected.
+8. **Integrate**: accepted code moves onto the shared branch `autopilot/main` (one code base for every problem, refreshed from your working tree at each start); every cycle is written to `journal.md` and `outputs/<problem>/experiments.json`.
 
-The project includes a **real-time monitoring dashboard** built with React + TypeScript that provides live updates of pipeline execution.
+Runs built on banned ideas or a known leak are listed in `problems/<name>/excluded_runs.yaml` (`--exclude-run`); nothing picks them as a baseline, a best run or a blend member.
 
-### Dashboard Features
+What each step may do is declared in the header of its prompt file (`.claude/skills/genml/modes/`) and enforced, not asked for: sessions get only their listed tools, no internet and no credentials, and run in Claude Code's sandbox; pipeline runs of agent code run in bubblewrap with the judge's files read-only. Without a working sandbox the autopilot does not start. Agents never submit to Kaggle; submitting is always a person's decision.
 
-- **Live Pipeline Status**: Real-time progress tracking via WebSocket
-- **Stage Monitoring**: Visual indicators for all 5 pipeline stages (pending/running/completed/failed)
-- **Model Training Progress**: Track each model's training status and Optuna trials
-- **Resource Monitoring**: GPU memory, CPU, and RAM usage
-- **Current Activity**: See exactly what the pipeline is doing right now
-- **Debug View**: Raw JSON data explorer for development
+In Claude Code, the `/genml` skill starts, checks, steers and stops the autopilot.
 
-### Quick Start - Dashboard
-
-**Prerequisites:**
-- Node.js 18+ and npm
-- FastAPI dependencies: `pip install fastapi uvicorn[standard] websockets`
-
-**Development Mode (Recommended):**
+## Commands
 
 ```bash
-# Terminal 1: Start API Backend
-python run_api.py
+python src/genML/main.py --list-problems
+python src/genML/main.py --problem NAME [--download] [--notes TEXT]
+python src/genML/main.py --list-runs NAME | --show-run NAME RUN_ID
+python src/genML/main.py --ensemble NAME [--method stack|hill_climb] [--top 10]     # blend across runs
+python src/genML/main.py --baseline NAME [--repeats N]                              # baseline + noise
+python src/genML/main.py --noise-test NAME --run RUN_ID --model XGBoost [--seeds 3]  # seed noise
+python src/genML/main.py --exclude-run NAME RUN_ID --reason TEXT                    # a run that does not count
+python src/genML/main.py --compare NAME EXPERIMENT_A EXPERIMENT_B                    # is B really better?
+python src/genML/main.py --submit NAME [--run RUN_ID] [--message TEXT]              # submit to Kaggle
+python src/genML/main.py --submissions NAME                                         # CV vs leaderboard
 
-# Terminal 2: Start Dashboard (in new terminal)
-cd dashboard
-npm install  # First time only
-npm run dev
+python src/genML/main.py --autopilot NAME --cycles 10 [--directive TEXT] [--until ISO] [--no-second-opinion]
+python src/genML/main.py --autopilot-status NAME | --autopilot-stop NAME
+python src/genML/main.py --queue-directive NAME TEXT                                # steer a later cycle
+python src/genML/main.py --second-opinion NAME [--cycle C003]                       # a second model reviews a cycle
+python src/genML/main.py --llm-status                                               # which CLIs can answer
 
-# Terminal 3: Run the ML Pipeline (in new terminal)
-python src/genML/main.py
+python -m src.genML.jobs worker | enqueue NAME | list | cancel JOB_ID                # job queue
 ```
 
-Then open your browser to **http://localhost:5173** to watch the pipeline run in real-time!
+## Using it from an MCP client
 
-**Production Mode:**
+`src/genML/mcp_server.py` exposes the pipeline as MCP tools, so an LLM client can create problems, start runs, poll their status and compare runs. Runs go through a job queue with one GPU worker, so tools return immediately with a `job_id`.
 
 ```bash
-# Build and serve the dashboard
-cd dashboard
-npm run build
-cd ..
-python run_api.py
-
-# Open browser to http://localhost:8000
+claude mcp add genml -- /path/to/genML/.venv/bin/python -m src.genML.mcp_server
 ```
 
-### Dashboard Architecture
+Tools: `list_problems`, `inspect_dataset`, `create_problem`, `start_run`, `start_ensemble`, `get_run_status`, `list_jobs`, `list_runs`, `compare_runs`, `get_run_report`, `get_feature_diagnostics`, `cancel_run`, `submit_to_kaggle` (previews unless `confirm=true`), `get_submissions`.
 
-- **Frontend**: React 18 + TypeScript + Vite
-- **Backend**: FastAPI with WebSocket support
-- **State Management**: Zustand
-- **Charts**: Recharts (for future visualizations)
-- **API Client**: Axios with React Query
+## Dashboard
 
-The dashboard auto-connects to the backend and displays real-time updates as the pipeline executes. When no pipeline is running, it shows "No Active Pipeline" status.
+A React dashboard shows live progress (stages, models, Optuna trials, GPU/CPU/RAM) and lists problems and runs.
 
-**For more details**, see `dashboard/README.md`
-
-
-## Key Features
-
-### 🤖 Automated Feature Engineering
-- **AutoFeatureEngine**: Automatically detects data types and generates relevant features
-- **Domain-specific strategies**: Adapts feature generation based on detected problem domains
-- **Intelligent feature selection**: Uses statistical tests and model-based selection
-- **Configurable processing**: Customizable feature engineering parameters
-
-### 🔄 Adaptive Pipeline
-- **Problem type detection**: Automatically identifies regression vs classification
-- **Multi-dataset support**: Works with any train.csv/test.csv dataset
-- **Smart path resolution**: Finds datasets in multiple organized locations
-- **Format detection**: Automatically detects submission format from sample files
-
-### 🏗️ CrewAI Flow Architecture
-- **Sequential orchestration**: Uses `@start()` and `@listen()` decorators
-- **Error handling**: Comprehensive error propagation between pipeline stages
-- **Progress tracking**: Real-time status updates and detailed logging
-- **Modular design**: Each stage is independent and can be modified separately
-- **Pipeline package**: All production logic lives in `src/genML/pipeline/`, while `src/genML/tools.py` keeps the historical API intact for older scripts/tests.
-
-### 📊 Core ML Functions
-The primary entry points are re-exported via `src.genML.pipeline` (and mirrored in `src.genML.tools` for compatibility):
-- `load_dataset()` - Multi-path dataset loading with validation
-- `engineer_features()` - Automated feature engineering pipeline (with optional AI feature ideation)
-- `train_model_pipeline()` - Multi-model training with Optuna tuning, GPU-aware factories, and optional stacking ensembles
-- `generate_predictions()` - Adaptive prediction generation and formatting
-
-## Requirements
-
-**Core Dependencies:**
-- Python 3.10+ (as specified in pyproject.toml)
-- CrewAI 0.193.2+ with tools support
-- Standard ML libraries (pandas, scikit-learn, xgboost, numpy)
-- Any dataset following train.csv/test.csv format
-
-**Optional - For Real-Time Dashboard:**
-- Node.js 18+ and npm
-- FastAPI + uvicorn + websockets
-- Modern web browser
-
-## Working with Different Datasets
-
-To use the pipeline with a new dataset:
-
-1. **Prepare your data:**
-   - Place `train.csv` and `test.csv` in `datasets/current/`
-   - Optionally include `sample_submission.csv` for format detection
-   - Ensure your train.csv has the target variable in a column
-
-2. **Run the pipeline:**
-   ```bash
-   conda source genml
-   python3 src/genML/main.py
-   ```
-
-3. **The pipeline will automatically:**
-   - Detect whether it's a regression or classification problem
-   - Generate appropriate features based on your data types
-   - Train suitable models for your problem type
-   - Create properly formatted submission files
-
-## Troubleshooting
-
-**Missing data files:**
+```bash
+python run_api.py                           # API on http://localhost:8000
+cd dashboard && npm install && npm run dev  # UI on http://localhost:5173
 ```
-❌ Missing required data files: train.csv, test.csv
-```
-Solution: Place your dataset files in `datasets/current/` or project root.
 
-**Import errors:**
-```
-ModuleNotFoundError: No module named 'crewai'
-```
-Solution: `pip install -r requirements.txt` or `uv sync`
+## Tests
 
-**Pipeline fails on feature engineering:**
-Check that your dataset has proper column names and no completely empty columns.
+```bash
+pytest -m "not slow"   # the fast suite (a few minutes)
+pytest                 # also end-to-end runs on local Kaggle data
+```
 
-**Dashboard not connecting:**
-- Ensure FastAPI backend is running: `python run_api.py`
-- Check that port 8000 is available
-- Verify dashboard is running: `cd dashboard && npm run dev`
-- See `dashboard/README.md` for detailed troubleshooting
+Golden tests in `tests/problems/` run against each declared problem's data when it is available locally and skip otherwise; Kaggle data is never committed. Tests never call a real LLM: every backend is faked.
+
+## Project layout
+
+```
+problems/<name>/                 # problem.yaml and notes.md per problem
+DECISIONS.md                     # what was decided, why, and what changed
+src/genML/
+  main.py                        # CLI
+  flow.py, run_context.py        # the four stages, per-run folders
+  jobs.py                        # SQLite job queue and GPU worker (agent code runs sandboxed)
+  experiments.py                 # settings checks and the experiment ledger
+  autopilot/                     # loop, judge, worktrees, permissions, dossier, second opinion
+  llm/                           # claude and codex CLIs as JSON-answering backends
+  pipeline/                      # specs, metrics, tables, folds and OOF store, training, ensembles
+  features/                      # type detection, encodings, derived features
+  service.py, mcp_server.py      # service layer and MCP server
+  api/                           # FastAPI backend for the dashboard
+.claude/skills/genml/            # the /genml skill and the autopilot's prompt files
+dashboard/                       # React + TypeScript UI
+tests/
+```

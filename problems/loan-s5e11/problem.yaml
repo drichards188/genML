@@ -1,0 +1,9 @@
+name: loan-s5e11
+source:
+  type: kaggle
+  competition: playground-series-s5e11
+description: 'Predicting Loan Payback (Kaggle metric: Roc Auc Score)'
+target: loan_paid_back
+id_column: id
+task: binary
+metric: roc_auc

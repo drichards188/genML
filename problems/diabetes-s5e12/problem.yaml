@@ -1,0 +1,9 @@
+name: diabetes-s5e12
+source:
+  type: kaggle
+  competition: playground-series-s5e12
+description: 'Diabetes Prediction Challenge (Kaggle metric: Roc Auc Score)'
+target: diagnosed_diabetes
+id_column: id
+task: binary
+metric: roc_auc

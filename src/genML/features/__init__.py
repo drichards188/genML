@@ -15,7 +15,6 @@ from .feature_processors import (
 )
 from .feature_engine import AutoFeatureEngine
 from .feature_selector import AdvancedFeatureSelector
-from .domain_researcher import DomainResearcher
 
 __all__ = [
     'DataTypeAnalyzer',
@@ -25,5 +24,4 @@ __all__ = [
     'DateTimeProcessor',
     'AutoFeatureEngine',
     'AdvancedFeatureSelector',
-    'DomainResearcher'
 ]

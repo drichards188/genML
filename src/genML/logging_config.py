@@ -28,7 +28,8 @@ class TeeStream:
         self.log_file.flush()
 
 
-def setup_logging(dataset_name: Optional[str] = None, log_level: int = logging.INFO) -> str:
+def setup_logging(dataset_name: Optional[str] = None, log_level: int = logging.INFO,
+                  log_path: Optional[Path] = None) -> str:
     """
     Configure logging for the ML pipeline with both console and file output.
     Captures ALL output including print statements and logging statements.
@@ -40,18 +41,19 @@ def setup_logging(dataset_name: Optional[str] = None, log_level: int = logging.I
     Returns:
         Path to the log file created
     """
-    # Create logs directory
-    logs_dir = Path("outputs/logs")
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    # Generate descriptive timestamped filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if dataset_name:
-        log_filename = f"ml_pipeline_{dataset_name}_{timestamp}.log"
+    if log_path is not None:
+        # Per-run log (outputs/<problem>/<run_id>/pipeline.log)
+        log_filepath = Path(log_path)
+        log_filepath.parent.mkdir(parents=True, exist_ok=True)
     else:
-        log_filename = f"ml_pipeline_{timestamp}.log"
-
-    log_filepath = logs_dir / log_filename
+        logs_dir = Path("outputs/logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if dataset_name:
+            log_filename = f"ml_pipeline_{dataset_name}_{timestamp}.log"
+        else:
+            log_filename = f"ml_pipeline_{timestamp}.log"
+        log_filepath = logs_dir / log_filename
 
     # Open log file for all output
     log_file = open(log_filepath, 'w', encoding='utf-8', buffering=1)

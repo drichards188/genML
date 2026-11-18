@@ -1,0 +1,10 @@
+# Runs that do not count for this problem (run_id: reason). Nothing picks them as a best
+# run, a baseline or a blend member. See DECISIONS.md.
+'20261106_113915_138': 'deleted 2026-11-12: built on copied material'
+'20261106_133032_053': 'deleted 2026-11-12: built on copied material'
+'20261107_081643_935': 'deleted 2026-11-12: built on copied material'
+'20261107_081645_566': 'deleted 2026-11-12: built on copied material'
+'20261110_105950_455': 'deleted 2026-11-12: built on copied material'
+'20261110_123514_203': 'deleted 2026-11-12: built on copied material'
+'20261110_151421_987': 'deleted 2026-11-12: built on copied material'
+'20261110_155142_905': 'deleted 2026-11-12: built on copied material'
