@@ -1,0 +1,14 @@
+# Domain research for the autopilot (src/genML/autopilot/research.py). The research session sees
+# only `domain` and the cutoff, never this problem's name, competition, files or columns, so the
+# description must not name them (the step refuses one that does).
+domain: >
+  Fraud detection on payment card transactions: which properties of a single transaction, of the
+  card's and the cardholder's recent activity, of the merchant and of the channel indicate that a
+  transaction is fraudulent, and how fraud teams at card issuers, acquirers and payment processors
+  turn them into model inputs.
+# The competition opened on 2026-11-01 (Kaggle API, enabledDate). Only sources published earlier
+# count, so none can hold its answers.
+sources_before: 2026-11-01
+# Owner-vetted sites besides the scholarly indexes (not date-checked). None for now.
+extra_hosts: []
+max_items: 20
