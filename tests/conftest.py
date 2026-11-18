@@ -34,12 +34,11 @@ def isolate_outputs(tmp_path, monkeypatch):
         path = outputs_dir / sub if sub else outputs_dir
         path.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(pipeline_config, attr, path)
-    monkeypatch.setattr(
-        pipeline_config, "AI_TUNING_OVERRIDE_PATH", outputs_dir / "reports" / "ai_tuning_overrides.json"
-    )
     monkeypatch.setattr(pipeline_config, "ACTIVE_RUN", None)
     monkeypatch.setattr(pipeline_config, "PROGRESS_TRACKER", None)
     monkeypatch.setattr("src.genML.run_context.OUTPUTS_ROOT", outputs_dir)
+    # Jobs started by tests run without a systemd memory scope (tests of the cap set it themselves)
+    monkeypatch.setenv("GENML_JOB_MEMORY_CAP", "off")
     pipeline_context.reset()
     yield tmp_path
     pipeline_context.reset()
