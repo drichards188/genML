@@ -93,7 +93,7 @@ function App() {
                     {currentRun.current_stage_name || 'N/A'}
                   </span>
                   <span className="overview-caption">
-                    Stage {currentRun.current_stage || 0} of 5
+                    Stage {currentRun.current_stage || 0} of 4
                   </span>
                 </div>
                 <div className="overview-item">

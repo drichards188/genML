@@ -142,7 +142,6 @@ class TestMLPipelineFlow:
         assert flow.STAGES == (
             'load_data_task',
             'feature_engineering_task',
-            'model_selection_task',
             'model_training_task',
             'prediction_task',
         )

@@ -8,7 +8,7 @@ to create a comprehensive feature engineering pipeline.
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Any, Optional
 import logging
 from pathlib import Path
 import json
@@ -21,7 +21,6 @@ from .feature_processors import (
     DateTimeProcessor
 )
 from .feature_selector import AdvancedFeatureSelector
-from .domain_researcher import DomainResearcher
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +49,9 @@ class AutoFeatureEngine:
         if 'max_features' in self.config:
             selector_config.setdefault('max_features', self.config['max_features'])
         self.feature_selector = AdvancedFeatureSelector(selector_config)
-        self.domain_researcher = DomainResearcher(self.config.get('domain_research', {}))
         self.processors = {}
         self.feature_map = {}
         self.analysis_results = {}
-        self.domain_analysis = {}
-        self.research_results = {}
         self.selected_features = []
         self.feature_selection_report = {}
         self.is_fitted = False
@@ -79,13 +75,12 @@ class AutoFeatureEngine:
             'datetime': self.config.get('datetime_config', {})
         }
 
-    def analyze_data(self, df: pd.DataFrame, web_search_func=None) -> Dict[str, Any]:
+    def analyze_data(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Analyze dataset to understand structure and plan feature engineering.
 
         Args:
             df: DataFrame to analyze
-            web_search_func: Optional function for web search research
 
         Returns:
             Dictionary containing comprehensive analysis results
@@ -95,23 +90,7 @@ class AutoFeatureEngine:
         # Basic data type analysis
         self.analysis_results = self.analyzer.analyze_dataset(df, overrides=self.manual_type_hints)
 
-        # Domain analysis for intelligent feature engineering
-        self.domain_analysis = self.domain_researcher.analyze_domain(df, self.analysis_results)
-
-        # Research domain-specific strategies if web search is available
-        if web_search_func:
-            self.research_results = self.domain_researcher.research_feature_strategies(
-                self.domain_analysis, web_search_func
-            )
-
-        # Combine all analysis results
-        combined_results = {
-            **self.analysis_results,
-            'domain_analysis': self.domain_analysis,
-            'research_results': self.research_results
-        }
-
-        return combined_results
+        return dict(self.analysis_results)
 
     def fit(self, train_df: pd.DataFrame, target_col: Optional[str] = None) -> 'AutoFeatureEngine':
         """

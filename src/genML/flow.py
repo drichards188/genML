@@ -1,12 +1,12 @@
 """
 Pipeline orchestration for the genML ML pipeline.
 
-Five stages run in order (data loading, feature engineering, model selection,
-training, prediction); each passes its JSON result to the next and a failed
+Four stages run in order (data loading, feature engineering, training,
+prediction); each passes its JSON result to the next and a failed
 stage aborts the run with ``PipelineAbort``. ``run_pipeline()`` wraps a run with
 its problem spec, per-run output folder, log file and run summary.
 
-This used to be a CrewAI Flow; CrewAI only sequenced these five functions, so it
+This used to be a CrewAI Flow; CrewAI only sequenced these functions, so it
 was replaced with plain Python.
 """
 import json
@@ -20,7 +20,6 @@ from src.genML.pipeline import (
     engineer_features,  # Feature engineering and preprocessing
     generate_predictions,  # Final predictions and submission file creation
     load_dataset,  # Data loading and initial exploration
-    run_model_selection_advisor,  # AI model advisor
     train_model_pipeline,  # Model training and selection
 )
 
@@ -55,7 +54,6 @@ class MLPipelineFlow:
     STAGES = (
         "load_data_task",
         "feature_engineering_task",
-        "model_selection_task",
         "model_training_task",
         "prediction_task",
     )
@@ -158,47 +156,9 @@ class MLPipelineFlow:
             self.progress_tracker.set_pipeline_status("failed")
             raise PipelineAbort(f"Feature engineering failed: {e}") from e
 
-    def model_selection_task(self, feature_results):
-        """
-        Stage 3: AI-assisted model selection guidance.
-
-        Executes the model selection advisor to rank supported models before training.
-        """
-        print("\n🔄 Step 3: Consulting AI model advisor for recommended algorithms...")
-
-        # Track stage start
-        self.progress_tracker.track_stage_start(3, "Model Selection", "Consulting AI model advisor")
-
-        _abort_if_failed(feature_results, "Feature engineering")
-
-        try:
-            result_json = run_model_selection_advisor()
-            advisor_results = json.loads(result_json)
-
-            status = advisor_results.get("status", "unknown")
-            print("=== MODEL SELECTION ADVISOR RESULTS ===")
-            print(json.dumps(advisor_results, indent=2))
-
-            # Track AI insight
-            if status == "success":
-                self.progress_tracker.track_ai_insight("model_selection", advisor_results)
-
-            # Mark stage complete
-            self.progress_tracker.track_stage_complete(3)
-
-            feature_results['model_advisor'] = advisor_results
-            feature_results['model_advisor_status'] = status
-            return feature_results
-        except PipelineAbort:
-            raise
-        except Exception as e:
-            print(f"❌ MODEL ADVISOR FAILED: {e}")
-            feature_results['model_advisor_error'] = str(e)
-            return feature_results
-
     def model_training_task(self, feature_results):
         """
-        Stage 4: Model Training and Selection
+        Stage 3: Model Training and Selection
 
         This stage trains multiple ML models using cross-validation and selects the best
         performing one. Model selection is crucial for achieving optimal performance on
@@ -211,13 +171,13 @@ class MLPipelineFlow:
         Returns:
             dict: Model training results with performance metrics and best model info
         """
-        print("\n🔄 Step 4: Training and selecting the best ML model...")
+        print("\n🔄 Step 3: Training and selecting the best ML model...")
 
         # Track stage start
-        self.progress_tracker.track_stage_start(4, "Model Training", "Training and selecting best model")
+        self.progress_tracker.track_stage_start(3, "Model Training", "Training and selecting best model")
 
         # Ensure previous stage completed successfully
-        _abort_if_failed(feature_results, "Model advisor / feature engineering")
+        _abort_if_failed(feature_results, "Feature engineering")
 
         # Execute model training and selection pipeline
         try:
@@ -228,7 +188,7 @@ class MLPipelineFlow:
             print(json.dumps(model_results, indent=2))
 
             # Mark stage complete
-            self.progress_tracker.track_stage_complete(4, {
+            self.progress_tracker.track_stage_complete(3, {
                 "best_model": model_results.get("best_model"),
                 "best_score": model_results.get("best_score")
             })
@@ -244,7 +204,7 @@ class MLPipelineFlow:
 
     def prediction_task(self, model_results):
         """
-        Stage 5: Prediction Generation and Submission Creation
+        Stage 4: Prediction Generation and Submission Creation
 
         The final stage of the ML pipeline. It uses the trained model to generate predictions
         on the test dataset and creates a properly formatted submission file. This stage is
@@ -256,10 +216,10 @@ class MLPipelineFlow:
         Returns:
             dict: Prediction results with submission file info and prediction statistics
         """
-        print("\n🔄 Step 5: Generating predictions and creating submission file...")
+        print("\n🔄 Step 4: Generating predictions and creating submission file...")
 
         # Track stage start
-        self.progress_tracker.track_stage_start(5, "Prediction", "Generating predictions and creating submission")
+        self.progress_tracker.track_stage_start(4, "Prediction", "Generating predictions and creating submission")
 
         # Verify model training completed successfully
         _abort_if_failed(model_results, "Model training")
@@ -275,7 +235,7 @@ class MLPipelineFlow:
             print("✅ Submission file 'submission.csv' has been created and is ready for upload!")
 
             # Mark stage and pipeline complete
-            self.progress_tracker.track_stage_complete(5, {
+            self.progress_tracker.track_stage_complete(4, {
                 "submission_file": prediction_results.get("submission_file")
             })
             self.progress_tracker.set_pipeline_status("completed")

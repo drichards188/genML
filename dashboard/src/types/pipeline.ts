@@ -46,12 +46,6 @@ export interface ResourceMetrics {
   elapsed_seconds: number;
 }
 
-export interface AIInsights {
-  model_selection: Record<string, any>;
-  feature_suggestions: any[];
-  error_patterns: any[];
-}
-
 export interface RunProgress {
   run_id: string | null;
   dataset_name?: string;
@@ -66,7 +60,6 @@ export interface RunProgress {
   stages?: Record<string, StageInfo>;
   models?: ModelResult[];
   resources?: ResourceMetrics;
-  ai_insights?: AIInsights;
   message?: string;  // For idle state message
 }
 

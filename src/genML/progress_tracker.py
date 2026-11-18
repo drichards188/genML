@@ -8,10 +8,9 @@ can use to report their progress, which is then consumed by the dashboard UI.
 import json
 import logging
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +59,6 @@ class ProgressTracker:
                 "ram_mb": 0,
                 "elapsed_seconds": 0
             },
-            "ai_insights": {
-                "model_selection": {},
-                "feature_suggestions": [],
-                "error_patterns": []
-            }
         }
 
         # Set up progress directory
@@ -109,7 +103,7 @@ class ProgressTracker:
         Track the start of a pipeline stage.
 
         Args:
-            stage_num: Stage number (1-5)
+            stage_num: Stage number (1-4)
             stage_name: Name of the stage
             description: Optional description of what this stage does
         """
@@ -138,7 +132,7 @@ class ProgressTracker:
         Mark a stage as complete.
 
         Args:
-            stage_num: Stage number (1-5)
+            stage_num: Stage number (1-4)
             summary: Optional summary data for this stage
         """
         with self._lock:
@@ -303,20 +297,6 @@ class ProgressTracker:
             self._data["resources"]["cpu_percent"] = int(cpu_percent)
             self._data["resources"]["ram_mb"] = int(ram_mb)
             self._write_progress()
-
-    def track_ai_insight(self, insight_type: str, data: Dict[str, Any]):
-        """
-        Track AI advisor insights.
-
-        Args:
-            insight_type: Type of insight (model_selection, feature_suggestions, error_patterns)
-            data: Insight data
-        """
-        with self._lock:
-            if insight_type in self._data["ai_insights"]:
-                self._data["ai_insights"][insight_type] = data
-                self._write_progress()
-                logger.info(f"AI insight recorded: {insight_type}")
 
     def set_pipeline_status(self, status: str):
         """

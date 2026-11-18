@@ -286,30 +286,6 @@ class TestDomainSpecificScenarios:
         assert X.shape[0] == 100
         assert X.shape[1] > 4  # More than original features
 
-    def test_domain_specific_recommendations(self):
-        """Test that domain analysis provides relevant recommendations"""
-        np.random.seed(42)
-
-        # Finance dataset
-        df_finance = pd.DataFrame({
-            'price': np.random.uniform(10, 1000, 50),
-            'cost': np.random.uniform(5, 500, 50),
-            'profit': np.random.uniform(1, 500, 50),
-            'target': np.random.randint(0, 2, 50)
-        })
-
-        engine = AutoFeatureEngine()
-        analysis = engine.analyze_data(df_finance)
-
-        # Should detect finance domain
-        assert 'domain_analysis' in analysis
-        domain_analysis = analysis['domain_analysis']
-
-        if domain_analysis and domain_analysis.get('detected_domains'):
-            # Should provide recommendations
-            assert 'recommendations' in domain_analysis
-            assert len(domain_analysis['recommendations']) > 0
-
     def test_high_cardinality_ecommerce_categories(self):
         """Test e-commerce with many product categories"""
         np.random.seed(42)

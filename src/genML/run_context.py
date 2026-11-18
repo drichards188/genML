@@ -107,7 +107,6 @@ class RunContext:
         config.MODELS_DIR = self.run_dir / "models"
         config.PREDICTIONS_DIR = self.run_dir / "predictions"
         config.REPORTS_DIR = self.run_dir / "reports"
-        config.AI_TUNING_OVERRIDE_PATH = config.REPORTS_DIR / "ai_tuning_overrides.json"
         config.ACTIVE_RUN = self
         logger.info("Run %s for problem %s -> %s", self.run_id, self.problem_name, self.run_dir)
         return self
@@ -169,7 +168,7 @@ def list_runs(problem_name: str, outputs_root: Optional[Path] = None) -> List[Di
     runs = []
     for summary_file in (Path(outputs_root or OUTPUTS_ROOT) / problem_name).glob("*/run.json"):
         summary = _read_json(summary_file)
-        if summary:
+        if summary and summary.get("run_id"):
             runs.append(summary)
     return sorted(runs, key=lambda r: r.get("run_id", ""), reverse=True)
 
