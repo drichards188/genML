@@ -10,12 +10,18 @@ metric: roc_auc
 # Deadline 2026-11-30, 10 submissions/day. GPU gradient boosting only; RF and
 # linear models rarely win at 700k rows and use most of the time budget.
 models: [XGBoost, CatBoost, LightGBM]
+# Tuning runs on 2 of the 5 shared folds with early stopping; the early-stopped
+# tree count is fixed for the out-of-fold stage.
 budget:
-  n_trials: 15
-  timeout_per_model: 900
-# Leak-safe encodings (features/encoding.py): out-of-fold target encoding and
-# count encoding of categoricals, low-cardinality numerics and their pairs
+  n_trials: 20
+  timeout_per_model: 1200
+  tuning_folds: 2
+# base: raw keeps the original columns (no scaled/log/squared copies, which
+# trees do not need). Encodings (features/encoding.py): target and count
+# encoding of categoricals, low-cardinality numerics and their pairs. Target
+# encodings are nested per fold, so no fold's labels reach its own model.
 feature_engineering:
+  base: raw
   encodings:
     target_encode: auto
     count_encode: auto
