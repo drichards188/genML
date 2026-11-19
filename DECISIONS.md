@@ -6,34 +6,179 @@ now; this file records how it got there. Git history has the line-level detail.
 
 Add an entry whenever a decision changes behaviour, scope or the rules, in the same change.
 
-## Open (decided to do, not done yet)
+## Not done when the project ended
 
-1. Strip from the code the capabilities that came from the copied fraud-s6e11 recipe (see 2026-11-12),
-   block the routes the copying came through, then run a new fraud-s6e11 baseline (`--baseline`). All
-   waiting for the owner's go-ahead. The interactive Claude Code transcripts still hold the copied
-   material and agent Python can read them (the sandbox hides only credentials).
-2. home-credit and amex-default need `--baseline` before their first autopilot start (ieee-fraud has
-   one since 2026-11-16). Titanic
-   and the S5 Playground specs do not declare `feature_engineering.base: raw`, so the judge refuses them
-   until they do.
-3. Refocus genML on being an honest referee for other tools' results (the owner's call, 2026-11-18).
-   No AI idea generator has been shown to beat many cheap tests plus an honest scorer, the modelling
-   pipeline duplicates AutoGluon, and genML's distinct part is its scoring: the judge on rows a
-   contestant never sees, the noise bar, time-forward splits, the shuffled-label check, the sandbox and
-   the provenance rules. Next: AutoGluon in its own environment as the first contestant (a command that
-   gets the training rows and returns predictions for the hidden rows), then a benchmark of planted
-   failures (leaks, noise-only gains, repeated looks at the hidden rows) and planted real gains (a useful
-   column withheld from the baseline) on a sample of a real dataset, comparing AutoGluon's own
-   validation, Deepchecks and genML's judge. Pass: genML catches clearly more with few false alarms and
-   passes real gains above a measured size; otherwise stop. Verdicts become graded (proven, likely but
-   unproven, no evidence, leak). New pipeline features and idea-generation work stop; the autopilot
-   becomes one contestant among others.
+1. A new fraud-s6e11 baseline, after removing the features that came from the public notebook (see
+   2026-11-12).
+2. Baselines for home-credit and amex-default; Titanic and the S5 Playground specs would also need
+   `feature_engineering.base: raw` before the judge accepts them.
 
-Known limits, accepted for now: modules where a leak could hide (encoding, derived features, training,
+The referee (2026-11-18) was built and measured; see the entries below.
+
+Known limits at the end: modules where a leak could hide (encoding, derived features, training,
 ensembles) are not protected from agent edits; the canary catches leaks in accepted code, but settings
 ideas are only covered by the settings rules, not a canary run. A canary doubles the run time of an
 accepted code cycle. The second opinion is the same model family as the sessions (Claude only since
 2026-11-17).
+
+## 2026-11-18
+
+**The project ends (the owner's call).** Every part that could have set genML apart was measured
+against the simplest existing alternative and none came out ahead: the pipeline duplicates AutoGluon,
+the autopilot gave one accepted gain in three real-data cycles (possibly recalled), and the referee's
+verdicts are no better than a t-test over reruns (the two results below). `README.md` is now a one-page
+summary of the project. The items under "Not done when the project ended" stay undone. Left behind: local branches never pushed
+(`autopilot/main` with C003's accepted code, commit 177d040, never merged into `master`;
+`autopilot/ieee-fraud/C001` to `C003`); `outputs/` (about 11 GB of runs, contests and benchmark
+results) and `~/.cache/genml-autopilot/` on the owner's machine, never committed; five Kaggle
+submissions on the leaderboards (three for S6E11, one each for Home Credit and IEEE-CIS), none pending.
+
+**Result: on fixed LightGBM the referee adds nothing over a t-test on per-run scores (not confirmed by
+the rule below).** `python -m src.genML.referee.power_study`, 93 new runs, all `ok`
+(`outputs/referee/benchmark/ieee-100k-power.json`, `power.log`). Share of comparisons called (3 runs
+against 3):
+
+| test | same settings (140) | different but equal (28) | planted gains right (120) | wrong way | holdout agrees |
+|---|---|---|---|---|---|
+| DeLong, one run per side | 11% | 7% | 27% | 1% | 94% |
+| DeLong, 3-run averages | 8% | 0% | 33% | 0% | 100% |
+| t-test on per-run AUC | 4% | 0% | 32% | 1% | 98% |
+| textbook formula | 1% | 0% | 25% | 0% | 100% |
+| referee | 1% | 0% | 26% | 0% | 100% |
+
+The t-test called none of the different-but-equal pairs, so by the rule the referee's row-noise part
+adds nothing for this tool, and it costs power: card 100% for both, C 65% for the t-test against 55%,
+D 25% against 0%, M 5% against 0%, amount and V 0% for both. In exchange the referee avoided one
+wrong-way call in 120 (the t-test called withholding V a gain once, as the first benchmark hinted)
+and five same-settings calls in 140 (4% is within the t-test's nominal 5%). The textbook formula
+matched the referee within 5 points everywhere, so the bootstrap and chunk rule add nothing over it.
+A limit of the test: the noise draws differed little more than reruns do (AUC of 3-run averages, sd
+0.0015 across draws against 0.0012 across seed groups), so the case where row noise should matter, two
+models that are equally good but err on clearly different rows, barely occurred; the rule did not
+anticipate that. Together with the AutoGluon study: counting seed noise is what matters, and the plain
+t-test does it at least as well as the referee. The referee's verdict is not a new method and,
+measured so far, not a better one; what remains distinct is the harness around it (sandboxed
+third-party runs on hidden rows, several seeds, time-forward splits, the tool's own claim against its
+hidden score, data leak checks). `contestants/lightgbm_contestant.py` gained `--noise-seed` (default
+777, the old behaviour). Waiting for the owner on what to do with the referee.
+
+**Pre-registered before running: does the referee add anything over a plain t-test on per-run scores?
+(fixed LightGBM).** The AutoGluon study showed that seed noise fools DeLong, but a Welch t-test on each
+run's deciding-row AUC (3 runs against 3) was as well calibrated there as the referee (6 of 100 against
+3 of 100), so counting seed noise does not set the referee apart: any careful analyst would do it. What
+the referee adds over that t-test is row noise: the t-test asks "better on these exact rows", the
+referee "better on new rows". That matters only when two different methods are equally good but err
+on different rows. The test, on `ieee-100k` with `contestants/lightgbm_contestant.py` (about 7 s per
+run), every comparison 3 runs against 3 (`python -m src.genML.referee.power_study`):
+- same-settings nulls: 20 random disjoint group pairs from each pool of identical runs (the full
+  model's 15 seeds, and each withheld-column model's 15);
+- different-but-equal nulls: the full model plus 10 pure-noise columns, with 8 different noise draws
+  (`--noise-seed`; the existing `lgb-noise10` is one), 3 seeds each, all 28 pairs of draws. The draws
+  differ only in which noise values each row got, so none is better in general, but each errs on
+  different rows;
+- planted real gains: the six withheld-column models (card, C, M, D, V, TransactionAmt; seeds 30 to 44)
+  against the full model, 20 random comparisons each; the full model counts as truly better (all six
+  holdout gains were positive in the first benchmark).
+
+Tests on every comparison: DeLong on one run per side, DeLong on the 3-run averages, the t-test (p <
+0.05), the textbook formula (DeLong's row standard error plus each side's seed variance over 3, |z| > 2)
+and the referee (likely or proven, or the mirror rule for a loss). **Rule: the referee's row-noise part
+has value over the t-test if the t-test calls at least 15% of the different-but-equal pairs while the
+referee calls at most 5%; if the t-test calls under 10% of them, the referee adds nothing over a t-test
+for this tool (it only costs power); between is inconclusive.** Reported beside it: each test's share
+of right and wrong-direction calls per planted gain, and how often the holdout rows agree with a call.
+Known before running: on the first 3 seeds, withholding the V columns raised the deciding-row AUC by
+0.004 while the holdout AUC fell by 0.007, so the t-test may call that one the wrong way; it is
+reported, not part of the rule. If the textbook formula's rates match the referee's within 5 points
+everywhere, the referee's bootstrap and chunk rule add nothing over the formula.
+
+**Result: seed noise fools single-run DeLong for AutoGluon (confirmed: 56% of pairs against the 15%
+bar).** Seeds 3 to 9 of `ag-medium` ran with the same command and 600 s limit as 0 to 2, all `ok`
+(`outputs/referee/benchmark/ag-seeds.log`); `python -m src.genML.referee.seed_study` wrote
+`outputs/referee/benchmark/ieee-100k-ag-medium-seeds.json`. Over the ten runs the deciding-row AUC goes
+from 0.877 to 0.907 (sd 0.0098). DeLong p < 0.05 in 25 of 45 single-run pairs (mean |z| 2.02, max 4.54;
+a calibrated test gives 5% and 0.80). The pairs share runs, so 56% is rough, but the finding does not
+rest on it: the run-to-run spread of a difference (sd 0.014) is about 2.7 times the standard error
+DeLong gives it (median 0.005). It is not only the time limit: four runs reached 600 s (seeds 0, 3, 4,
+5; three skipped LightGBMLarge, seed 3 also NeuralNetTorch), yet the 15 pairs where both runs finished
+early with every model were significant in 8. More compute does not help a row-only test: DeLong on
+3-run seed averages, p < 0.05 in 52 of 100 disjoint group pairs. The referee on the same groups: 97
+no_evidence, 2 likely, 1 proven (3%, inside the pre-registered 5%; mean |gain / se_total| 0.81, so not
+the over-caution seen on fixed LightGBM). The proven is false and its cause is known: groups {3, 7, 8}
+and {5, 6, 9} are each tight (per-run sd 0.0022 and 0.0036 against 0.0098 over all ten), so seed sds
+from 3 runs undercounted the noise about threefold. A 3-run sd has 2 degrees of freedom; read against a
+normal bar, "more than 3 se" happens about 2% of the time on noise (t with 4 df), not 0.13%. Load was
+0.7 before the runs and about 14 during on 28 threads, mostly AutoGluon itself. Limits: one dataset,
+one tool, one preset, one time limit. What it changes: the referee's increment over DeLong is real for
+AutoGluon here, and "proven" cannot be trusted at 3 seeds until the seed sd's small sample is accounted
+for (proposed: Student-t critical values with Welch-Satterthwaite degrees of freedom, or at least 5 seeds
+for proven; then rerun this study and the LightGBM nulls). Waiting for the owner.
+
+**Pre-registered before running: does seed noise make DeLong's test call reruns of the same settings
+a gain?** Research (the owner asked whether the referee is novel) found every piece of it published
+or released: hidden-label scoring (Codabench, Meta's AIRA2), paired row tests (DeLong 1988, evalci),
+seed-aware comparison (Bouthillier et al. 2021, deepsig), an automatic gate with a held-out slice and a
+row-bootstrap margin (heldout, MIT). No tool found reruns a third-party tool across seeds on hidden rows
+and decides with row and seed noise together; that is the only increment the referee could add, and it
+matters only if single-run row tests are often fooled. A free preview on finished runs: DeLong p < 0.05
+on 2 of 3 same-settings AutoGluon pairs (z about 3.4, both against seed 0, which hit the 10-minute limit
+and skipped LightGBMLarge) and on 12 of 105 fixed-LightGBM pairs (11%, mean |z| 1.00 against 0.80). The
+test: seeds 3 to 9 of `ag-medium` (same command and limit as 0 to 2), then over all 45 single-run pairs
+of the ten: **DeLong p < 0.05 (two-sided) in at least 15% of pairs confirms the referee's niche for
+AutoGluon; under 10% means DeLong is enough and the referee adds nothing there; between is
+inconclusive.** Reported beside it: DeLong on seed averages of disjoint 3-run groups (the referee's
+compute), the referee's own grades on the same groups (expected at most 5% likely or proven), how
+many runs hit the time limit or skipped a model, and the machine's load during the runs (the PC is
+shared, so the time limit makes AutoGluon depend on load).
+
+**First referee benchmark on `ieee-100k`: a partial pass.** `python -m src.genML.referee.benchmark`
+(`outputs/referee/benchmark/ieee-100k.json`), about an hour at `nice 15`. A fixed LightGBM contestant
+(`contestants/lightgbm_contestant.py`, 8 s a run) calibrates the verdict; AutoGluon gets three seeds; Deepchecks
+0.19 (its own environment; it only runs with NumPy < 2, scikit-learn < 1.6, pandas < 2.3, pyarrow < 17) runs
+its train-test and data-integrity suites on the same contests (`external/deepchecks_check.py`).
+- Noise only (15 comparisons of reseeded or noise-column runs): all `no_evidence`, mean |z| 0.36, max 1.03.
+  No false gains, but |z| should average about 0.8 if the noise estimate were exact, so it is about 1.5 to 2
+  times too cautious (the row bootstrap of seed-averaged predictions probably already holds part of the
+  seed noise that is then added again).
+- Planted real gains (column groups withheld from the baseline): only the card columns (+0.013, holdout
+  +0.014) reached `likely`; the others were real on the holdout rows (+0.004 to +0.007) but `no_evidence`.
+  The smallest provable gain is about 0.013 AUC here: the 8,333 deciding rows hold only about 290 frauds.
+- Planted leaks: duplicated rows and an id that tracks the label were caught by both the referee and
+  Deepchecks. A column known only after the outcome (the label with 5% flipped, AUC 0.95 alone) passed the
+  referee's first threshold (0.97) and Deepchecks' defaults; the threshold is now 0.90, which catches it,
+  but it was set after seeing this result and needs another dataset to confirm it. With the leak in, the
+  verdict said `proven` (+0.072), not `suspicious`: the score-based rule cannot see a leak this size, only
+  the data checks can. Clean contests: no referee flags; Deepchecks raised 5 to 8 failed conditions on each
+  (drift, new categories, correlated or constant columns), none about leaks.
+- AutoGluon (`medium_quality`, 10 minutes): per-seed hidden scores 0.877, 0.904, 0.903 (sd 0.016, eight
+  times the fixed LightGBM's 0.002); its own validation claimed 0.933, 0.909, 0.926, so it overstated
+  itself by 0.005 to 0.056. Its seed average (0.899) was no better than the 8-second LightGBM (0.903;
+  `no_evidence`). Validating on the latest training rows without the time column did not reduce its
+  optimism in one seed (+0.032).
+Next: a contest on all 590k rows (about 1,700 frauds among the deciding rows, roughly 2.4 times finer
+resolution), a check of the noise estimate there with more noise-only comparisons, and the leak threshold
+on a second dataset.
+
+**The referee's first pieces: contests, sandboxed contestants, graded verdicts, data leak checks
+(`src/genML/referee/`, `contestants/autogluon_contestant.py`).** The first step of the referee plan. A contest hides
+the latest time block (or a stratified 20%) of a real training table and keeps its labels in a private
+folder; any command can enter by predicting the hidden rows, sandboxed with no network and no view of the
+labels or of other entries. One design change from the autopilot: because the hidden labels never reach a
+contestant, leaks inside its pipeline cannot raise its referee score, so the shuffled-label rerun is not
+needed here; such leaks show only as optimism (what the tool claims about itself minus its referee score).
+Leaks that can raise the score live in the data, so the checks look there: hidden rows duplicated among
+training rows, one column that predicts the label almost alone, an id that carries signal on the hidden
+rows (flags to explain, not rejections). Verdicts are graded instead of accept/reject (proven, likely,
+no_evidence, worse, suspicious), with seed noise from each entry's own seeds; without measured seed noise a
+gain can be at most "likely". Each comparison reports the smallest gain it could have proven. Contestants run
+at `nice 15` in a memory-capped scope, so the owner's own work on the machine comes first. AutoGluon 1.6
+lives in its own environment (`~/.venvs/genml-autogluon`, outside the repo) so its pinned libraries never
+touch genML's. First contest: `ieee-100k`, 100,000 ieee-fraud rows (83,333 train, 16,667 hidden, forward
+in time); its checks raise no flags (strongest single column AUC 0.685, id 0.549, no duplicates).
+First entry, AutoGluon `medium_quality`, one seed, 10 minutes, sandboxed: it reported 0.933 AUC on its own
+validation and scored 0.877 on the deciding rows (0.889 on the holdout rows), optimism +0.056. Part of
+that gap is real drift that any model faces forward in time; the rest is AutoGluon validating on random
+rows of time-ordered data. Tests: `tests/test_referee.py`.
 
 ## 2026-11-17
 
@@ -191,7 +336,7 @@ account"; it answered on 2026-11-12).
 ieee-fraud autopilot start. A docstring in `features/derived.py`, a test example in
 `tests/test_real_data.py` and three lines of this file described the excluded idea; they are neutral now
 (the owner's 2026-11-12 rule: agents must not see the content of excluded ideas). Still readable by
-agent Python and not fixed here: the interactive Claude Code transcripts (Open 1).
+agent Python and not fixed here: the interactive Claude Code transcripts.
 
 ## 2026-11-12
 
