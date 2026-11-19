@@ -6,6 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 genML is a tabular ML pipeline for Kaggle-style problems (a train and a test table, in one file each or spread over several related files). Each problem is declared in `problems/<name>/problem.yaml`; unset fields are inferred and every inference is recorded. Runs tune gradient-boosting and neural models on the problem's own metric, store out-of-fold (OOF) predictions on folds shared by all runs, stack them, and write a submission whose content is decided by the metric. The intended way to use it is the **autopilot**: Claude Code sessions plan and build experiments, a second model reviews each plan, and trusted code judges every result. Runs go through a job worker and can also be driven by LLM clients through an MCP server. A FastAPI + React dashboard shows live progress. Decisions and changes are logged in `DECISIONS.md`.
 
+**Status: the project ended on 2026-11-18 (the owner's call).** No part of it measured better than
+existing tools; README.md is the retrospective and DECISIONS.md has the reasons. Do not start new features,
+referee work or autopilot runs unless the owner reopens the project. The rest of this file describes the
+code as it stood at the end.
+
 ## Purpose: a process that solves real problems
 
 genML exists to solve real tabular problems with as little human input as possible. Kaggle competitions,
@@ -64,6 +69,13 @@ python src/genML/main.py --init-kaggle playground-series-s6e11 --name fraud-s6e1
 python src/genML/main.py            # legacy: datasets/current/, everything inferred
 
 python -m src.genML.jobs worker | enqueue NAME | list | cancel JOB_ID
+python -m src.genML.referee create --problem ieee-fraud --name ieee-100k --sample 100000   # a contest
+python -m src.genML.referee enter ieee-100k ag-medium --seeds 0 1 2 --time-limit 600 -- \
+    ~/.venvs/genml-autogluon/bin/python contestants/autogluon_contestant.py --presets medium_quality
+python -m src.genML.referee summary|check ieee-100k | compare ieee-100k BASE CANDIDATE
+python -m src.genML.referee.benchmark [--contest ieee-100k] [--skip-autogluon]   # noise, planted gains and leaks
+python -m src.genML.referee.seed_study --contest ieee-100k --entry ag-medium       # is single-run DeLong fooled by seeds?
+python -m src.genML.referee.power_study [--contest ieee-100k] [--skip-runs]        # referee against simpler tests
 python -m src.genML.mcp_server      # MCP server (stdio)
 python run_api.py                   # dashboard API on :8000; UI: cd dashboard && npm run dev
 ```
@@ -150,6 +162,41 @@ Code base: one shared branch `autopilot/main` for every problem. Each start (`re
 Permissions are declared, not prompted (`autopilot/policy.py`): each loop mode file starts with a YAML header (`tools`, `bash` commands, `read` folders, `network: none`, `credentials: hidden`, `sandbox: required`) that `agent.run_agent` turns into `claude -p --restricted --tools ... --settings <file>`; the settings file (saved next to the session log) holds allow/deny rules and Claude Code's sandbox (no network, credential files unreadable, writes only in the worktree, `failIfUnavailable`; the session keeps Claude Code's own temp folder because the sandbox's sockets fail on long paths). Runs of agent code follow `autopilot/run_policy.yaml`: the job worker (`jobs._launch`) wraps them in bubblewrap (no network, credentials masked and removed from the environment, writes only to `outputs/<problem>/` minus `autopilot/`, `outputs/progress/`, the worktree and a private temp folder that `TMPDIR` points at) and hands over the job as a JSON file (`jobs execute-json`). Without bubblewrap and socat the loop refuses to start and agent-code jobs fail, unless the owner passes `--allow-unsandboxed`.
 
 Prompts are the mode files in `.claude/skills/genml/modes/` (`_shared.md` is added to every loop session, never to the research session, which must not learn the problem); problem and machine details in them are placeholders filled by `loop.Autopilot._facts` (rows, data files, fold counts, run time, RAM, GPU). The protected tests `test_autopilot_policy.py`, `test_second_opinion.py`, `test_honest_judging.py`, `test_autopilot_ops.py` and `test_probe.py` pin these rules. Usage limits are waited out and the same session resumed. Worktrees and canary data live in `~/.cache/genml-autopilot/<repo>/`. Agents never submit to Kaggle.
+
+### Referee (`src/genML/referee/`, `contestants/`)
+Scores other tools' models honestly. A **contest** (`contest.py`, `outputs/referee/<name>/`) splits a real
+training table (a declared problem's, tables joined as genML does, optionally sampled): with a time column
+the latest of `cv.n_splits` blocks is hidden, so contestants predict forward in time; otherwise a stratified
+20% is hidden. `public/` holds `train.parquet`, `hidden.parquet` (target removed) and `contest.json`;
+`private/` holds the hidden labels and the row codes (half the hidden rows decide, half are holdout that is
+reported but never decides), and the hashes of the public files, checked on every load. A **contestant**
+(`arena.run_entry`) is any command given `--contest --out --seed --workdir [--time-limit]`; it writes one
+prediction per hidden row and may write `self_report.json` (its own validation score). It runs under
+bubblewrap with no network, the private folder and other entries replaced by empty folders, credentials
+masked, writes only in its entry folder, at `nice 15`, in a memory-capped scope. Predictions edited after
+the run, or entries made before a public file changed, are not counted. The **verdict** (`verdict.compare`)
+scores seed-averaged predictions on the deciding rows; `se_total = sqrt(se_rows**2 + sd_a**2/n_a +
+sd_b**2/n_b)` (paired bootstrap plus each entry's per-seed spread) and a graded result: `proven` (> 3
+se_total, 80% of 5 row chunks), `likely` (> 2 se_total, 60%; also the ceiling when no seed noise was
+measured), `no_evidence`, `worse`, `suspicious` (> 10x the proven bar). It reports `smallest_provable_gain`,
+the holdout difference (flagged when it disagrees) and, per entry (`entry_summary`), `optimism`: the tool's
+claim about itself minus its referee score. Because contestants never see the hidden labels, leaks inside
+their pipelines cannot raise their referee score (no shuffled-label rerun is needed); **checks**
+(`checks.check_contest`) look for leaks in the data itself: hidden rows duplicated among training rows,
+a column that predicts the label almost alone, an id carrying signal on the hidden rows. A flag means
+"explain this", not "reject". `contestants/autogluon_contestant.py` runs AutoGluon from its own environment
+(`~/.venvs/genml-autogluon`, AutoGluon 1.6; never genML's), drops only the id column, seeds AutoGluon's
+data split and bagged models, and reports its own validation score on the metric's scale. `contestants/lightgbm_contestant.py` is a
+fixed LightGBM (seconds per run; `--drop`, `--drop-prefix`, `--noise-columns`) for calibrating verdicts.
+`benchmark.py` runs noise-only comparisons, planted real gains (column groups withheld) and planted leaks,
+and compares the checks with Deepchecks (`external/deepchecks_check.py`, `~/.venvs/genml-deepchecks`).
+`seed_study.py` takes one entry run with many seeds (every difference is noise) and reports how often
+DeLong's paired AUC test calls single runs, or seed averages, different, next to the referee's grades on
+disjoint groups of runs (`verdict.grade_groups`, the grading `compare` uses, for caller-made groups).
+`power_study.py` judges 3-run against 3-run comparisons five ways (DeLong on one run and on averages,
+a t-test on per-run scores, DeLong plus seed variance, the referee) on same-settings nulls, models that
+differ only in their noise columns (`lightgbm_contestant.py --noise-seed`) and planted gains (withheld
+columns), and checks each call against the holdout rows (results: DECISIONS.md, 2026-11-18).
 
 ### Cross-run ensembles (`src/genML/pipeline/store_ensemble.py`)
 Blends the best stored experiments sharing the latest run's folds into a new run folder with its own submission.
